@@ -1,0 +1,17 @@
+# Optional: hands-free wake word ("Hey JARVIS") for `python jarvis.py --wake`.
+#
+# openwakeword 0.6.0 declares tflite-runtime as a Linux dependency, but tflite-runtime has no
+# build for Python 3.12. JARVIS uses the ONNX models instead, so install openwakeword without
+# its declared dependencies, then these runtime dependencies:
+#
+#   .venv/bin/pip install --no-deps openwakeword==0.6.0
+#   .venv/bin/pip install -r requirements-wake.txt
+#
+# pip will warn that tflite-runtime is missing; that is expected and harmless.
+# The "hey_jarvis" model (about 7 MB) downloads automatically the first time --wake is used.
+onnxruntime==1.31.0
+numpy==2.5.4
+scipy==1.18.1
+scikit-learn==1.9.1
+tqdm==4.70.1
+requests==2.34.2

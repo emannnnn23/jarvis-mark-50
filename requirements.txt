@@ -1,0 +1,23 @@
+# JARVIS MARK 50 - Python dependencies (Python 3.10+, tested on 3.12 / Zorin OS 18)
+# Install into the project venv:  .venv/bin/pip install -r requirements.txt
+
+# Groq SDK - the language model ("brain"). Required for chatting.
+groq==1.7.0
+
+# DuckDuckGo web search. This package was renamed from duckduckgo-search to ddgs;
+# jarvis.py imports ddgs first and falls back to duckduckgo_search if only that is installed.
+ddgs==9.16.0
+
+# Text-to-speech via Microsoft Edge's online neural voices (produces MP3).
+# Optional at runtime: without it JARVIS runs text-only. Needs a system MP3 player
+# (mpv, ffplay, mpg123 or gst-play-1.0).
+edge-tts==7.3.1
+
+# Optional: richer CPU, memory, process and network-interface details.
+# Without it, JARVIS falls back to /proc and the ps utility.
+psutil==7.2.2
+
+# Optional: the hands-free wake-word engine (--wake) is installed separately; see requirements-wake.txt.
+
+# testing
+pytest==9.1.1

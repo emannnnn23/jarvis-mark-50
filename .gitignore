@@ -1,0 +1,28 @@
+# Added by code-review-graph
+.code-review-graph/
+
+# Python environment and bytecode
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets: the real configuration holds GROQ_API_KEY. Commit .env.example instead.
+.env
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs (JARVIS logs to ~/.local/share by default, but keep stray logs out too)
+*.log
+
+# Personal data: the memory file stores your name, location, remembered facts and a
+# log of recent conversations. It is created automatically when missing.
+jarvis_memory.json
+# Backups made by "/memory reset" when the memory file was corrupted
+jarvis_memory.corrupt-*.json
+
+# Temporary text-to-speech audio
+*.mp3
+jarvis-tts-*/
