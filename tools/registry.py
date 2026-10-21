@@ -60,6 +60,7 @@ class Tool:
     describe: Callable[[dict[str, Any]], tuple[str, list[str]]] | None = None
     timeout: float = 30.0
     untrusted_output: bool = False  # results may contain third-party text (prompt-injection risk)
+    cancel: Callable[[], Any] | None = None  # stops work still running when the user cancels
 
     def permission_for(self, args: dict[str, Any]) -> Permission:
         return self.permission(args) if callable(self.permission) else self.permission
@@ -222,15 +223,29 @@ def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, ra
     if not decision.allowed:
         return finish({"status": STATUS_DENIED, "reason": decision.reason, "message": "The operation was not executed."})
 
+    try:  # decided once, before running: the world may change while the tool runs
+        level = tool.permission_for(args)
+    except Exception:  # noqa: BLE001 - evaluate() succeeded a moment ago; assume the worst
+        level = Permission.SENSITIVE_ACTION
+
+    def cancel_tool() -> None:
+        if tool.cancel is not None:
+            try:
+                tool.cancel()
+            except Exception:  # noqa: BLE001 - cancelling must not mask the interruption
+                log.exception("Cancelling %s failed", name)
+
     future = _tool_executor.submit(tool.handler, **args)
     try:
         data = future.result(timeout=tool.timeout)
     except KeyboardInterrupt:
+        cancel_tool()
         finish({"status": STATUS_UNVERIFIED, "error": "Cancelled by the user while the tool was running."})
         raise
     except concurrent.futures.TimeoutError:
         future.cancel()
-        if tool.permission_for(args) is Permission.READ_ONLY:
+        cancel_tool()
+        if level is Permission.READ_ONLY:
             return finish({"status": STATUS_ERROR, "error": f"{name} timed out after {tool.timeout:.0f} seconds."})
         return finish({
             "status": STATUS_UNVERIFIED,

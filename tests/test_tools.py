@@ -126,7 +126,7 @@ class LinuxIntegrationTests(AgentTestCase):
         with mock.patch("jarvis.shutil.which", return_value=None), \
                 mock.patch("jarvis.subprocess.Popen") as popen:
             with self.assertRaises(jarvis.ToolError) as ctx:
-                self.tools.launch_app("vscode")
+                self.tools.open_application("vscode")
         self.assertIn("not installed", str(ctx.exception))
         self.assertIn("code", str(ctx.exception))
         popen.assert_not_called()
@@ -138,7 +138,7 @@ class LinuxIntegrationTests(AgentTestCase):
         with mock.patch("jarvis.shutil.which", side_effect=which), \
                 mock.patch("jarvis.subprocess.Popen", return_value=process) as popen, \
                 mock.patch("jarvis.time.sleep") as sleep:
-            result = self.tools.launch_app("Firefox")
+            result = self.tools.open_application("Firefox")
         popen.assert_called_once()
         args, kwargs = popen.call_args
         self.assertIsInstance(args[0], list)
@@ -158,7 +158,7 @@ class LinuxIntegrationTests(AgentTestCase):
         with mock.patch("jarvis.shutil.which", side_effect=which), \
                 mock.patch("jarvis.subprocess.Popen", return_value=process) as popen, \
                 mock.patch("jarvis.time.sleep"):
-            result = self.tools.launch_app("VS Code")
+            result = self.tools.open_application("VS Code")
         self.assertEqual(popen.call_args[0][0], ["/usr/bin/codium"])
         self.assertEqual(result["app"], "vscode")
 
@@ -168,7 +168,7 @@ class LinuxIntegrationTests(AgentTestCase):
             for name in ("rm", "bash -c 'rm -rf ~'", "../../bin/sh"):
                 with self.subTest(name=name):
                     with self.assertRaises(jarvis.ToolError) as ctx:
-                        self.tools.launch_app(name)
+                        self.tools.open_application(name)
                     self.assertIn("not an approved application", str(ctx.exception))
         popen.assert_not_called()
 
@@ -210,7 +210,7 @@ class LinuxIntegrationTests(AgentTestCase):
             with self.assertRaises(jarvis.ToolError):
                 jarvis.run_command(["x"])
 
-    # git_status runs the real git binary in temporary repositories: the point of these tests is
+    # inspect_git_status runs the real git binary in temporary repositories: the point of these tests is
     # to prove that git itself honours the hardening, which a mocked subprocess cannot show.
     def _git(self, repo, *args):
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
@@ -230,7 +230,7 @@ class LinuxIntegrationTests(AgentTestCase):
     def test_git_status_reports_changes(self):
         repo = self._make_repo()
         (repo / "file.py").write_text("x = 2\n")
-        result = self.tools.git_status("repo")
+        result = self.tools.inspect_git_status("repo")
         self.assertEqual(result["status"], "success")
         self.assertIn("M file.py", result["git_status"])
         self.assertIn("file.py", result["diff_stat"])
@@ -251,9 +251,9 @@ class LinuxIntegrationTests(AgentTestCase):
         self._git(repo, "config", "core.hooksPath", str(hooks))
         (repo / ".gitattributes").write_text("* filter=x\n")
         (repo / "file.py").write_text("x = 3\n")
-        result = self.tools.git_status("repo")
+        result = self.tools.inspect_git_status("repo")
         self.assertEqual(result["status"], "success")
-        self.assertFalse(marker.exists(), "git_status executed code from the repository config")
+        self.assertFalse(marker.exists(), "inspect_git_status executed code from the repository config")
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_git_status_ignores_repository_above_workspace(self):
@@ -263,20 +263,20 @@ class LinuxIntegrationTests(AgentTestCase):
         (self.workspace / "plain").mkdir()
         with mock.patch.dict(os.environ, {"GIT_DIR": str(self.tmp / ".git")}):
             with self.assertRaises(jarvis.ToolError) as ctx:
-                self.tools.git_status("plain")
+                self.tools.inspect_git_status("plain")
         self.assertIn("not inside a git repository", str(ctx.exception))
 
     def test_git_status_outside_workspace_rejected(self):
         with mock.patch("jarvis.subprocess.run") as run:
             with self.assertRaises(jarvis.ToolError):
-                self.tools.git_status("../")
+                self.tools.inspect_git_status("../")
         run.assert_not_called()
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_git_status_failure(self):
         (self.workspace / "notrepo").mkdir()
         with self.assertRaises(jarvis.ToolError) as ctx:
-            self.tools.git_status("notrepo")
+            self.tools.inspect_git_status("notrepo")
         self.assertIn("not inside a git repository", str(ctx.exception))
 
     def test_open_youtube_encodes_query(self):

@@ -1,0 +1,71 @@
+# JARVIS MARK 50 permissions: what JARVIS may launch and run.
+#
+# You edit this file; the model never does. The model can only choose from what is listed
+# here. It never supplies a command line of its own. Restart JARVIS after editing.
+# Point JARVIS_PERMISSIONS_FILE at another file to use that instead.
+
+# Extra or replacement applications for open_application: name = "command".
+# The built-in list (vscode, firefox, chrome, files, terminal, text editor, calculator,
+# system monitor, settings) stays available; an entry here with the same name replaces it.
+[applications]
+# obsidian = "obsidian"
+# music = "flatpak run com.spotify.Client"
+
+# Commands JARVIS may run inside a workspace project (run_project_tests).
+#
+#   argv        the exact command, as a list. "python3" (or "python") uses the project's .venv/venv if it has one;
+#               a relative path such as "bin/rails" runs the project's own script.
+#   kind        "tests" or "lint"
+#   detect      files or folders that mark a project this command fits (any one is enough)
+#   npm_script  for npm commands: the script that must exist in package.json
+#   timeout     seconds before the command (and everything it started) is stopped; 5-3600, default 600
+#   confirm     ask before running (default true). Running tests runs the project's code with your
+#               full user access, so only trust projects you know.
+#
+# When a project has no rule under [projects], JARVIS uses the first command below that fits.
+
+[commands.rails-test]
+description = "Rails tests (minitest), excluding system tests"
+argv = ["bin/rails", "test"]
+kind = "tests"
+detect = ["bin/rails"]
+timeout = 900
+
+[commands.npm-test]
+description = "npm test script"
+argv = ["npm", "test", "--silent"]
+kind = "tests"
+detect = ["package.json"]
+npm_script = "test"
+timeout = 900
+
+[commands.flutter-test]
+description = "Flutter tests"
+argv = ["flutter", "test"]
+kind = "tests"
+detect = ["pubspec.yaml"]
+timeout = 900
+
+[commands.pytest]
+description = "Python tests with pytest"
+argv = ["python3", "-m", "pytest", "-q"]
+kind = "tests"
+detect = ["pytest.ini", "conftest.py", "pyproject.toml", "setup.cfg", "setup.py"]
+timeout = 900
+
+[commands.npm-lint]
+description = "npm lint script"
+argv = ["npm", "run", "lint", "--silent"]
+kind = "lint"
+detect = ["package.json"]
+npm_script = "lint"
+timeout = 300
+
+# Per-project rules. The key is the project's folder name inside the workspace.
+#   tests / lint   which command above to use for this project
+#   confirm        false = trust this project: run its commands without asking.
+#                  (JARVIS still asks if the request came after it read web or file content.)
+[projects]
+# [projects.RPMIS]
+# tests = "rails-test"
+# confirm = false

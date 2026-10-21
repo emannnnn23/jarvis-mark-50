@@ -78,7 +78,7 @@ class FileTools:
     """Workspace file and notes tool handlers. Mixed into JarvisTools, which provides self.config and self.memory."""
 
     # -- files ---------------------------------------------------------------
-    def list_directory(self, path: str = ".") -> dict[str, Any]:
+    def list_workspace_files(self, path: str = ".") -> dict[str, Any]:
         target = resolve_safe_path(path, self.config.workspace)
         if not target.exists():
             raise ToolError(f"{path!r} does not exist.")
@@ -109,7 +109,7 @@ class FileTools:
             result["truncated"] = True
         return result
 
-    def read_file(self, path: str, max_chars: int = 6000) -> dict[str, Any]:
+    def read_workspace_file(self, path: str, max_chars: int = 6000) -> dict[str, Any]:
         target = resolve_safe_path(path, self.config.workspace)
         if not target.is_file():
             raise ToolError(f"{path!r} is not a readable file inside {self.config.workspace}.")

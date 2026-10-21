@@ -327,7 +327,7 @@ class JarvisCLI:
         elif command == "/tools":
             for tool in self.ctx.registry.tools():
                 level = tool.permission.value if isinstance(tool.permission, Permission) else "depends on arguments"
-                print(f"  {tool.name:<18} {level}")
+                print(f"  {tool.name:<22} {level}")
         elif command == "/memory" and rest == "reset":
             self._reset_memory()
         elif command == "/memory":

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from core.context import build_messages, build_system_prompt
 from intelligence.groq_client import JarvisAPIError, call_model
-from tools.registry import STATUS_SUCCESS, ToolValidationError, execute_tool, parse_arguments, serialize_tool_result
+from tools.registry import STATUS_DENIED, ToolValidationError, execute_tool, parse_arguments, serialize_tool_result
 
 if TYPE_CHECKING:
     from config.settings import Config
@@ -110,7 +110,8 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
                 result = execute_tool(ctx.registry, ctx.policy, name, call.function.arguments, tainted=tainted)
                 previous_results[key] = result
                 tool = ctx.registry.get(name)
-                if tool is not None and tool.untrusted_output and result["status"] == STATUS_SUCCESS:
+                # Any result that ran (even a failed or timed-out one) may carry third-party text.
+                if tool is not None and tool.untrusted_output and result["status"] != STATUS_DENIED:
                     tainted = True
             events.append({"tool": name, "status": result["status"]})
             messages.append({"role": "tool", "tool_call_id": call.id, "name": name,

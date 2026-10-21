@@ -29,7 +29,7 @@ class MemoryStoreTests(TempDirTestCase):
         self.memory_path.write_text(json.dumps(payload), encoding="utf-8")
         store = self.make_memory()
         self.assertTrue(store.writable)
-        self.assertEqual(store.profile(), {"user_name": "Tony", "location": "Malibu"})
+        self.assertEqual(store.profile(), {"user_name": "Emanuel", "location": "Almeria"})
         self.assertEqual(store.find_fact("fabc123")["text"], "Likes espresso")
         self.assertEqual(store.data["custom"], {"keep": True})
 

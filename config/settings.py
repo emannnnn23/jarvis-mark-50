@@ -6,6 +6,7 @@ import dataclasses
 import os
 import re
 import shlex
+import tomllib
 from pathlib import Path
 
 from core.audit import log
@@ -189,6 +190,118 @@ def parse_app_overrides(raw: str) -> dict[str, list[list[str]]]:
     return apps
 
 
+DEFAULT_PERMISSIONS_FILE = SCRIPT_DIR / "config" / "permissions.toml"
+COMMAND_KINDS = ("tests", "lint")
+_COMMAND_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,40}")
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectCommand:
+    """A command JARVIS may run inside a workspace project. Defined by the user, never by the model."""
+    name: str
+    argv: tuple[str, ...]
+    kind: str = "tests"
+    detect: tuple[str, ...] = ()
+    npm_script: str | None = None
+    timeout: int = 600
+    confirm: bool = True
+    description: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectRule:
+    """Per-project choices from [projects.<folder>]: which command to use, and whether to ask first."""
+    tests: str | None = None
+    lint: str | None = None
+    confirm: bool | None = None
+
+
+@dataclasses.dataclass
+class Permissions:
+    applications: dict[str, list[list[str]]]
+    commands: dict[str, ProjectCommand]
+    projects: dict[str, ProjectRule]
+
+
+def load_permissions(path: Path) -> Permissions:
+    """Read the permissions file. A missing file means no extra apps and no project commands."""
+    path = Path(path)
+    if not path.exists():
+        return Permissions({}, {}, {})
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"{path} could not be read as TOML: {exc}") from None
+
+    def fail(message: str):
+        raise ConfigError(f"{path}: {message}")
+
+    def string_list(value, where: str) -> tuple[str, ...]:
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            fail(f"{where} must be a list of non-empty strings.")
+        return tuple(value)
+
+    unknown = set(data) - {"applications", "commands", "projects"}
+    if unknown:
+        fail(f"unknown section(s): {', '.join(sorted(unknown))}.")
+    for section in ("applications", "commands", "projects"):
+        if not isinstance(data.get(section, {}), dict):
+            fail(f"[{section}] must be a table, e.g. [{section}] on its own line followed by entries.")
+
+    applications: dict[str, list[list[str]]] = {}
+    for name, command in (data.get("applications") or {}).items():
+        if not isinstance(command, str) or not command.strip():
+            fail(f"applications.{name} must be a command string.")
+        try:
+            applications[name.strip().lower()] = [shlex.split(command)]
+        except ValueError as exc:
+            fail(f"applications.{name} is not a valid command: {exc}.")
+
+    commands: dict[str, ProjectCommand] = {}
+    allowed_keys = {"argv", "kind", "detect", "npm_script", "timeout", "confirm", "description"}
+    for name, spec in (data.get("commands") or {}).items():
+        where = f"commands.{name}"
+        if not _COMMAND_NAME.fullmatch(name):
+            fail(f"{where}: names use lowercase letters, digits, '-' and '_'.")
+        if not isinstance(spec, dict):
+            fail(f"{where} must be a table.")
+        if set(spec) - allowed_keys:
+            fail(f"{where}: unknown key(s) {', '.join(sorted(set(spec) - allowed_keys))}.")
+        argv = string_list(spec.get("argv"), f"{where}.argv")
+        if not argv:
+            fail(f"{where}.argv must not be empty.")
+        kind = spec.get("kind", "tests")
+        if kind not in COMMAND_KINDS:
+            fail(f"{where}.kind must be one of {', '.join(COMMAND_KINDS)}.")
+        timeout = spec.get("timeout", 600)
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 5 <= timeout <= 3600:
+            fail(f"{where}.timeout must be a whole number of seconds between 5 and 3600.")
+        confirm = spec.get("confirm", True)
+        if not isinstance(confirm, bool):
+            fail(f"{where}.confirm must be true or false.")
+        npm_script = spec.get("npm_script")
+        if npm_script is not None and (not isinstance(npm_script, str) or not npm_script.strip()):
+            fail(f"{where}.npm_script must be a script name.")
+        commands[name] = ProjectCommand(
+            name=name, argv=argv, kind=kind, detect=string_list(spec.get("detect", []), f"{where}.detect"),
+            npm_script=npm_script, timeout=timeout, confirm=confirm, description=str(spec.get("description", "")),
+        )
+
+    projects: dict[str, ProjectRule] = {}
+    for name, spec in (data.get("projects") or {}).items():
+        where = f"projects.{name}"
+        if not isinstance(spec, dict) or set(spec) - {"tests", "lint", "confirm"}:
+            fail(f"{where} may only set tests, lint and confirm.")
+        for kind in COMMAND_KINDS:
+            chosen = spec.get(kind)
+            if chosen is not None and (chosen not in commands or commands[chosen].kind != kind):
+                fail(f"{where}.{kind} must name a [commands] entry of kind {kind!r}.")
+        if "confirm" in spec and not isinstance(spec["confirm"], bool):
+            fail(f"{where}.confirm must be true or false.")
+        projects[name] = ProjectRule(spec.get("tests"), spec.get("lint"), spec.get("confirm"))
+    return Permissions(applications, commands, projects)
+
+
 @dataclasses.dataclass
 class Config:
     api_key: str = dataclasses.field(repr=False)
@@ -219,6 +332,9 @@ class Config:
     wake_end_silence: float = 1.0
     wake_chime: bool = True
     apps: dict[str, list[list[str]]] = dataclasses.field(default_factory=lambda: dict(DEFAULT_APPS))
+    permissions_file: Path = DEFAULT_PERMISSIONS_FILE
+    commands: dict[str, ProjectCommand] = dataclasses.field(default_factory=dict)
+    projects: dict[str, ProjectRule] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None, require_api_key: bool = True) -> "Config":
@@ -248,7 +364,10 @@ class Config:
             raw = (env.get(name) or "").strip()
             return Path(raw).expanduser() if raw else default
 
+        permissions_file = path_setting("JARVIS_PERMISSIONS_FILE", DEFAULT_PERMISSIONS_FILE)
+        permissions = load_permissions(permissions_file)
         apps = dict(DEFAULT_APPS)
+        apps.update(permissions.applications)  # the permissions file, then JARVIS_APPS, override built-ins
         apps.update(parse_app_overrides(env.get("JARVIS_APPS", "")))
         data_home = Path(env["XDG_DATA_HOME"]).expanduser() if env.get("XDG_DATA_HOME") else Path.home() / ".local/share"
 
@@ -281,4 +400,7 @@ class Config:
             wake_end_silence=_env_float(env, "JARVIS_WAKE_END_SILENCE", 1.0, 0.4, 3.0),
             wake_chime=_env_bool(env, "JARVIS_WAKE_CHIME", True),
             apps=apps,
+            permissions_file=permissions_file,
+            commands=permissions.commands,
+            projects=permissions.projects,
         )

@@ -46,7 +46,11 @@ import time  # noqa: F401 - re-exported for tests that patch it
 from config.settings import (  # noqa: F401 - re-exported
     DEFAULT_MODEL,
     DEFAULT_STT_MODEL,
+    Permissions,
+    ProjectCommand,
+    ProjectRule,
     _env_float,
+    load_permissions,
     parse_app_overrides,
 )
 from core.audit import (  # noqa: F401 - re-exported
@@ -80,8 +84,17 @@ from tools.catalog import (  # noqa: F401 - re-exported
 from tools.filesystem import (  # noqa: F401 - re-exported
     resolve_safe_path,
 )
+from tools.developer import (  # noqa: F401 - re-exported
+    command_fits,
+    resolve_argv,
+)
 from tools.linux_system import (  # noqa: F401 - re-exported
+    BoundedResult,
+    battery_status,
+    cancel_running_commands,
     launch_detached,
+    project_env,
+    run_bounded,
     run_command,
 )
 from tools.registry import (  # noqa: F401 - re-exported
@@ -128,6 +141,7 @@ __all__ = [
     "AUDIO_INSTALL_HINT",
     "AgentContext",
     "AgentResult",
+    "BoundedResult",
     "CHIME_IGNORE_SECONDS",
     "Config",
     "ConfigError",
@@ -152,6 +166,9 @@ __all__ = [
     "PHANTOM_PEAK",
     "Permission",
     "PermissionPolicy",
+    "Permissions",
+    "ProjectCommand",
+    "ProjectRule",
     "RECORDER_INSTALL_HINT",
     "SCRIPT_DIR",
     "SILENCE_PEAK",
@@ -176,10 +193,13 @@ __all__ = [
     "asyncio",
     "audit",
     "audit_log",
+    "battery_status",
     "build_registry",
     "call_model",
+    "cancel_running_commands",
     "classify_api_error",
     "clean_text_for_speech",
+    "command_fits",
     "detect_audio_player",
     "detect_recorder",
     "empty_memory",
@@ -193,15 +213,19 @@ __all__ = [
     "list_model_ids",
     "load_env_file",
     "load_memory",
+    "load_permissions",
     "log",
     "main",
     "os",
     "parse_app_overrides",
     "parse_args",
     "parse_arguments",
+    "project_env",
     "redact",
+    "resolve_argv",
     "resolve_safe_path",
     "run_agent",
+    "run_bounded",
     "run_checks",
     "run_command",
     "safe_display",
@@ -275,6 +299,12 @@ def run_checks(config: Config) -> int:
     report(True if recorder else None, "microphone recorder", recorder[0] if recorder else RECORDER_INSTALL_HINT)
     wake_ok, wake_detail = wake_engine_available()
     report(True if wake_ok else None, "wake-word engine", wake_detail + (f" ({config.wake_model})" if wake_ok else ""))
+    if config.permissions_file.exists():
+        kinds = [spec.kind for spec in config.commands.values()]
+        report(True, "permissions file", f"{config.permissions_file} ({kinds.count('tests')} test and "
+                                         f"{kinds.count('lint')} lint commands, {len(config.projects)} project rules)")
+    else:
+        report(None, "permissions file", f"{config.permissions_file} not found; no project commands are allowed")
     try:
         load_memory(config.memory_path)
         report(True, "memory file", str(config.memory_path))

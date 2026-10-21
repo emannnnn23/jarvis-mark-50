@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import collections
+import contextlib
+import dataclasses
 import datetime as dt
 import os
 import platform
+import select
 import shutil
+import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -40,6 +46,181 @@ def run_command(argv: list[str], timeout: float = 10, cwd: Path | None = None,
         raise ToolError(f"'{argv[0]}' timed out after {timeout:g} seconds.") from None
     except OSError as exc:
         raise ToolError(f"Could not run '{argv[0]}': {exc.strerror or exc}") from None
+
+
+def project_env() -> dict[str, str]:
+    """The environment for commands that run project code: JARVIS's own settings and credentials
+    (GROQ_*, JARVIS_*, which may have come from its .env file) are removed."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(("GROQ_", "JARVIS_"))}
+
+
+OUTPUT_KEEP_BYTES = 1_000_000  # only the end of a very long output is kept in memory
+
+
+@dataclasses.dataclass
+class BoundedResult:
+    returncode: int | None
+    output: str
+    timed_out: bool
+    cancelled: bool
+    seconds: float
+    output_truncated: bool = False
+
+
+_running: set[subprocess.Popen] = set()
+_cancelled: set[int] = set()  # pids stopped by cancel_running_commands
+_cancel_generation = 0  # bumped by every cancel, so a command starting at that moment is caught too
+_running_lock = threading.Lock()
+
+
+class _TailReader(threading.Thread):
+    """Reads a pipe until EOF or until stopped, keeping only the last `keep` bytes."""
+
+    def __init__(self, fd: int, keep: int = OUTPUT_KEEP_BYTES):
+        super().__init__(name="jarvis-command-output", daemon=True)
+        self.fd, self.keep = fd, keep
+        self.chunks: collections.deque[bytes] = collections.deque()
+        self.size = self.total = 0
+        self.stopping = threading.Event()
+
+    def run(self) -> None:
+        while not self.stopping.is_set():
+            if not select.select([self.fd], [], [], 0.1)[0]:
+                continue
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            self.chunks.append(data)
+            self.size += len(data)
+            self.total += len(data)
+            while len(self.chunks) > 1 and self.size - len(self.chunks[0]) >= self.keep:
+                self.size -= len(self.chunks.popleft())
+
+    def text(self) -> str:
+        return b"".join(self.chunks)[-self.keep:].decode("utf-8", "replace")
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_group(process: subprocess.Popen, grace: float = 5.0, straggler_grace: float = 0.5) -> None:
+    """Stop a command and everything it started (they share its process group): SIGTERM, then up to
+    `grace` seconds for the command itself to clean up but only `straggler_grace` for anything left
+    once it has exited, then SIGKILL for whatever remains (including children that ignore SIGTERM)."""
+    pgid = process.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return  # nothing left in the group
+    deadline = time.monotonic() + grace
+    leader_gone_at = None
+    while True:
+        now = time.monotonic()
+        if process.poll() is not None:
+            if not _group_alive(pgid):
+                return
+            leader_gone_at = leader_gone_at or now
+            if now - leader_gone_at >= straggler_grace:
+                break
+        elif now >= deadline:
+            break
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=5)
+
+
+def cancel_running_commands() -> int:
+    """Stop every bounded command still running (used when the user cancels a request)."""
+    global _cancel_generation
+    with _running_lock:
+        _cancel_generation += 1
+        processes = [process for process in _running if process.poll() is None]
+        _cancelled.update(process.pid for process in processes)
+    for process in processes:
+        _stop_group(process)
+    return len(processes)
+
+
+def run_bounded(argv: list[str], cwd: Path, timeout: float, env: dict[str, str] | None = None) -> BoundedResult:
+    """Run a long command (e.g. a test suite) in its own process group, with stdout and stderr
+    combined. It waits for the command to *exit* (a background child holding the output open
+    cannot stall it), then stops anything the command left behind in its group. A timeout or a
+    cancellation stops the whole group. Only the last OUTPUT_KEEP_BYTES of output are kept."""
+    found = argv[0] if os.path.isabs(argv[0]) else shutil.which(argv[0])
+    if found is None or os.path.isdir(found) or not os.access(found, os.X_OK):
+        raise ToolError(f"'{argv[0]}' is not installed, not on PATH, or not executable.")
+    executable = os.path.abspath(found)  # a relative PATH entry must not re-resolve inside the project
+    with _running_lock:
+        generation = _cancel_generation
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            [executable, *argv[1:]], cwd=cwd, env=env, shell=False, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        raise ToolError(f"Could not run '{argv[0]}': {exc.strerror or exc}") from None
+    reader = _TailReader(process.stdout.fileno())
+    reader.start()
+    with _running_lock:
+        _running.add(process)
+        cancelled_while_starting = _cancel_generation != generation
+    timed_out = False
+    try:
+        if cancelled_while_starting:
+            _stop_group(process)
+        else:
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        _stop_group(process)  # also clears background children still holding the output pipe
+        reader.join(timeout=1.0)
+    finally:
+        reader.stopping.set()
+        reader.join(timeout=1.0)
+        process.stdout.close()
+        with _running_lock:
+            _running.discard(process)
+            cancelled = cancelled_while_starting or process.pid in _cancelled
+            _cancelled.discard(process.pid)
+    return BoundedResult(process.returncode, reader.text(), timed_out and not cancelled, cancelled,
+                         round(time.monotonic() - started, 1), reader.total > OUTPUT_KEEP_BYTES)
+
+
+def battery_status() -> dict[str, Any] | None:
+    """Battery charge and state, or None on a machine without a battery."""
+    if psutil is not None and hasattr(psutil, "sensors_battery"):
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:  # noqa: BLE001 - some kernels expose odd power-supply data
+            battery = None
+        if battery is not None:
+            result: dict[str, Any] = {"percent": round(battery.percent), "plugged_in": battery.power_plugged}
+            unknown = (psutil.POWER_TIME_UNLIMITED, psutil.POWER_TIME_UNKNOWN)
+            if not battery.power_plugged and battery.secsleft not in unknown and battery.secsleft > 0:
+                result["time_left"] = str(dt.timedelta(seconds=int(battery.secsleft)))
+            return result
+    for supply in sorted(Path("/sys/class/power_supply").glob("BAT*")):
+        try:
+            percent = int((supply / "capacity").read_text().strip())
+            state = (supply / "status").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        return {"percent": percent, "plugged_in": state in ("Charging", "Full", "Not charging"), "state": state}
+    return None
 
 
 def launch_detached(argv: list[str], cwd: Path | None = None, settle_seconds: float = 0.5) -> dict[str, Any]:
@@ -87,7 +268,7 @@ class SystemTools:
         return result
 
     # -- system --------------------------------------------------------------
-    def system_status(self) -> dict[str, Any]:
+    def get_system_status(self) -> dict[str, Any]:
         info: dict[str, Any] = {
             "hostname": platform.node(),
             "kernel": platform.release(),
@@ -146,6 +327,7 @@ class SystemTools:
             except OSError:
                 continue
         info["disks"] = disks
+        info["battery"] = battery_status() or "no battery detected"
         return info
 
     def list_processes(self, sort_by: str = "cpu", limit: int = 10) -> dict[str, Any]:
@@ -210,7 +392,7 @@ class SystemTools:
             raise ToolError(f"'{name}' is not an approved application. Approved: {', '.join(sorted(self.config.apps))}.")
         return key, self.config.apps[key]
 
-    def launch_app(self, name: str) -> dict[str, Any]:
+    def open_application(self, name: str) -> dict[str, Any]:
         key, candidates = self._resolve_app(name)
         for argv in candidates:
             if shutil.which(argv[0]):

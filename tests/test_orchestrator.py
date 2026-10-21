@@ -142,7 +142,7 @@ class AgentLoopTests(AgentTestCase):
 
     def test_tool_error_message_is_returned(self):
         client = FakeGroqClient([
-            response(None, [tool_call("call_r", "read_file", {"path": "missing.txt"})]),
+            response(None, [tool_call("call_r", "read_workspace_file", {"path": "missing.txt"})]),
             response("Not found."),
         ])
         self.run_agent(client)

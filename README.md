@@ -1,6 +1,6 @@
 # JARVIS MARK 50
 
-JARVIS MARK 50 is a personal assistant for the Linux terminal, written as a single Python file (`jarvis.py`). It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 18 tools that JARVIS defines: web search, the clock, system status, a small JSON memory, Markdown notes, read-only file and git access inside one workspace folder, and launching a fixed list of desktop apps. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell, cannot install software and cannot delete files. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
+JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python as a set of small packages (see [Project layout](#project-layout)) and started with `python jarvis.py`. It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 19 tools that JARVIS defines: web search, the clock, system status (including the battery), a small JSON memory, Markdown notes, read-only file and git access inside one workspace folder, launching a fixed list of desktop apps, and running a project's tests or linter with a command you approved in `config/permissions.toml`. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell and never writes a command line: it can only pick an approved command by name. It cannot install software and cannot delete files. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
 
 - Version: 1.0.0 (`python jarvis.py --version`)
 - Target: Zorin OS 18 (Ubuntu 24.04 "noble" base), Python 3.12. Requires Python 3.10 or newer.
@@ -17,19 +17,24 @@ JARVIS MARK 50 is a personal assistant for the Linux terminal, written as a sing
 | Speech input: Groq transcription | Verified on 2026-10-17: `whisper-large-v3-turbo` and `whisper-large-v3` each returned an exact transcript of a generated test clip in about 0.4 s. Both models are available to the development account. |
 | Speech input: full pipeline | Recorder process, WAV file, length and silence checks, Groq upload and transcript were verified end to end with a simulated microphone. The temporary files were removed afterwards. |
 | Speech input: microphone | `arecord` opened the built-in microphone (HDA Intel PCH, CX8200 Analog) and wrote a valid 16 kHz mono WAV when stopped with SIGINT. The quiet room measured a peak of about 0.015, so the silence threshold was set to 0.03 (speech is typically 0.1 or more). |
-| Speech input: real spoken voice | **Not tested yet.** Nobody has yet spoken into the microphone and checked the transcript. The recorder, silence checks, transcriber and CLI flow are covered by 69 automated tests. |
+| Speech input: real spoken voice | **Not tested yet.** Nobody has yet spoken into the microphone and checked the transcript. The recorder, silence checks, transcriber and CLI flow are covered by the automated test suite. |
 | Hands-free: engine install | Verified on 2026-10-17 on Python 3.12: openWakeWord 0.6.0 installs only with `pip install --no-deps openwakeword==0.6.0`, because its declared `tflite-runtime` dependency has no Python 3.12 build. The runtime dependencies come from `requirements-wake.txt`. Disk use is about 270 MB, mostly scipy (109 MB), onnxruntime (68 MB), scikit-learn (49 MB) and numpy (43 MB). The `hey_jarvis` model plus its feature models (about 7 MB) download once on first use. |
 | Hands-free: wake-model scores | On generated speech, "Hey Jarvis, ..." in three different voices scored 0.998-0.999. JARVIS's own `en-GB-RyanNeural` reply scored 0.000. "Hello Jarvis, ..." scored 0.52, which is why the default threshold is 0.6. |
 | Hands-free: CPU | Inference costs about 3 ms per 80 ms frame, or about 4% of one CPU core, for as long as hands-free mode is on. |
 | Hands-free: end to end | Verified on 2026-10-17 with the real model and real Groq Whisper, on generated audio. (1) "Hey Jarvis, what is the weather like in Manila today?" from idle: one detection, transcript "what is the weather like in Manila today?". (2) "Hey Jarvis, stop" mixed over JARVIS's own voice while it was speaking: one detection, transcript "stop.", handled as a stop phrase. (3) JARVIS's voice alone: 0 detections. (4) Ordinary chatter without the wake word: 0 detections. |
 | Hands-free: microphone | Real microphone, local only (nothing was transcribed): 6.1 s processed, maximum wake score 0.047 in a quiet room, no false triggers. The estimated room noise RMS was 0.0045, giving a speech threshold of 0.013. The push-to-talk recorder could open the microphone at the same time (PipeWire allows several capture clients). |
 | Hands-free: real spoken "Hey JARVIS" | **Not tested yet.** Nobody has yet said "Hey JARVIS" into the microphone, so wake-up, interruption and end-of-request detection with a real voice are unverified. |
+| Project tests: results | Verified on 2026-10-21 with real runs on temporary demo projects. A passing pytest project gave `passed=true`. A failing one gave `passed=false` and exit code 1, and the output named the failing test. |
+| Project tests: environment | Verified on 2026-10-21: `GROQ_API_KEY` was absent in the child process. |
+| Project tests: time limit | Verified on 2026-10-21: a hanging test that had started a child `sleep` was stopped at a 5 s limit, and the child `sleep` was gone too. |
+| Project tests: live conversation | Verified on 2026-10-21 with `openai/gpt-oss-20b`: the model ran the tests after confirmation and correctly named the broken assertion. It understood the follow-up "And the passing one?", and reported the battery through `get_system_status` ("51% – not plugged in"). |
+| Project tests: your real projects | **Not run, by design.** No command has been run on your own projects (such as RPMIS); you decide when. See [Your workspace](#your-workspace). |
 
 ## Features
 
 ### Personality
 
-JARVIS treats you as its creator: loyal, familiar and candid, in a British voice, addressing you as Sir. It thinks a command through and then carries it out, without asking permission or questions it can answer itself. If it sees a problem or a better approach it says so in one sentence, but still does what you asked when its tools allow. Its disagreement is advice, not refusal. This does not bypass any safety rule: sensitive actions still stop at the typed confirmation prompt, and it still cannot run shell commands, install software or delete files.
+JARVIS treats you as its creator: loyal, familiar and candid, in a British voice, addressing you as Sir. It thinks a command through and then carries it out, without asking permission or questions it can answer itself. If it sees a problem or a better approach it says so in one sentence, but still does what you asked when its tools allow. Its disagreement is advice, not refusal. This does not bypass any safety rule: sensitive actions still stop at the typed confirmation prompt, it can run only the project commands you approved, and it still cannot run shell commands, install software or delete files.
 
 ### Tools available to the model
 
@@ -46,17 +51,20 @@ Permission classes: **R** = read-only, **C** = controlled action, **S** = sensit
 | | `update_fact` | S | Replaces the text of a fact, by id (shows old and new text before asking). |
 | | `forget_fact` | S | Permanently deletes a fact, by id. |
 | | `set_user_profile` | C | Stores your name and/or location. |
-| System | `system_status` | R | Hostname, OS, kernel, uptime, CPU load, memory, and disk usage for `/` and home. |
+| System | `get_system_status` | R | Hostname, OS, kernel, uptime, CPU load, memory, disk usage for `/` and home, and the battery (see below). |
 | | `list_processes` | R | Top processes by CPU or memory (1-25 rows). |
 | | `check_network` | R | DNS and HTTPS (port 443) reachability of `api.groq.com` and `duckduckgo.com`. |
-| Apps and projects | `launch_app` | C | Starts an app from the approved list (see `JARVIS_APPS`). |
+| Apps and projects | `open_application` | C | Starts an app from the approved list (built-in apps, `[applications]` in the [permissions file](#permissions-file), `JARVIS_APPS`). |
 | | `open_project` | C | Opens a workspace directory in the configured editor (`JARVIS_EDITOR`). |
-| | `git_status` | R | `git status --short --branch` and `git diff --stat` for a repository in the workspace. |
-| Files and notes | `list_directory` | R | Lists a workspace directory (up to 200 entries). |
-| | `read_file` | R | Reads a text file in the workspace. Credentials in the content are redacted. |
+| | `inspect_git_status` | R | `git status --short --branch` and `git diff --stat` for a repository in the workspace. |
+| | `run_project_tests` | S, or C for a trusted project | Runs a project's tests or linter with a command approved in the permissions file, and reports pass/fail, the exit code and the end of the output (see [Running project tests and linters](#running-project-tests-and-linters)). |
+| Files and notes | `list_workspace_files` | R | Lists a workspace directory (up to 200 entries). |
+| | `read_workspace_file` | R | Reads a text file in the workspace. Credentials in the content are redacted. |
 | | `create_note` | C, or S when overwriting | Writes a Markdown note to the notes folder. Overwriting an existing note is sensitive. |
 
-Built-in app names for `launch_app`: `vscode` (`code`, falls back to `codium`), `firefox`, `chrome` (`google-chrome` / `chromium` / `chromium-browser`), `files` (`nautilus` / `nemo` / `thunar`), `terminal` (`gnome-terminal` / `kgx` / `x-terminal-emulator`), `text editor` (`gnome-text-editor` / `gedit`), `calculator`, `system monitor`, `settings`. It also accepts aliases such as "vs code", "file manager", "task manager" and "google chrome".
+Built-in app names for `open_application`: `vscode` (`code`, falls back to `codium`), `firefox`, `chrome` (`google-chrome` / `chromium` / `chromium-browser`), `files` (`nautilus` / `nemo` / `thunar`), `terminal` (`gnome-terminal` / `kgx` / `x-terminal-emulator`), `text editor` (`gnome-text-editor` / `gedit`), `calculator`, `system monitor`, `settings`. It also accepts aliases such as "vs code", "file manager", "task manager" and "google chrome".
+
+**Battery.** `get_system_status` adds a `battery` entry. With `psutil` it gives the charge in percent, whether the charger is plugged in, and the time left when the battery is discharging and the time is known. Without `psutil`, or if `psutil` reports no battery, it reads `/sys/class/power_supply/BAT*` and gives the percent, plugged in, and the kernel's state (such as `Discharging`), but no time left. On a machine without a battery it reports `no battery detected`.
 
 ### How a request is handled
 
@@ -114,7 +122,7 @@ nano .env                       # set GROQ_API_KEY=gsk_...
 .venv/bin/python jarvis.py --wake
 ```
 
-`--check` reports on the Python version, the required modules (`groq`, `ddgs`), the optional modules (`edge_tts`, `psutil`), the audio player, the API key, the model, the speech model (`JARVIS_STT_MODEL`), the microphone recorder (`arecord` or `pw-record`), the wake-word engine (with the configured `JARVIS_WAKE_MODEL`), the memory file, the workspace and the editor. If a key is set, it makes live calls to list the models available to your account. The speech model is checked only when a key is set. A missing speech model, recorder or wake-word engine is a warning, not a failure. Exit code 0 means all required checks passed, and 1 means at least one failed.
+`--check` reports on the Python version, the required modules (`groq`, `ddgs`), the optional modules (`edge_tts`, `psutil`), the audio player, the API key, the model, the speech model (`JARVIS_STT_MODEL`), the microphone recorder (`arecord` or `pw-record`), the wake-word engine (with the configured `JARVIS_WAKE_MODEL`), the permissions file, the memory file, the workspace and the editor. The permissions-file line shows the file's path and how many test commands, lint commands and project rules it defines, for example `permissions file: .../config/permissions.toml (4 test and 1 lint commands, 0 project rules)`. If the file does not exist, it warns `... not found; no project commands are allowed`. If a key is set, it makes live calls to list the models available to your account. The speech model is checked only when a key is set. A missing speech model, recorder, wake-word engine or permissions file is a warning, not a failure. An invalid permissions file is a configuration error, so `--check` stops before the report (see [Permissions file](#permissions-file)). Exit code 0 means all required checks passed, and 1 means at least one failed.
 
 ### Command-line options
 
@@ -132,7 +140,7 @@ At startup JARVIS confirms that the key works and that the model is offered to y
 
 ## Configuration
 
-Settings come from environment variables. `jarvis.py` automatically loads a `.env` file located **next to `jarvis.py`**. Variables already exported in your shell are never overridden by the file. `.env.example` lists every variable with its default.
+Settings come from environment variables. `jarvis.py` automatically loads a `.env` file located **next to `jarvis.py`**. Variables already exported in your shell are never overridden by the file. `.env.example` lists every variable with its default. Which apps JARVIS may open and which project commands it may run are set in a separate file, `config/permissions.toml` (see [Permissions file](#permissions-file)).
 
 | Variable | Default | Allowed values / notes |
 | --- | --- | --- |
@@ -152,7 +160,8 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_PERMISSION_MODE` | `standard` | `read_only`, `standard`, `confirm_all` |
 | `JARVIS_EDITOR` | `code` | Command used by `open_project`, split like a shell command (for example `codium` or `code --new-window`). |
 | `JARVIS_SAVE_CONVERSATIONS` | `true` | Keep the bounded conversation log in the memory file. |
-| `JARVIS_APPS` | (none) | Extra or replacement apps: `name=command; name2=command two`. A built-in name is replaced. |
+| `JARVIS_APPS` | (none) | Extra or replacement apps: `name=command; name2=command two`. An app of the same name, built in or from the permissions file, is replaced. |
+| `JARVIS_PERMISSIONS_FILE` | `config/permissions.toml` next to `jarvis.py` | Path; `~` is expanded. If the file does not exist there are no extra apps and no project commands. An invalid file stops startup (see [Permissions file](#permissions-file)). |
 | `JARVIS_STT_ENABLED` | `false` | `true/false` etc. Starts with push-to-talk on, like `--listen`. `/talk` works either way. |
 | `JARVIS_STT_BACKEND` | `groq` | Only `groq`. Any other value is a configuration error. |
 | `JARVIS_STT_MODEL` | `whisper-large-v3-turbo` | A Groq speech-to-text model id, for example `whisper-large-v3`. |
@@ -165,13 +174,13 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_WAKE_END_SILENCE` | `1.0` | 0.4-3.0 seconds of quiet that end a hands-free request. |
 | `JARVIS_WAKE_CHIME` | `true` | `true/false` etc. Plays a short two-tone chime when the wake word is heard. It plays in text-only mode too, if an audio player is found. |
 
-An invalid value, such as a number out of range, an unknown mode or a malformed `JARVIS_APPS` entry, stops startup with `Configuration error: ...` and exit code 2. `NO_COLOR` disables coloured output, and `XDG_DATA_HOME` moves the default log directory.
+An invalid value, such as a number out of range, an unknown mode, a malformed `JARVIS_APPS` entry or an invalid permissions file, stops startup with `Configuration error: ...` and exit code 2. `NO_COLOR` disables coloured output, and `XDG_DATA_HOME` moves the default log directory.
 
 ### Groq usage and limits
 
 Free-tier limits are small. On the development account (October 2026), `openai/gpt-oss-120b` allowed 8,000 tokens per minute and 1,000 requests per day; a single tool-using question costs roughly 4,000 tokens, so asking several in quick succession triggers a short wait. JARVIS prints `Groq is rate-limiting requests... Retrying in Ns` while it waits. Check your current limits at https://console.groq.com/settings/limits.
 
-- Every model call sends the definitions of all 18 tools, about 1.7k tokens, on top of the system prompt, up to 5 memories and the recent history.
+- Every model call sends the definitions of all 19 tools, roughly 2k tokens (a little more for each approved project command, because their names are listed in the `run_project_tests` description), on top of the system prompt, up to 5 memories and the recent history.
 - A question that uses tools takes at least two model calls: one to choose the tools and one to answer. Multi-step tasks take more. Startup and `--check` also make one call to list models.
 - A tool-heavy session can therefore use up the daily allowance quickly. To stretch it, lower `JARVIS_HISTORY_TURNS`, or switch to another model with `GROQ_MODEL` or `--model`, since each model has its own quota.
 - JARVIS retries transient failures automatically: per-minute rate limits, timeouts, network errors and server errors. It makes up to 3 retries with backoff, honours `retry-after`, and gives up if asked to wait more than 30 s. A malformed tool call from the model gets one retry at a lower temperature. An exhausted daily quota is not retried.
@@ -180,12 +189,12 @@ Free-tier limits are small. On the development account (October 2026), `openai/g
 
 ## In-chat commands
 
-Talk in plain English: for example "search for the latest Python release", "remember that I prefer concise answers", "how is the system doing?", "show git status for my-project".
+Talk in plain English: for example "search for the latest Python release", "remember that I prefer concise answers", "how is the system doing?", "show git status for my-project", "run the tests for RPMIS".
 
 | Command | Effect |
 | --- | --- |
 | `/help` (or `help`) | Shows help. |
-| `/tools` | Lists the tools and their permission classes (`create_note` shows "depends on arguments"). |
+| `/tools` | Lists the tools and their permission classes (`create_note` and `run_project_tests` show "depends on arguments"). |
 | `/memory [query]` | Shows the profile and up to 50 stored facts, filtered by the optional query. |
 | `/memory reset` | Only when the memory file is corrupted: backs it up and starts a fresh memory (asks first). |
 | `/forget <id>` | Deletes one memory (asks first). Ids are shown by `/memory`. |
@@ -199,15 +208,15 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | `/clear` | Forgets this session's conversation context. Saved memories are unaffected. |
 | `/status` | Shows the model, voice, permission mode, memory file, workspace, notes, logs, tool-round limit, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
 | `exit`, `quit`, `goodbye`, `bye jarvis`, Ctrl+D | Leaves JARVIS. |
-| Ctrl+C while JARVIS is working | Cancels the current request. Steps that already finished are not undone. |
+| Ctrl+C while JARVIS is working | Cancels the current request. Steps that already finished are not undone. A running project command is stopped, together with everything it started. |
 
 ## Permission system
 
 Each tool has one of three permission classes:
 
 - **Read-only**: looks at things and changes nothing.
-- **Controlled action**: changes something in a limited, low-risk way, such as opening a browser tab, launching an app, saving a memory, or creating a new note.
-- **Sensitive action**: destructive or irreversible: changing or deleting a memory, or overwriting an existing note.
+- **Controlled action**: changes something in a limited, low-risk way, such as opening a browser tab, launching an app, saving a memory, creating a new note, or running a project command you marked as trusted (`confirm = false`).
+- **Sensitive action**: destructive, irreversible or able to run third-party code: changing or deleting a memory, overwriting an existing note, or running a project's tests or linter (the default, because that runs the project's own code).
 
 The permission mode decides what happens to each class:
 
@@ -217,7 +226,7 @@ The permission mode decides what happens to each class:
 | Controlled action | denied | runs (asks you if the request is *tainted*, see below) | asks you |
 | Sensitive action | denied | asks you | asks you |
 
-**Prompt-injection guard (tainting).** `search_web`, `read_file`, `list_directory` and `git_status` return third-party text that could contain hidden instructions. Once one of them has returned content during a request, every later controlled action in that same request also needs your confirmation, and the prompt says why. This stops a booby-trapped web page or file from quietly opening a URL that carries your data, or writing an "instruction" into memory. The taint resets with each new message you type.
+**Prompt-injection guard (tainting).** `search_web`, `read_workspace_file`, `list_workspace_files`, `inspect_git_status` and `run_project_tests` return third-party text that could contain hidden instructions. Once one of them has returned content during a request, every later controlled action in that same request also needs your confirmation, and the prompt says why. This stops a booby-trapped web page or file from quietly opening a URL that carries your data, or writing an "instruction" into memory. The taint resets with each new message you type.
 
 How confirmation works:
 
@@ -231,16 +240,137 @@ The permission mode only governs tool calls made by the model. The `/forget` and
 
 ## Filesystem boundaries
 
-- **Workspace root** (`JARVIS_WORKSPACE`, default `~/Projects`): `list_directory`, `read_file`, `open_project` and `git_status` only work inside it. Relative paths are resolved against the root. Absolute paths are accepted only if they lie inside it.
+- **Workspace root** (`JARVIS_WORKSPACE`, default `~/Projects`): `list_workspace_files`, `read_workspace_file`, `open_project`, `inspect_git_status` and `run_project_tests` only work inside it. Relative paths are resolved against the root. Absolute paths are accepted only if they lie inside it.
 - **Symlinks are resolved** before the check, so a link inside the workspace that points outside it is refused.
-- **Protected names**: a path is refused if any part of it below the workspace root matches one of these. `list_directory` hides matching entries and reports how many it hid.
+- **Protected names**: a path is refused if any part of it below the workspace root matches one of these. `list_workspace_files` hides matching entries and reports how many it hid.
   - Directories: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.password-store`, `.pki`, `.mozilla`, `google-chrome`, `chromium`, `BraveSoftware`, `keyrings`, `.git`
   - Files: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`, `.netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials`, `credentials.*`, `secrets.*`, `*.secret`, `master.key`, `.envrc`, `*_history` (shell histories), `.htpasswd`
   - Still allowed: `.env.example`, `.env.sample`, `.env.template`
-- **`read_file`** only reads text files; files with NUL bytes are treated as binary and refused. It reads at most the first 200 KB and returns 6,000 characters by default (`max_chars` 100-9,000). Known credential formats in the content are redacted.
-- **`git_status`** is read-only and hardened against hostile repositories: it overrides `core.fsmonitor`, `core.hooksPath` and every configured `filter.*` driver, disables external diff and textconv programs, credential prompts, optional locks and system config, and ignores inherited `GIT_*` variables. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
+- **`read_workspace_file`** only reads text files; files with NUL bytes are treated as binary and refused. It reads at most the first 200 KB and returns 6,000 characters by default (`max_chars` 100-9,000). Known credential formats in the content are redacted.
+- **`inspect_git_status`** is read-only and hardened against hostile repositories: it overrides `core.fsmonitor`, `core.hooksPath` and every configured `filter.*` driver, disables external diff and textconv programs, credential prompts, optional locks and system config, and ignores inherited `GIT_*` variables. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
 - **Notes folder** (`JARVIS_NOTES_DIR`) is separate from the workspace, and `create_note` can only write there. The file name comes from the title (letters, digits, `.`, `_`, `-`; spaces become `-`; at most 80 characters; `.md` added), so a title cannot escape the folder. A `# Title` heading is added if the content does not start with one. Notes are written atomically. An existing note is replaced only when `overwrite` is set, which is a sensitive action.
-- There is no general shell, no delete tool and no way to write files outside the notes folder and the memory file.
+- There is no general shell, no delete tool, and no JARVIS tool that writes files outside the notes folder and the memory file. The exception is the code of a project whose tests or linter you let JARVIS run: it runs with your user's rights and can write wherever you can (see [Safety](#safety)).
+
+## Permissions file
+
+`config/permissions.toml` lists the extra apps JARVIS may open and the commands it may run inside your projects. You edit it; the model never does, and the model can only choose from what is listed. JARVIS reads the file once at startup, so restart after editing it. Set `JARVIS_PERMISSIONS_FILE` to use another file.
+
+- **Missing file**: not an error. There are then no extra apps and no project commands, and `--check` warns.
+- **Invalid file**: JARVIS refuses to start, with `Configuration error: <file>: <problem>` and exit code 2. That covers TOML syntax errors, any top-level section other than the three below, unknown keys, and every rule in the tables below.
+
+### Applications
+
+`[applications]` adds apps for `open_application`, one per line: `name = "command"`.
+
+- The command must be a non-empty string. It is split like a shell command, but no shell runs. A string that cannot be split (such as an unclosed quote) is an error.
+- Names are matched without regard to case.
+- **Precedence**: the built-in apps come first, then `[applications]`, then `JARVIS_APPS`. A later entry with the same name replaces an earlier one.
+
+```toml
+[applications]
+obsidian = "obsidian"
+music = "flatpak run com.spotify.Client"
+```
+
+### Commands
+
+Each `[commands.<name>]` table defines one command that `run_project_tests` may run. The name uses lowercase letters, digits, `-` and `_`, starts with a letter or digit, and is at most 41 characters long.
+
+| Key | Allowed values | Default | Meaning |
+| --- | --- | --- | --- |
+| `argv` | Required. A non-empty list of non-empty strings | | The exact command line. No shell is involved. See [Python projects and project scripts](#python-projects-and-project-scripts) for how the first item is found. |
+| `kind` | `"tests"` or `"lint"` | `"tests"` | Whether the command runs tests or a linter. |
+| `detect` | A list of non-empty strings | `[]` | Files or folders, relative to the project, that mark a project this command fits. Any one is enough. An empty list fits every project. |
+| `npm_script` | A non-empty string | (none) | For npm commands: the script that must exist under `"scripts"` in the project's `package.json`. |
+| `timeout` | A whole number from 5 to 3600 | `600` | Seconds before the command, and everything it started, is stopped. |
+| `confirm` | `true` or `false` | `true` | Ask before running. `false` skips the prompt (see [Safety](#safety)). |
+| `description` | Text | `""` | A note for you. JARVIS does not show it anywhere. |
+
+The shipped file defines these commands, in this order:
+
+| Name | `argv` | `kind` | `detect` | `npm_script` | `timeout` |
+| --- | --- | --- | --- | --- | --- |
+| `rails-test` | `bin/rails test` | tests | `bin/rails` | | 900 |
+| `npm-test` | `npm test --silent` | tests | `package.json` | `test` | 900 |
+| `flutter-test` | `flutter test` | tests | `pubspec.yaml` | | 900 |
+| `pytest` | `python3 -m pytest -q` | tests | `pytest.ini`, `conftest.py`, `pyproject.toml`, `setup.cfg`, `setup.py` | | 900 |
+| `npm-lint` | `npm run lint --silent` | lint | `package.json` | `lint` | 300 |
+
+None of them sets `confirm`, so all of them ask first.
+
+### Project rules
+
+Each `[projects.<folder>]` table sets choices for one project. The key is the project's folder relative to the workspace: for a top-level project, just its name (`[projects.RPMIS]`); quote a nested path (`[projects."clients/shop"]`).
+
+| Key | Allowed values | Meaning |
+| --- | --- | --- |
+| `tests` | The name of a `[commands]` entry whose `kind` is `"tests"` | The tests command for this project. |
+| `lint` | The name of a `[commands]` entry whose `kind` is `"lint"` | The lint command for this project. |
+| `confirm` | `true` or `false` | Overrides the command's own `confirm` for this project. `false` trusts the project. |
+
+Any other key is an error, and so is a command name that does not exist or has the wrong kind.
+
+## Running project tests and linters
+
+`run_project_tests` runs a project's tests, or with `check="lint"` its linter, using a command from the [permissions file](#permissions-file). It takes three arguments: `project` (a folder inside the workspace), `check` (`tests` by default, or `lint`) and, optionally, `command` (the name of an approved command). Ask in plain English, for example "run the tests for RPMIS" or "lint RentDitoMobile".
+
+### How the command is chosen
+
+Only commands of the requested kind (`tests` or `lint`) are considered. If there are none, JARVIS says so.
+
+1. If the model passed the name of an approved command, that command is used. Any other name is refused, with the list of approved names.
+2. Otherwise, if the project has a `[projects.<folder>]` rule for that kind, the rule's command is used.
+3. Otherwise, the first command in the file that fits the project is used. A command fits when one of its `detect` markers exists in the project and, if it sets `npm_script`, `package.json` defines that script.
+4. If nothing fits, the result is the error `No approved tests command fits <project>.` (or `lint`), with the approved names and the path of the permissions file.
+
+### Safety
+
+- **The model picks a name, never a command line.** The tool accepts only the project, the kind of check and an approved command name. The command line itself comes only from your file.
+- **It asks first by default.** Running tests runs the project's own code with your user's rights, so the call is a sensitive action. The confirmation prompt shows the exact command line, the time limit and the project path, and that command line is what runs: if the project changes while the prompt is open so that a different command would run (for example a `.venv` or `bin/rails` appears), JARVIS refuses and runs nothing. For example:
+
+  ```text
+  !! Confirmation required [SENSITIVE ACTION: run_project_tests]
+     Operation: Run tests for RPMIS: /home/you/Projects/RPMIS/bin/rails test (stops after 900s). This runs the project's code with your full user access.
+     Affects:   /home/you/Projects/RPMIS
+  ```
+
+- **Trusting a command or project.** `confirm = false` on a command, or on a project rule, makes the call a controlled action, so it runs without asking. A project's `confirm` wins over the command's. A trusted project still asks when the model names a command other than the one the project would normally use. JARVIS still asks when the request came after reading web or file content (see tainting under [Permission system](#permission-system)), and in `confirm_all` mode. In `read_only` mode project commands are always denied.
+- **JARVIS's key stays out.** The command runs without any `GROQ_*` or `JARVIS_*` environment variable, so a project cannot read your Groq key. Everything else in your environment is passed on, so variables a project relies on, such as an exported `RAILS_MASTER_KEY`, still work.
+- **Bounded and stoppable.** The command runs in the project folder, in its own process group, with no input (stdin is closed). When the `timeout` is reached, or you cancel with Ctrl+C or "Hey JARVIS", JARVIS stops the whole group: SIGTERM first, then SIGKILL for anything still running (after 5 s for the command itself, 0.5 s for leftovers once it has exited). JARVIS waits for the command to exit, not for its output to close, so a background process it leaves behind cannot stall JARVIS or turn a pass into a timeout; leftovers in its process group are stopped when it finishes. A daemon that detaches into its own session (with `setsid`) is outside that group and is not stopped.
+- **Program lookup.** A bare name such as `npm` is resolved on JARVIS's `PATH` to an absolute path before the command starts, so a relative `PATH` entry cannot pick up a program from inside the project.
+- **Output.** Standard output and error are combined; only the last 1 MB is kept in memory however much a command prints, and it is redacted. The model gets the verdict first (`passed`, `exit_code`), then the last 4,000 characters (`output_tail`, with `output_truncated` set when there was more), the last three non-empty lines, each cut to 300 characters (`summary`), the command line, the exit code and the duration. The output is marked as untrusted, so the rest of the request is tainted, including after a failed or timed-out run.
+
+How each outcome is reported:
+
+| Outcome | Result |
+| --- | --- |
+| The command exits with 0 | Status `success`, `passed=true`, `exit_code` 0. |
+| The command exits with anything else (failing tests, lint errors) | Status `success`, `passed=false` and the `exit_code`. The command ran, the checks failed. |
+| The time limit is reached | Status `error`, with no `passed` value: `Stopped after the <N>s time limit, so there is no complete result.` |
+| You cancel (Ctrl+C or "Hey JARVIS") | The whole request is cancelled and the model gets no result. The audit log records the call as `unverified`. |
+
+### Python projects and project scripts
+
+- `python3` (or `python`) as the first item of `argv` means the project's own virtualenv: `.venv/bin/python`, else `venv/bin/python`. Without either, the name is looked up on `PATH`. The shipped `pytest` command uses `python3`, because Zorin OS 18 has no `python` command unless `python-is-python3` is installed; a project without a virtualenv then runs with the system Python, which needs pytest installed.
+- A relative path with a `/`, such as `bin/rails`, runs the project's own script (`<project>/bin/rails`). It must be executable.
+- Any other name, such as `npm` or `flutter`, is looked up on `PATH`. An absolute path is used as it is.
+
+### Your workspace
+
+Checked on 2026-10-21 against the shipped permissions file. None of these commands has been run.
+
+| Project | What it is | Tests | Lint |
+| --- | --- | --- | --- |
+| `~/Projects/RPMIS` | Rails 7.1 with minitest | `rails-test` fits (`bin/rails test`) | none fits |
+| `~/Projects/RentDitoMobile` | Expo app | none: `package.json` has no `"test"` script | `npm-lint` fits (`npm run lint`, which runs `expo lint`) |
+
+To trust RPMIS, so that its tests run without a prompt, add this to `config/permissions.toml` and restart JARVIS:
+
+```toml
+[projects.RPMIS]
+tests = "rails-test"
+confirm = false
+```
 
 ## Memory
 
@@ -372,7 +502,7 @@ When it starts, JARVIS prints: `Hands-free on: listening on this computer for "H
 | "Hey JARVIS, stop" (or another stop phrase) | Speech stops. Nothing is sent to the model. | The request is cancelled. Nothing new is sent to the model. | JARVIS prints `Stopped.` |
 
 - After an interruption JARVIS prints `[wake] Interrupted. Listening...` instead of `[wake] Listening...`.
-- A cancelled request prints `Request cancelled. Any step that had already finished is not undone.` Anything already completed stays done, and a tool that was already running may still finish (see [Known limitations](#known-limitations)).
+- A cancelled request prints `Request cancelled. Any step that had already finished is not undone.` Anything already completed stays done, and a tool that was already running may still finish (see [Known limitations](#known-limitations)). A running project command is the exception: it is stopped, with everything it started.
 - At a confirmation prompt, the wake word cancels the whole request: the action does not run and the model gets no further turn. A spoken "yes" can never approve an action.
 - The wake word also interrupts a spoken request that is still being transcribed, so "Hey JARVIS, stop" works at every stage.
 - **Stop phrases** only stop. The whole transcript, ignoring case and punctuation, must be one of: "stop", "stop it", "stop talking", "cancel", "never mind" ("nevermind"), "quiet", "be quiet", "shush", "that's enough" ("thats enough"), "enough", "nothing", "forget it". Anything longer, such as "stop, please", is sent to the model as a request.
@@ -413,7 +543,24 @@ When it starts, JARVIS prints: `Hands-free on: listening on this computer for "H
 .venv/bin/python -m pytest -q
 ```
 
-Tests live in `tests/`. `jarvis.py` accepts injected fakes (browser opener, search client, speech synthesiser, confirmation callback) so the tests can run without real side effects.
+The test suite lives in `tests/`, one file per area:
+
+| File | Covers |
+| --- | --- |
+| `test_config.py` | Settings, `.env` loading and the permissions file |
+| `test_audit.py` | Secret redaction and the audit trail |
+| `test_memory.py` | The JSON memory store |
+| `test_orchestrator.py` | The request lifecycle: agent loop, model calls and errors |
+| `test_permissions.py` | The permission policy, filesystem boundaries and security hardening |
+| `test_tools.py` | Web search and Linux integration tools |
+| `test_developer.py` | Developer tools (being added) |
+| `test_voice_output.py` | Spoken output: text cleanup, the voice engine and the chime |
+| `test_speech_input.py` | Push-to-talk recording and transcription |
+| `test_wake.py` | Hands-free mode and voice interruption |
+| `helpers.py` | Shared fakes and base test cases |
+| `conftest.py` | Makes the project packages importable |
+
+The tools, voice output and permission policy accept injected fakes (browser opener, search client, speech synthesiser, confirmation callback), so the tests run without a network, a Groq key, a browser, a microphone or audio.
 
 ## Troubleshooting on Zorin OS
 
@@ -427,10 +574,13 @@ Tests live in `tests/`. `jarvis.py` accepts injected fakes (browser opener, sear
 | "The Groq usage quota for this model is exhausted" | This is the daily limit. Wait for it to reset or switch `GROQ_MODEL`. See https://console.groq.com/settings/limits. |
 | "DuckDuckGo is rate-limiting searches" | Wait a minute or two and search less often. Shared IPs such as VPNs hit this more often. |
 | `open_project` says "The configured editor 'code' is not installed" | Install VS Code from the `.deb` at https://code.visualstudio.com (`sudo apt install ./code_*.deb`) or with `sudo snap install code --classic`. Or set `JARVIS_EDITOR`, for example `codium` or `flatpak run com.visualstudio.code`. |
-| `--check` warns the workspace does not exist / list_directory says `'.' does not exist` | Run `mkdir -p ~/Projects`, or set `JARVIS_WORKSPACE` to the folder that holds your projects. |
+| `--check` warns the workspace does not exist / `list_workspace_files` says `'.' does not exist` | Run `mkdir -p ~/Projects`, or set `JARVIS_WORKSPACE` to the folder that holds your projects. |
 | `open_url` / `open_youtube` report success but nothing opens | JARVIS can only confirm that it sent the request to the browser. Check `xdg-settings get default-web-browser`, set one with `xdg-settings set default-web-browser firefox.desktop`, and make sure you are running inside the desktop session, not over SSH. |
 | "Memory file ... is not valid JSON" | Find the error with `python3 -m json.tool jarvis_memory.json` and fix it, or type `/memory reset` in JARVIS to back the file up and start fresh. |
-| `Configuration error: ...` on startup | A variable in `.env` or your environment has an invalid value. The message names it. |
+| `Configuration error: ...` on startup | A variable in `.env` or your environment has an invalid value, or the permissions file breaks a rule. The message names the variable, or the file and the entry. See [Permissions file](#permissions-file). |
+| "No approved tests command fits &lt;project&gt;" | No command in the permissions file fits that project: none of its `detect` markers exist, or `package.json` lacks the `npm_script` (RentDitoMobile has no `"test"` script, for example). Add a command that fits, or map one with `[projects.<folder>] tests = "<name>"`, then restart JARVIS. "No tests commands are approved" means the file has none of that kind, or was not found (`--check` shows which). |
+| "'python' is not installed, not on PATH, or not executable" | A custom command uses `python`, the project has no `.venv` or `venv`, and Zorin OS has no `python` command by default. Create the project's virtualenv, run `sudo apt install python-is-python3`, or use `python3` in the command's `argv` (the shipped `pytest` command already does) (see [Python projects and project scripts](#python-projects-and-project-scripts)). |
+| A project's tests fail with database or connection errors | The tests need a service, such as a database, that is not running. Start it the way you normally would, then ask again. JARVIS does not start services. |
 | "I heard only silence" | The microphone is muted, or the wrong input is selected. Check Settings > Sound > Input (input level and device). `wpctl status` lists the sources and shows the default one. Test outside JARVIS with `arecord -d 3 /tmp/t.wav && aplay /tmp/t.wav`. |
 | "The microphone could not be opened (... busy ...)" | Another program is using the microphone, for example a video call or a browser tab. Close it and try again. |
 | "No microphone recorder found" / "Speech input unavailable" | Run `sudo apt install alsa-utils` (provides `arecord`). `--check` shows which recorder was found. |
@@ -461,7 +611,10 @@ Tests live in `tests/`. `jarvis.py` accepts injected fakes (browser opener, sear
 - **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget.
 - **Search returns snippets only.** JARVIS does not open or read the result pages.
 - **Memory of conversations is limited.** Context covers only the current session: the last `JARVIS_HISTORY_TURNS` exchanges, plus one-line summaries of older questions. Tool results are not carried between turns. The saved conversation log is a bounded record and is not fed back to the model.
-- **Tool timeouts cannot kill a hung tool.** Tools run in worker threads, and Python cannot stop a thread. A read-only tool that times out is reported as an error. A state-changing tool that times out is reported as `unverified`, because it may still finish. Pressing Ctrl+C has the same effect: the request is abandoned, but a tool already running may complete.
+- **Tool timeouts cannot kill a hung tool.** Tools run in worker threads, and Python cannot stop a thread. A read-only tool that times out is reported as an error. A state-changing tool that times out is reported as `unverified`, because it may still finish. Pressing Ctrl+C has the same effect: the request is abandoned, but a tool already running may complete. `run_project_tests` is the exception: its command and everything it started are stopped on its own time limit and on cancel.
+- **No file editing yet.** JARVIS can read files and run approved tests, but it has no tool to edit files or apply a patch, so it can report a failing test but not fix it.
+- **Tests of real projects may need services.** A project's test suite may expect a database or another service to be running. JARVIS does not start services, so such tests fail until you start them.
+- **Project commands run your project's code.** Approving a test run is approving whatever that code does, with your user's rights. Only the Groq key and JARVIS's own settings are kept out of its environment.
 - **App launches cannot be confirmed visually.** JARVIS checks that the process did not exit straight away, but it cannot see whether a window appeared.
 - Memory retrieval is keyword-based, not semantic.
 - **Tainting is per request.** If a reply repeats text from a web page or file, the next message you send starts untainted. Redaction is pattern-based and cannot catch every secret format, so keep real credentials out of the workspace.
@@ -470,10 +623,12 @@ Tests live in `tests/`. `jarvis.py` accepts injected fakes (browser opener, sear
 
 JARVIS stays a single agent throughout. Later versions add capabilities, not more agents.
 
+The developer-assistant work follows the phases of the architecture blueprint. Phase 3 is done. Phase 4 is next: diff inspection, controlled file edits with your approval, verification after a change, a planner and checkpoints.
+
 | Version | Focus |
 | --- | --- |
 | V1.1 | Voice input. Done: push-to-talk with Groq Whisper, the "Hey JARVIS" wake word and interrupting JARVIS by voice. Still to do: local (offline) transcription. |
-| V1.2 | Developer assistant features |
+| V1.2 | Developer assistant features. Done: opening projects, read-only git status, and running approved test and lint commands. Next: Phase 4. |
 | V2 | SQLite-backed memory (the `MemoryStore` interface is designed to be swapped) |
 | V2.1 | Desktop UI |
 | V3 | More advanced agent behaviour, still a single agent |
@@ -482,9 +637,30 @@ JARVIS stays a single agent throughout. Later versions add capabilities, not mor
 
 | Path | Purpose |
 | --- | --- |
-| `jarvis.py` | The whole application: config, logging, memory, permissions, tools, voice, speech input, hands-free wake word, agent loop, CLI |
+| `jarvis.py` | The entry point, run with `python jarvis.py`: the `--check` diagnostics (`run_checks`), command-line options (`parse_args`) and `main`. It also re-exports the main public names, so `import jarvis` still works for scripts and tests. |
+| `config/settings.py` | Environment variables, `.env` loading, validated settings, and loading the permissions file |
+| `config/permissions.toml` | Approved apps, project commands and project rules (see [Permissions file](#permissions-file)) |
+| `core/audit.py` | Logging, secret redaction and the audit trail |
+| `core/context.py` | The JARVIS persona and the prompt built for each request |
+| `core/orchestrator.py` | The request lifecycle: the bounded model/tool loop |
+| `core/policy.py` | Permission classes and the policy that decides whether a tool call may run |
+| `core/session.py` | The conversation session (recent turns) |
+| `intelligence/groq_client.py` | The Groq provider: client setup, model checks, chat calls and error translation |
+| `memory/json_store.py` | The JSON memory store |
+| `tools/registry.py` | Tool definitions, argument validation, and running a tool behind the permission policy |
+| `tools/catalog.py` | The tool set and its registration: schemas and permission classes |
+| `tools/linux_system.py` | Time, system status and battery, processes, network, applications, and the bounded command runner |
+| `tools/filesystem.py` | Workspace files, path restrictions and notes |
+| `tools/web_search.py` | DuckDuckGo search |
+| `tools/browser.py` | Opening web pages and YouTube searches |
+| `tools/developer.py` | Opening projects, git status, and running approved project commands |
+| `tools/memory_tools.py` | The memory tools |
+| `voice/output.py` | Spoken output: edge-tts and local playback |
+| `voice/input.py` | Push-to-talk recording and Groq Whisper transcription |
+| `voice/wake.py` | Hands-free mode: wake word and voice interruption |
+| `ui/terminal.py` | The terminal interface: chat loop, commands, confirmations and voice turns |
+| `tests/` | The pytest suite (see [Running tests](#running-tests)) |
 | `requirements.txt` | Pinned Python dependencies |
 | `requirements-wake.txt` | Optional runtime dependencies for the wake-word engine (install `openwakeword` itself with `--no-deps`, see [Hands-free mode](#hands-free-mode-wake-word)) |
 | `.env.example` | Configuration template; copy to `.env` |
 | `jarvis_memory.json` | Your memory file (gitignored; recreated if missing) |
-| `tests/` | pytest suite |

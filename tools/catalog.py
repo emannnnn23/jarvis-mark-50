@@ -12,7 +12,7 @@ from memory.json_store import MAX_FACT_LENGTH
 from tools.browser import BrowserTools
 from tools.developer import DeveloperTools
 from tools.filesystem import FileTools
-from tools.linux_system import SystemTools
+from tools.linux_system import SystemTools, cancel_running_commands
 from tools.memory_tools import MemoryTools
 from tools.registry import Tool, ToolRegistry
 from tools.web_search import WebSearchTools
@@ -77,36 +77,46 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
         Tool("set_user_profile", "Store the user's name and/or location, only when the user states them.",
              _object({"user_name": _string("User's name", 100), "location": _string("User's location", 200)}),
              tools.set_user_profile, C, timeout=10),
-        Tool("system_status", "Report hostname, OS, uptime, CPU load, memory and disk usage.", _object(),
-             tools.system_status, R, timeout=15),
+        Tool("get_system_status", "Report hostname, OS, uptime, CPU load, memory, disk usage and battery.", _object(),
+             tools.get_system_status, R, timeout=15),
         Tool("list_processes", "List the top running processes by CPU or memory.",
              _object({"sort_by": {"type": "string", "enum": ["cpu", "memory"]},
                       "limit": {"type": "integer", "minimum": 1, "maximum": 25}}),
              tools.list_processes, R, timeout=15),
         Tool("check_network", "Check DNS and HTTPS connectivity to the internet.", _object(),
              tools.check_network, R, timeout=20),
-        Tool("launch_app", "Launch an approved desktop application: " + ", ".join(sorted(tools.config.apps)) + ".",
+        Tool("open_application", "Launch an approved desktop application: " + ", ".join(sorted(tools.config.apps)) + ".",
              _object({"name": _string("Application name", 60)}, ["name"]),
-             tools.launch_app, C, tools._describe_launch, timeout=15),
+             tools.open_application, C, tools._describe_launch, timeout=15),
         Tool("open_project", "Open a project directory inside the workspace in the configured code editor.",
              _object({"path": _string("Directory path relative to the workspace", 500)}, ["path"]),
              tools.open_project, C, lambda a: (f"Open {a['path']!r} in {tools.config.editor}", [a["path"]]), timeout=15),
-        Tool("list_directory", "List files in a workspace directory. Paths are relative to the workspace root.",
+        Tool("list_workspace_files", "List files in a workspace directory. Paths are relative to the workspace root.",
              _object({"path": _string("Directory; '.' is the workspace root", 500, 0)}),
-             tools.list_directory, R, timeout=10, untrusted_output=True),
-        Tool("read_file", "Read a text file inside the workspace. Protected files (.env, keys) are refused.",
+             tools.list_workspace_files, R, timeout=10, untrusted_output=True),
+        Tool("read_workspace_file", "Read a text file inside the workspace. Protected files (.env, keys) are refused.",
              _object({"path": _string("File path relative to the workspace", 500),
                       "max_chars": {"type": "integer", "minimum": 100, "maximum": 9000}},
                      ["path"]),
-             tools.read_file, R, timeout=10, untrusted_output=True),
+             tools.read_workspace_file, R, timeout=10, untrusted_output=True),
         Tool("create_note", "Create a Markdown note in the notes folder. Set overwrite only if the user agreed.",
              _object({"title": _string("Note title", 120), "content": _string("Note body (Markdown)", 20000),
                       "overwrite": {"type": "boolean", "description": "Replace an existing note with this title"}},
                      ["title", "content"]),
              tools.create_note, tools._note_permission, tools._describe_note, timeout=10),
-        Tool("git_status", "Read-only git status and diff summary for a repository inside the workspace.",
+        Tool("inspect_git_status", "Read-only git status and diff summary for a repository inside the workspace.",
              _object({"path": _string("Repository directory relative to the workspace", 500)}, ["path"]),
-             tools.git_status, R, timeout=35, untrusted_output=True),
+             tools.inspect_git_status, R, timeout=35, untrusted_output=True),
+        Tool("run_project_tests",
+             "Run a project's tests (or linter) with a command approved in the permissions file, and report "
+             "the exit code and the end of the output. Approved commands: "
+             + (", ".join(f"{name} ({spec.kind})" for name, spec in tools.config.commands.items()) or "none") + ".",
+             _object({"project": _string("Project folder relative to the workspace", 500),
+                      "check": {"type": "string", "enum": ["tests", "lint"], "description": "Default: tests"},
+                      "command": _string("Optional: an approved command name; normally chosen automatically", 41)},
+                     ["project"]),
+             tools.run_project_tests, tools._project_command_permission, tools._describe_project_command,
+             timeout=3600 + 60, untrusted_output=True, cancel=cancel_running_commands),
     ):
         registry.register(tool)
     return registry

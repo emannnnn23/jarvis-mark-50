@@ -44,7 +44,7 @@ class AuditLogTests(TempDirTestCase):
         registry = jarvis.build_registry(jarvis.JarvisTools(self.config, memory, browser_open=FakeBrowser()))
         policy = jarvis.PermissionPolicy("standard", confirm=Recorder(True))
         secret = "gsk_" + "Q7" * 20
-        result = jarvis.execute_tool(registry, policy, "read_file", json.dumps({"path": f"{secret}.txt"}))
+        result = jarvis.execute_tool(registry, policy, "read_workspace_file", json.dumps({"path": f"{secret}.txt"}))
         self.assertEqual(result["status"], jarvis.STATUS_ERROR)
         self.assertNotIn(secret, json.dumps(result))
         for handler in jarvis.audit_log.handlers + jarvis.log.handlers:
@@ -52,7 +52,7 @@ class AuditLogTests(TempDirTestCase):
         audit_text = (self.log_dir / "audit.log").read_text(encoding="utf-8")
         lines = [json.loads(line) for line in audit_text.splitlines() if line.strip()]
         entry = [e for e in lines if e.get("event") == "tool_call"][-1]
-        self.assertEqual(entry["tool"], "read_file")
+        self.assertEqual(entry["tool"], "read_workspace_file")
         self.assertEqual(entry["status"], "error")
         self.assertNotIn(secret, audit_text)
         self.assertNotIn(secret, (self.log_dir / "jarvis.log").read_text(encoding="utf-8"))
