@@ -172,11 +172,11 @@ def run_bounded(argv: list[str], cwd: Path, timeout: float, env: dict[str, str] 
         )
     except OSError as exc:
         raise ToolError(f"Could not run '{argv[0]}': {exc.strerror or exc}") from None
-    reader = _TailReader(process.stdout.fileno())
-    reader.start()
-    with _running_lock:
+    with _running_lock:  # register at once, so a cancel from now on can find it
         _running.add(process)
         cancelled_while_starting = _cancel_generation != generation
+    reader = _TailReader(process.stdout.fileno())
+    reader.start()
     timed_out = False
     try:
         if cancelled_while_starting:

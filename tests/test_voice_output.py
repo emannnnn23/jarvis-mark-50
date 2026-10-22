@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import tempfile
 import threading
+import time
 import unittest
+import warnings
 import wave
 from pathlib import Path
 from unittest import mock
 
 import jarvis  # noqa: E402
+from voice import output  # noqa: E402
 
 
 class SpeechTextTests(unittest.TestCase):
@@ -345,6 +349,62 @@ class VoiceEngineHandsFreeTests(unittest.TestCase):
             self.assertAlmostEqual(seconds, duration)
             self.assertGreater(peak, 0.1)
             self.assertLess(peak, 0.3)  # a soft cue, not a blast
+
+
+class ShutdownCancelsPendingTasksTests(unittest.TestCase):
+    def make_voice(self):
+        voice = jarvis.VoiceEngine(enabled=False, player=["fake-player"], notify=lambda message: None)
+        self.addCleanup(voice.shutdown)
+        self.started, self.finished = threading.Event(), threading.Event()
+
+        async def slow_play(path):
+            self.started.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                self.finished.set()
+
+        voice._play = slow_play
+        return voice
+
+    def shutdown_and_collect(self, voice) -> list[str]:
+        """Shut down, collect garbage, and return any 'never awaited' warnings (asyncio must log no errors)."""
+        with warnings.catch_warnings(record=True) as caught, self.assertNoLogs("asyncio", level="ERROR"):
+            warnings.simplefilter("always")
+            began = time.monotonic()
+            voice.shutdown()
+            self.assertLess(time.monotonic() - began, 2.5)
+            gc.collect()
+        return [str(w.message) for w in caught if "never awaited" in str(w.message)]
+
+    def test_chime_scheduled_just_before_shutdown_leaves_no_unawaited_coroutine(self):
+        voice = self.make_voice()
+        voice.chime()
+        self.assertEqual(self.shutdown_and_collect(voice), [])
+        self.assertIsNone(voice._loop)
+        if self.started.is_set():
+            self.assertTrue(self.finished.is_set(), "a chime that started must be cancelled and unwound")
+
+    def test_playing_chime_is_cancelled_by_shutdown(self):
+        voice = self.make_voice()
+        voice.chime()
+        self.assertTrue(self.started.wait(2))
+        self.assertEqual(self.shutdown_and_collect(voice), [])
+        self.assertTrue(self.finished.is_set())
+
+    def test_cancel_pending_tasks_cancels_all_but_the_current_task(self):
+        async def main():
+            sleeper = asyncio.ensure_future(asyncio.sleep(30))
+            await asyncio.sleep(0)
+            await output._cancel_pending_tasks()
+            return sleeper
+
+        loop = asyncio.new_event_loop()
+        try:
+            sleeper = loop.run_until_complete(main())
+        finally:
+            loop.close()
+        self.assertTrue(sleeper.cancelled())
 
 
 if __name__ == "__main__":

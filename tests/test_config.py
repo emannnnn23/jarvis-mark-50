@@ -15,6 +15,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 )
 import jarvis  # noqa: E402
 from config.settings import (  # noqa: E402
+    APP_NAME,
     COMMAND_KINDS,
     DEFAULT_APPS,
     DEFAULT_PERMISSIONS_FILE,
@@ -116,6 +117,41 @@ class ConfigTests(unittest.TestCase):
             config = jarvis.Config.from_env(env=self.env(JARVIS_WORKSPACE=tmp, JARVIS_LOG_DIR=tmp + "/logs"))
             self.assertEqual(config.workspace, Path(tmp))
             self.assertEqual(config.log_dir, Path(tmp) / "logs")
+
+
+class DeveloperSettingsTests(unittest.TestCase):
+    def env(self, **extra):
+        return {"GROQ_API_KEY": FAKE_KEY, **extra}
+
+    def test_backup_dir_default_follows_xdg_data_home(self):
+        config = jarvis.Config.from_env(env=self.env(XDG_DATA_HOME="/data/home"))
+        self.assertEqual(config.backup_dir, Path("/data/home") / APP_NAME / "backups")
+        self.assertEqual(config.log_dir.parent, config.backup_dir.parent)
+        with mock.patch("pathlib.Path.home", return_value=Path("/home/someone")):
+            self.assertEqual(jarvis.Config.from_env(env=self.env()).backup_dir,
+                             Path("/home/someone/.local/share") / APP_NAME / "backups")
+
+    def test_backup_dir_from_env(self):
+        self.assertEqual(jarvis.Config.from_env(env=self.env(JARVIS_BACKUP_DIR="/srv/jarvis-backups")).backup_dir,
+                         Path("/srv/jarvis-backups"))
+        with mock.patch.dict("os.environ", {"HOME": "/home/someone"}):
+            self.assertEqual(jarvis.Config.from_env(env=self.env(JARVIS_BACKUP_DIR="~/bk")).backup_dir,
+                             Path("/home/someone/bk"))
+        blank = jarvis.Config.from_env(env=self.env(JARVIS_BACKUP_DIR="  ", XDG_DATA_HOME="/d"))
+        self.assertEqual(blank.backup_dir, Path("/d") / APP_NAME / "backups")
+
+    def test_max_dev_tool_rounds(self):
+        self.assertEqual(jarvis.Config.from_env(env=self.env()).max_dev_tool_rounds, 14)
+        self.assertEqual(jarvis.Config(api_key=FAKE_KEY).max_dev_tool_rounds, 14)
+        for value, expected in (("1", 1), ("40", 40), (" 20 ", 20)):
+            with self.subTest(value=value):
+                config = jarvis.Config.from_env(env=self.env(JARVIS_MAX_DEV_TOOL_ROUNDS=value))
+                self.assertEqual(config.max_dev_tool_rounds, expected)
+        for value in ("0", "41", "abc", "2.5", "-3"):
+            with self.subTest(value=value):
+                with self.assertRaises(jarvis.ConfigError) as ctx:
+                    jarvis.Config.from_env(env=self.env(JARVIS_MAX_DEV_TOOL_ROUNDS=value))
+                self.assertIn("JARVIS_MAX_DEV_TOOL_ROUNDS", str(ctx.exception))
 
 
 class LoadEnvFileTests(unittest.TestCase):

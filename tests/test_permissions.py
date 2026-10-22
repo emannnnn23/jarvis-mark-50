@@ -439,5 +439,51 @@ class SecurityHardeningTests(AgentTestCase):
         self.assertTrue(cleaned_up.is_set())
 
 
+class ConfirmationDetailsTests(unittest.TestCase):
+    """ConfirmationRequest.details, (operation, paths[, details]) from describe_call, and describe failures."""
+
+    def evaluate(self, describe, confirm=None):
+        tool = jarvis.Tool("act", "d", jarvis._object({}), lambda: None, jarvis.Permission.SENSITIVE_ACTION, describe)
+        confirm = confirm or Recorder(True)
+        return jarvis.PermissionPolicy("standard", confirm=confirm).evaluate(tool, {"x": 1}), confirm
+
+    def test_details_default_to_empty(self):
+        request = jarvis.ConfirmationRequest("t", jarvis.Permission.SENSITIVE_ACTION, "op", [])
+        self.assertEqual(request.details, "")
+        self.assertEqual(request.reason, "")
+
+    def test_three_tuple_passes_the_details_to_the_prompt(self):
+        decision, confirm = self.evaluate(lambda args: ("Edit a.py", ["/w/a.py"], "--- a/a.py\n+++ b/a.py"))
+        self.assertTrue(decision.allowed)
+        self.assertTrue(decision.confirmed)
+        [request] = confirm.calls
+        self.assertEqual((request.tool_name, request.operation, request.affected_paths, request.details),
+                         ("act", "Edit a.py", ["/w/a.py"], "--- a/a.py\n+++ b/a.py"))
+
+    def test_two_tuple_and_default_description_have_no_details(self):
+        _, confirm = self.evaluate(lambda args: ("Do it", ["/w"]))
+        self.assertEqual(confirm.calls[0].details, "")
+        _, confirm = self.evaluate(None)
+        self.assertEqual(confirm.calls[0].operation, 'act({"x": 1})')
+        self.assertEqual(confirm.calls[0].details, "")
+
+    def test_describe_failure_is_reported_as_not_done_without_asking(self):
+        for error in (jarvis.ToolError("old_text was not found in the file."), RuntimeError("disk gone")):
+            with self.subTest(error=type(error).__name__):
+                def describe(args, error=error):
+                    raise error
+
+                decision, confirm = self.evaluate(describe)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.reason, f"Not done: {error}")
+                self.assertEqual(confirm.calls, [])
+
+    def test_declined_with_details(self):
+        decision, confirm = self.evaluate(lambda args: ("Edit", [], "diff"), confirm=Recorder(False))
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "The user declined this operation.")
+        self.assertEqual(confirm.calls[0].details, "diff")
+
+
 if __name__ == "__main__":
     unittest.main()

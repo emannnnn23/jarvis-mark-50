@@ -34,6 +34,13 @@ class JarvisTools(WebSearchTools, BrowserTools, MemoryTools, SystemTools, FileTo
         self.ddgs_factory = ddgs_factory
 
 
+# Offered to the model only in developer mode, so everyday requests carry fewer tool definitions.
+DEVELOPER_TOOLS = frozenset({
+    "list_workspace_files", "read_workspace_file", "inspect_git_status", "inspect_git_diff", "inspect_git_history",
+    "describe_project", "search_workspace_code", "edit_workspace_file", "create_workspace_file", "run_project_tests",
+})
+
+
 def _string(description: str, max_length: int = 500, min_length: int = 1) -> dict[str, Any]:
     return {"type": "string", "description": description, "minLength": min_length, "maxLength": max_length}
 
@@ -107,6 +114,45 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
         Tool("inspect_git_status", "Read-only git status and diff summary for a repository inside the workspace.",
              _object({"path": _string("Repository directory relative to the workspace", 500)}, ["path"]),
              tools.inspect_git_status, R, timeout=35, untrusted_output=True),
+        Tool("inspect_git_diff", "Read-only full git diff of a workspace repository, or of one file in it. "
+             "Protected files are excluded.",
+             _object({"path": _string("Repository directory relative to the workspace", 500),
+                      "file": _string("Optional: a file inside the repository", 500),
+                      "staged": {"type": "boolean", "description": "Show staged changes instead"}},
+                     ["path"]),
+             tools.inspect_git_diff, R, timeout=35, untrusted_output=True),
+        Tool("inspect_git_history", "Read-only recent commits with the files each changed, plus uncommitted "
+             "changes. since: 'today', 'yesterday', 'N days ago' or a date.",
+             _object({"path": _string("Repository directory relative to the workspace", 500),
+                      "since": _string("Optional time range", 30),
+                      "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+                     ["path"]),
+             tools.inspect_git_history, R, timeout=35, untrusted_output=True),
+        Tool("describe_project", "Orientation for a workspace project: type, top-level layout, git branch and "
+             "recent commits, approved test commands, and the start of the README.",
+             _object({"path": _string("Project directory relative to the workspace", 500)}, ["path"]),
+             tools.describe_project, R, timeout=35, untrusted_output=True),
+        Tool("search_workspace_code", "Plain-text search through a project's source files (not regex). Skips "
+             "dependencies, builds, binaries and protected files.",
+             _object({"query": _string("Text to find", 200),
+                      "path": _string("Folder or file relative to the workspace; default the whole workspace", 500, 0),
+                      "case_sensitive": {"type": "boolean"},
+                      "max_results": {"type": "integer", "minimum": 1, "maximum": 100}},
+                     ["query"]),
+             tools.search_workspace_code, R, timeout=60, untrusted_output=True),
+        Tool("edit_workspace_file", "Change a text file in the workspace by replacing one exact, unique piece of "
+             "text. The user sees the diff and must approve it. Copy old_text exactly from the file.",
+             _object({"path": _string("File path relative to the workspace", 500),
+                      "old_text": _string("Exact text to replace; must occur once", 20000),
+                      "new_text": _string("Replacement text (may be empty to remove old_text)", 40000, 0)},
+                     ["path", "old_text", "new_text"]),
+             tools.edit_workspace_file, S, tools._describe_edit, timeout=30),
+        Tool("create_workspace_file", "Create a new text file in the workspace (never overwrites). The user sees "
+             "the content and must approve it.",
+             _object({"path": _string("New file path relative to the workspace", 500),
+                      "content": _string("File content", 200000, 0)},
+                     ["path", "content"]),
+             tools.create_workspace_file, S, tools._describe_create, timeout=30),
         Tool("run_project_tests",
              "Run a project's tests (or linter) with a command approved in the permissions file, and report "
              "the exit code and the end of the output. Approved commands: "
@@ -118,5 +164,7 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
              tools.run_project_tests, tools._project_command_permission, tools._describe_project_command,
              timeout=3600 + 60, untrusted_output=True, cancel=cancel_running_commands),
     ):
+        if tool.name in DEVELOPER_TOOLS:
+            tool.group = "developer"
         registry.register(tool)
     return registry

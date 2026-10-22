@@ -313,7 +313,9 @@ class Config:
     workspace: Path = Path.home() / "Projects"
     notes_dir: Path = Path.home() / "Documents" / "JARVIS Notes"
     log_dir: Path = _xdg_dir("XDG_DATA_HOME", ".local/share") / APP_NAME / "logs"
+    backup_dir: Path = _xdg_dir("XDG_DATA_HOME", ".local/share") / APP_NAME / "backups"
     max_tool_rounds: int = 8
+    max_dev_tool_rounds: int = 14  # developer tasks (look, edit, test, re-test) need more steps
     search_limit: int = 5
     log_level: str = "INFO"
     history_turns: int = 10
@@ -381,7 +383,9 @@ class Config:
             workspace=path_setting("JARVIS_WORKSPACE", Path.home() / "Projects"),
             notes_dir=path_setting("JARVIS_NOTES_DIR", Path.home() / "Documents" / "JARVIS Notes"),
             log_dir=path_setting("JARVIS_LOG_DIR", data_home / APP_NAME / "logs"),
+            backup_dir=path_setting("JARVIS_BACKUP_DIR", data_home / APP_NAME / "backups"),
             max_tool_rounds=_env_int(env, "JARVIS_MAX_TOOL_ROUNDS", 8, 1, 25),
+            max_dev_tool_rounds=_env_int(env, "JARVIS_MAX_DEV_TOOL_ROUNDS", 14, 1, 40),
             search_limit=_env_int(env, "JARVIS_SEARCH_LIMIT", 5, 1, 10),
             log_level=log_level,
             history_turns=_env_int(env, "JARVIS_HISTORY_TURNS", 10, 0, 50),

@@ -6,6 +6,7 @@ import contextlib
 import datetime as dt
 import os
 import queue
+import re
 import select
 import signal
 import sys
@@ -31,6 +32,25 @@ if TYPE_CHECKING:
     from voice.wake import WakeWordListener
 
 
+MAX_DETAIL_LINES = 120
+
+
+def print_details(details: str) -> None:
+    """Show a confirmation's details (usually a unified diff), coloured and capped in length."""
+    lines = safe_display(details).splitlines()
+    for line in lines[:MAX_DETAIL_LINES]:
+        if line.startswith("+") and not line.startswith("+++"):
+            print("   " + style(line, "green"))
+        elif line.startswith("-") and not line.startswith("---"):
+            print("   " + style(line, "red"))
+        elif line.startswith("@@"):
+            print("   " + style(line, "cyan"))
+        else:
+            print("   " + line)
+    if len(lines) > MAX_DETAIL_LINES:
+        print("   " + style(f"... {len(lines) - MAX_DETAIL_LINES} more lines not shown", "dim"))
+
+
 def terminal_confirm(request: ConfirmationRequest) -> bool:
     """Ask the person at the keyboard to approve one specific operation."""
     if not sys.stdin.isatty():
@@ -42,6 +62,8 @@ def terminal_confirm(request: ConfirmationRequest) -> bool:
         print(f"   Affects:   {safe_display(path)}")
     if request.reason:
         print(f"   Why asked: {request.reason}")
+    if request.details:
+        print_details(request.details)
     try:
         answer = input("   Type 'yes' to proceed, anything else cancels: ")
     except (EOFError, KeyboardInterrupt):
@@ -61,6 +83,21 @@ def style(text: str, colour: str) -> str:
 
 EXIT_WORDS = {"exit", "quit", "/exit", "/quit", "goodbye", "goodbye jarvis", "bye jarvis"}
 
+# Words that mean a request is about code; mentioning a workspace project's name counts too.
+_DEVELOPER_WORDS = re.compile(
+    r"\b(code|codebase|source|repo|repos|repository|git|diff|commit|commits|branch|test|tests|testing|lint|"
+    r"linter|bug|bugs|fix|fixes|refactor|function|method|class|module|file|files|folder|project|projects|"
+    r"build|compile|error|exception|stack ?trace|traceback|changed|changes|readme|architecture|implement|"
+    r"rails|ruby|python|flutter|dart|npm|node|javascript|typescript|expo|react)\b", re.IGNORECASE)
+
+
+def looks_like_developer_request(text: str, project_names: set[str] = frozenset()) -> bool:
+    if _DEVELOPER_WORDS.search(text):
+        return True
+    # A sentence's closing full stop is not part of the project name.
+    words = {word.rstrip(".") for word in re.findall(r"[a-z0-9_.-]+", text.lower())}
+    return bool(words & project_names)
+
 
 HELP_TEXT = """Talk to JARVIS in plain English, for example:
   search for the latest Python release      what time is it?
@@ -77,6 +114,7 @@ Commands:
   /status            show configuration    exit            leave JARVIS
   /talk              speak one message     /listen on|off  push-to-talk: Enter on an empty line = speak
   /wake on|off       hands-free: say "Hey JARVIS", then your request
+  /dev on|off        developer tools (files, git, edits, tests); they switch on when you ask about code
 Saying "Hey JARVIS" while JARVIS is talking or working interrupts it; "Hey JARVIS, stop" just stops it.
 Press Ctrl+C while JARVIS is working to cancel the current request.
 Confirmation prompts must always be typed; a spoken "yes" cannot approve an action."""
@@ -99,6 +137,7 @@ class JarvisCLI:
         self.listen_mode = False
         self._speech_disclosed = False
         self.conversation = Conversation(max_turns=ctx.config.history_turns)
+        self.developer_mode = False  # offer the developer tools (files, git, edits, tests) to the model
         self.wake_factory = wake_factory
         self.wake: WakeWordListener | None = None
         self._want_wake = wake
@@ -338,6 +377,11 @@ class JarvisCLI:
             self._toggle_voice(rest)
         elif command == "/stop":
             self.voice.stop()
+        elif command == "/dev":
+            if rest in ("on", "off"):
+                self.developer_mode = rest == "on"
+            print(f"  Developer tools are {'on' if self.developer_mode else 'off'}"
+                  + ("." if rest in ("on", "off") else ". Use /dev on or /dev off."))
         elif command == "/listen":
             if rest in ("on", "off"):
                 self._set_listen(rest == "on")
@@ -359,7 +403,8 @@ class JarvisCLI:
             for label, value in (("Model", cfg.model), ("Voice", f"{cfg.voice} ({'on' if self.voice.enabled else 'off'})"),
                                  ("Permission mode", self.ctx.policy.mode), ("Memory file", cfg.memory_path),
                                  ("Workspace", cfg.workspace), ("Notes", cfg.notes_dir), ("Logs", cfg.log_dir),
-                                 ("Max tool rounds", cfg.max_tool_rounds),
+                                 ("Max tool rounds", f"{cfg.max_tool_rounds} ({cfg.max_dev_tool_rounds} with developer tools)"),
+                                 ("Developer tools", "on" if self.developer_mode else "off (on when you ask about code)"),
                                  ("Speech input", f"{cfg.stt_backend}/{cfg.stt_model}, push-to-talk "
                                                   f"{'on' if self.listen_mode else 'off'}"),
                                  ("Hands-free", f"{'on' if self.hands_free else 'off'} ({cfg.wake_model}, "
@@ -420,13 +465,27 @@ class JarvisCLI:
         else:
             print("  Voice off; text only.")
 
+    def _maybe_enter_developer_mode(self, text: str) -> None:
+        if not self.developer_mode and looks_like_developer_request(text, self._project_names()):
+            self.developer_mode = True
+            print(style("  (developer tools on for this session; /dev off to hide them)", "dim"))
+
+    def _project_names(self) -> set[str]:
+        try:
+            return {p.name.lower() for p in self.ctx.config.workspace.expanduser().iterdir()
+                    if p.is_dir() and not p.name.startswith(".")}
+        except OSError:
+            return set()
+
     def handle_message(self, text: str) -> None:
         self.voice.stop()
+        self._maybe_enter_developer_mode(text)
         print(style("  ...", "dim"))
         try:
             result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
                                on_tool=lambda name: print(style(f"  > {name}", "dim")),
-                               on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")))
+                               on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
+                               tool_groups={"core", "developer"} if self.developer_mode else {"core"})
         except KeyboardInterrupt:
             self._consume_interrupt()  # a wake-word interruption is fully handled here
             print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))

@@ -108,6 +108,18 @@ def verify_model(client, model: str) -> None:
                              f"Set GROQ_MODEL to one of: {suggestions or ', '.join(available[:8])}", "model")
 
 
+_tool_validation_flag_supported = True
+
+
+def _flag_unsupported() -> None:
+    global _tool_validation_flag_supported
+    _tool_validation_flag_supported = False
+
+
+# Free-tier per-minute limits can ask for waits of a minute or so in the middle of a multi-step task.
+MAX_RETRY_WAIT = 60
+
+
 def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *,
                tool_choice: str = "auto", max_retries: int = 3, sleep: Callable[[float], None] = time.sleep,
                on_retry: Callable[[str, float], None] | None = None, reasoning_effort: str = ""):
@@ -118,12 +130,20 @@ def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[d
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
+        if _tool_validation_flag_supported:
+            # JARVIS validates every tool call itself and returns precise errors the model can
+            # correct, instead of Groq rejecting the whole request over one malformed call.
+            kwargs["disable_tool_validation"] = True
     attempt = 0
     while True:
         try:
             return client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             error = classify_api_error(exc, model)
+            if error.kind == "bad_request" and "disable_tool_validation" in str(error) \
+                    and kwargs.pop("disable_tool_validation", None):
+                _flag_unsupported()  # this model or account does not take the option: carry on without it
+                continue
             if not error.retryable or attempt >= max_retries:
                 raise error from exc
             if error.kind == "tool_use_failed":
@@ -133,7 +153,7 @@ def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[d
                 delay = 0.0
             else:
                 delay = error.retry_after if error.retry_after is not None else min(2 ** attempt, 8)
-                if delay > 30:
+                if delay > MAX_RETRY_WAIT:
                     raise error from exc
             log.info("Retrying Groq call after %s (attempt %d)", error.kind, attempt + 1)
             if on_retry and delay:

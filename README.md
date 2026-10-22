@@ -1,6 +1,6 @@
 # JARVIS MARK 50
 
-JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python as a set of small packages (see [Project layout](#project-layout)) and started with `python jarvis.py`. It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 19 tools that JARVIS defines: web search, the clock, system status (including the battery), a small JSON memory, Markdown notes, read-only file and git access inside one workspace folder, launching a fixed list of desktop apps, and running a project's tests or linter with a command you approved in `config/permissions.toml`. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell and never writes a command line: it can only pick an approved command by name. It cannot install software and cannot delete files. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
+JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python as a set of small packages (see [Project layout](#project-layout)) and started with `python jarvis.py`. It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 25 tools that JARVIS defines: web search, the clock, system status (including the battery), a small JSON memory, Markdown notes, launching a fixed list of desktop apps, and, inside one workspace folder, reading files, inspecting git (status, diff, history), searching code, changing or creating text files after you approve the exact diff, and running a project's tests or linter with a command you approved in `config/permissions.toml`. The 10 code tools are offered only in [developer mode](#developer-mode), which switches on when you ask about code. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell and never writes a command line: it can only pick an approved command by name. It cannot install software, delete or rename files, or commit or push. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
 
 - Version: 1.0.0 (`python jarvis.py --version`)
 - Target: Zorin OS 18 (Ubuntu 24.04 "noble" base), Python 3.12. Requires Python 3.10 or newer.
@@ -29,38 +29,49 @@ JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python
 | Project tests: time limit | Verified on 2026-10-21: a hanging test that had started a child `sleep` was stopped at a 5 s limit, and the child `sleep` was gone too. |
 | Project tests: live conversation | Verified on 2026-10-21 with `openai/gpt-oss-20b`: the model ran the tests after confirmation and correctly named the broken assertion. It understood the follow-up "And the passing one?", and reported the battery through `get_system_status` ("51% – not plugged in"). |
 | Project tests: your real projects | **Not run, by design.** No command has been run on your own projects (such as RPMIS); you decide when. See [Your workspace](#your-workspace). |
+| Developer tools: inspection | Verified on 2026-10-21/22 with real runs on a temporary git repository, `calc`, that had a bug in `subtract`, a failing test, an uncommitted `README` change and a tracked `.env` holding a fake secret. `describe_project` found branch `master`, the commit, 2 uncommitted files and the approved `pytest` command. `search_workspace_code` for `def subtract` found `calc/calc.py:5`. `inspect_git_diff` showed the README change and left out the `.env` change and its secret. `inspect_git_history` with `since="today"` listed the commit. |
+| Developer tools: changing code | Verified on 2026-10-21/22 on the same repository. The edit confirmation showed the exact one-line diff with `(tracked by git, no other uncommitted changes)`. After approval the file was written and verified, a backup was made, and the uncommitted README change was kept. Re-running the tests passed. Editing `calc/.env` was refused, and `create_workspace_file` on an existing file was refused. |
+| Developer tools: live end to end | Verified on 2026-10-21/22 with `openai/gpt-oss-120b` and the request "The tests in the calc project are failing. Find the bug, fix it, and prove it's fixed." The model looked at the project, ran the tests (failed), read the code, and proposed the exact diff (`a + b` to `a - b`), which was applied after approval. Its first edit attempt was wrong and was corrected after JARVIS's own validation feedback. It re-ran the tests (2 passed) and reported "Sir, the subtraction function mistakenly added the operands … All tests now pass: 2 passed". It took 10 rounds and about 3.5 minutes, mostly waiting on the free-tier limit of 8,000 tokens per minute. |
+| Developer tools: problems found and fixed | Found during those runs and fixed (see [Reliability](#reliability)): (1) a rate-limit wait over 30 s aborted the task without saying a file had already been changed; waits of up to 60 s are now allowed, and an API failure after steps ran reports exactly which steps ran. (2) The identical-call cache served a stale test result after an edit; it now resets after any step that changes something. (3) Groq rejected a malformed tool call outright; Groq's own tool-call validation is now turned off, and JARVIS's validation sends correctable errors back to the model. |
+| Developer tools: your real projects | **Not tested.** All the runs above used the temporary demo repository. |
 
 ## Features
 
 ### Personality
 
-JARVIS treats you as its creator: loyal, familiar and candid, in a British voice, addressing you as Sir. It thinks a command through and then carries it out, without asking permission or questions it can answer itself. If it sees a problem or a better approach it says so in one sentence, but still does what you asked when its tools allow. Its disagreement is advice, not refusal. This does not bypass any safety rule: sensitive actions still stop at the typed confirmation prompt, it can run only the project commands you approved, and it still cannot run shell commands, install software or delete files.
+JARVIS treats you as its creator: loyal, familiar and candid, in a British voice, addressing you as Sir. It thinks a command through and then carries it out, without asking permission or questions it can answer itself. If it sees a problem or a better approach it says so in one sentence, but still does what you asked when its tools allow. Its disagreement is advice, not refusal. This does not bypass any safety rule: sensitive actions, including every file change, still stop at the typed confirmation prompt, it can run only the project commands you approved, and it still cannot run shell commands, install software, delete files, or commit or push.
 
 ### Tools available to the model
 
-Permission classes: **R** = read-only, **C** = controlled action, **S** = sensitive action (see [Permission system](#permission-system)).
+Permission classes: **R** = read-only, **C** = controlled action, **S** = sensitive action (see [Permission system](#permission-system)). **Dev** marks the 10 developer tools, which the model is offered only in [developer mode](#developer-mode). **U** marks tools whose output is untrusted third-party text (see tainting under [Permission system](#permission-system)).
 
-| Group | Tool | Class | What it does |
-| --- | --- | --- | --- |
-| Information | `search_web` | R | DuckDuckGo search. Returns titles, URLs and snippets only; pages are not opened. |
-| | `get_time` | R | Local date, time, weekday, UTC offset and timezone. |
-| Browser | `open_youtube` | C | Opens a YouTube *search results* page in the default browser. Nothing plays. |
-| | `open_url` | C | Opens an `http`/`https` address in the default browser (DuckDuckGo if none is given). |
-| Memory | `remember_fact` | C | Saves a fact, with priority `normal` or `high`. Secrets are refused. |
-| | `search_memory` | R | Keyword search over facts, or the newest facts for an empty query. Also returns the profile. |
-| | `update_fact` | S | Replaces the text of a fact, by id (shows old and new text before asking). |
-| | `forget_fact` | S | Permanently deletes a fact, by id. |
-| | `set_user_profile` | C | Stores your name and/or location. |
-| System | `get_system_status` | R | Hostname, OS, kernel, uptime, CPU load, memory, disk usage for `/` and home, and the battery (see below). |
-| | `list_processes` | R | Top processes by CPU or memory (1-25 rows). |
-| | `check_network` | R | DNS and HTTPS (port 443) reachability of `api.groq.com` and `duckduckgo.com`. |
-| Apps and projects | `open_application` | C | Starts an app from the approved list (built-in apps, `[applications]` in the [permissions file](#permissions-file), `JARVIS_APPS`). |
-| | `open_project` | C | Opens a workspace directory in the configured editor (`JARVIS_EDITOR`). |
-| | `inspect_git_status` | R | `git status --short --branch` and `git diff --stat` for a repository in the workspace. |
-| | `run_project_tests` | S, or C for a trusted project | Runs a project's tests or linter with a command approved in the permissions file, and reports pass/fail, the exit code and the end of the output (see [Running project tests and linters](#running-project-tests-and-linters)). |
-| Files and notes | `list_workspace_files` | R | Lists a workspace directory (up to 200 entries). |
-| | `read_workspace_file` | R | Reads a text file in the workspace. Credentials in the content are redacted. |
-| | `create_note` | C, or S when overwriting | Writes a Markdown note to the notes folder. Overwriting an existing note is sensitive. |
+| Group | Tool | Class | Dev | What it does |
+| --- | --- | --- | --- | --- |
+| Information | `search_web` | R, U | | DuckDuckGo search. Returns titles, URLs and snippets only; pages are not opened. |
+| | `get_time` | R | | Local date, time, weekday, UTC offset and timezone. |
+| Browser | `open_youtube` | C | | Opens a YouTube *search results* page in the default browser. Nothing plays. |
+| | `open_url` | C | | Opens an `http`/`https` address in the default browser (DuckDuckGo if none is given). |
+| Memory | `remember_fact` | C | | Saves a fact, with priority `normal` or `high`. Secrets are refused. |
+| | `search_memory` | R | | Keyword search over facts, or the newest facts for an empty query. Also returns the profile. |
+| | `update_fact` | S | | Replaces the text of a fact, by id (shows old and new text before asking). |
+| | `forget_fact` | S | | Permanently deletes a fact, by id. |
+| | `set_user_profile` | C | | Stores your name and/or location. |
+| System | `get_system_status` | R | | Hostname, OS, kernel, uptime, CPU load, memory, disk usage for `/` and home, and the battery (see below). |
+| | `list_processes` | R | | Top processes by CPU or memory (1-25 rows). |
+| | `check_network` | R | | DNS and HTTPS (port 443) reachability of `api.groq.com` and `duckduckgo.com`. |
+| Apps | `open_application` | C | | Starts an app from the approved list (built-in apps, `[applications]` in the [permissions file](#permissions-file), `JARVIS_APPS`). |
+| | `open_project` | C | | Opens a workspace directory in the configured editor (`JARVIS_EDITOR`). |
+| Notes | `create_note` | C, or S when overwriting | | Writes a Markdown note to the notes folder. Overwriting an existing note is sensitive. |
+| Workspace files | `list_workspace_files` | R, U | Dev | Lists a workspace directory (up to 200 entries). |
+| | `read_workspace_file` | R, U | Dev | Reads a text file in the workspace. Credentials in the content are redacted. |
+| Git and code | `inspect_git_status` | R, U | Dev | `git status --short --branch` and `git diff --stat` for a repository in the workspace. |
+| | `inspect_git_diff` | R, U | Dev | The full diff of a repository, or of one file in it, with protected files left out and credentials redacted (see [Inspecting code](#inspecting-code)). |
+| | `inspect_git_history` | R, U | Dev | Recent commits with the files each one changed, optionally `since` today, yesterday, "N days ago" or a date, plus the uncommitted changes. |
+| | `describe_project` | R, U | Dev | A quick orientation: project markers, top-level layout, git branch, recent commits, uncommitted file count, the approved commands that fit, and the start of the README. |
+| | `search_workspace_code` | R, U | Dev | Plain-text search through source files, skipping dependencies, builds, binaries and protected files. |
+| Changing code | `edit_workspace_file` | S | Dev | Replaces one exact, unique piece of text in a workspace text file, after you approve the diff. Keeps a backup (see [Changing code](#changing-code)). |
+| | `create_workspace_file` | S | Dev | Creates a new text file in the workspace after you approve its content. Never overwrites. |
+| Project commands | `run_project_tests` | S, or C for a trusted project; U | Dev | Runs a project's tests or linter with a command approved in the permissions file, and reports pass/fail, the exit code and the end of the output (see [Running project tests and linters](#running-project-tests-and-linters)). |
 
 Built-in app names for `open_application`: `vscode` (`code`, falls back to `codium`), `firefox`, `chrome` (`google-chrome` / `chromium` / `chromium-browser`), `files` (`nautilus` / `nemo` / `thunar`), `terminal` (`gnome-terminal` / `kgx` / `x-terminal-emulator`), `text editor` (`gnome-text-editor` / `gedit`), `calculator`, `system monitor`, `settings`. It also accepts aliases such as "vs code", "file manager", "task manager" and "google chrome".
 
@@ -68,11 +79,20 @@ Built-in app names for `open_application`: `vscode` (`code`, falls back to `codi
 
 ### How a request is handled
 
-- The model may call tools for up to `JARVIS_MAX_TOOL_ROUNDS` rounds (default 8). If it runs out of rounds, it is asked to say the task is incomplete and to summarise only what the tool results confirm.
-- If the model repeats an identical tool call within one request, the call does not run again. The earlier result is reused, so an action never runs twice by accident.
+- The model may call tools for up to `JARVIS_MAX_TOOL_ROUNDS` rounds (default 8), or `JARVIS_MAX_DEV_TOOL_ROUNDS` (default 14) while [developer mode](#developer-mode) is on. If it runs out of rounds, it is asked to say the task is incomplete and to summarise only what the tool results confirm.
+- The model is shown only the tools for the current mode. A call to a tool it was not offered does not run.
+- If the model repeats an identical tool call within one request, the call does not run again. The earlier result is reused, so an action never runs twice by accident. After any successful step that is not read-only, such as an edit or a test run, the earlier results are forgotten, so a check made after a change really runs again (see [Reliability](#reliability)).
+- JARVIS checks every tool call's arguments itself and sends precise errors back, so the model can correct a malformed call.
 - Every tool result carries a status (`success`, `error`, `denied`, `partial` or `unverified`). The system prompt tells the model to report that status accurately.
 - Web results and file contents are marked as untrusted data, and the model is told not to follow instructions found inside them.
 - A tool result longer than 10,000 characters is cut short before it is sent to the model.
+
+### Developer tools
+
+- Offered only in developer mode, which switches on by itself when a message is about code. `/dev on|off` controls it. Details: [Developer mode](#developer-mode).
+- Inspect: git status, diff and history, a project overview, plain-text code search, reading files. Details: [Inspecting code](#inspecting-code).
+- Change: one exact replacement per edit, or a new file, each shown as a diff that you approve by typing `yes`. Every edit keeps a backup. Details: [Changing code](#changing-code).
+- Verify: the model is told to re-run the project's tests after a change and report the result, never claiming a fix works without it.
 
 ### Voice input (push-to-talk)
 
@@ -153,7 +173,9 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_WORKSPACE` | `~/Projects` | Root for the file, project and git tools. |
 | `JARVIS_NOTES_DIR` | `~/Documents/JARVIS Notes` | Where notes are written. |
 | `JARVIS_LOG_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/logs` (normally `~/.local/share/jarvis-mark-50/logs`) | Path. |
-| `JARVIS_MAX_TOOL_ROUNDS` | `8` | 1-25 |
+| `JARVIS_BACKUP_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/backups` (normally `~/.local/share/jarvis-mark-50/backups`) | Path; `~` is expanded. Where `edit_workspace_file` keeps the previous version of each file it changes (see [Backups](#backups)). Use a folder that holds nothing else: JARVIS sets it to mode `700` and deletes the oldest folders in it beyond the newest 200. |
+| `JARVIS_MAX_TOOL_ROUNDS` | `8` | 1-25. Tool rounds per request while developer mode is off. |
+| `JARVIS_MAX_DEV_TOOL_ROUNDS` | `14` | 1-40. Tool rounds per request while [developer mode](#developer-mode) is on, since looking, editing, testing and re-testing takes more steps. |
 | `JARVIS_SEARCH_LIMIT` | `5` | 1-10. Also caps the model's own `max_results`. |
 | `JARVIS_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `JARVIS_HISTORY_TURNS` | `10` | 0-50 recent exchanges sent as context. |
@@ -180,16 +202,17 @@ An invalid value, such as a number out of range, an unknown mode, a malformed `J
 
 Free-tier limits are small. On the development account (October 2026), `openai/gpt-oss-120b` allowed 8,000 tokens per minute and 1,000 requests per day; a single tool-using question costs roughly 4,000 tokens, so asking several in quick succession triggers a short wait. JARVIS prints `Groq is rate-limiting requests... Retrying in Ns` while it waits. Check your current limits at https://console.groq.com/settings/limits.
 
-- Every model call sends the definitions of all 19 tools, roughly 2k tokens (a little more for each approved project command, because their names are listed in the `run_project_tests` description), on top of the system prompt, up to 5 memories and the recent history.
+- Every model call sends the tool definitions on top of the system prompt, up to 5 memories and the recent history. Everyday requests send the 15 core tools, about 5,700 characters (roughly 1.4k tokens). In [developer mode](#developer-mode) all 25 are sent, about 11,300 characters (roughly 2.8k tokens), plus a little for each approved project command, because their names are listed in the `run_project_tests` description.
+- A developer task takes many calls, each resending the growing conversation. The verified bug fix (see [Status](#status--verification)) took 10 rounds and about 3.5 minutes, mostly spent waiting for the per-minute limit.
 - A question that uses tools takes at least two model calls: one to choose the tools and one to answer. Multi-step tasks take more. Startup and `--check` also make one call to list models.
 - A tool-heavy session can therefore use up the daily allowance quickly. To stretch it, lower `JARVIS_HISTORY_TURNS`, or switch to another model with `GROQ_MODEL` or `--model`, since each model has its own quota.
-- JARVIS retries transient failures automatically: per-minute rate limits, timeouts, network errors and server errors. It makes up to 3 retries with backoff, honours `retry-after`, and gives up if asked to wait more than 30 s. A malformed tool call from the model gets one retry at a lower temperature. An exhausted daily quota is not retried.
+- JARVIS retries transient failures automatically: per-minute rate limits, timeouts, network errors and server errors. It makes up to 3 retries with backoff, honours `retry-after`, and gives up if asked to wait more than 60 s. If Groq still reports a malformed tool call (`tool_use_failed`), the call gets one retry at a lower temperature. An exhausted daily quota is not retried.
 - Replies are limited to 1,024 completion tokens, at temperature 0.4.
 - Each spoken message is one transcription request, including every hands-free request (even "Hey JARVIS, stop"). Speech models have their own free-tier limits, counted in audio seconds, separate from the chat model's quota. A transient transcription failure is retried once, waiting at most 5 s.
 
 ## In-chat commands
 
-Talk in plain English: for example "search for the latest Python release", "remember that I prefer concise answers", "how is the system doing?", "show git status for my-project", "run the tests for RPMIS".
+Talk in plain English: for example "search for the latest Python release", "remember that I prefer concise answers", "how is the system doing?", "show git status for my-project", "run the tests for RPMIS", "what did I change in RPMIS today?", "the tests in calc are failing, find the bug and fix it".
 
 | Command | Effect |
 | --- | --- |
@@ -205,8 +228,9 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | Enter on an empty line | With push-to-talk on: starts recording. Press Enter again to stop. |
 | `/wake on` / `/wake off` | Turns hands-free mode on or off. `/wake off` closes the microphone. `/wake` alone shows the current state. |
 | "Hey JARVIS" (spoken, hands-free on) | Starts a spoken request. While JARVIS is speaking or working, it interrupts first (see [Interrupting JARVIS](#interrupting-jarvis)). |
+| `/dev on` / `/dev off` | Turns [developer mode](#developer-mode) on or off: whether the model is offered the developer tools (files, git, code search, edits, tests). It also switches on by itself when a message is about code. `/dev` alone shows the current state. |
 | `/clear` | Forgets this session's conversation context. Saved memories are unaffected. |
-| `/status` | Shows the model, voice, permission mode, memory file, workspace, notes, logs, tool-round limit, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
+| `/status` | Shows the model, voice, permission mode, memory file, workspace, notes, logs, the tool-round limits (for example `8 (14 with developer tools)`), whether developer tools are on, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
 | `exit`, `quit`, `goodbye`, `bye jarvis`, Ctrl+D | Leaves JARVIS. |
 | Ctrl+C while JARVIS is working | Cancels the current request. Steps that already finished are not undone. A running project command is stopped, together with everything it started. |
 
@@ -216,7 +240,7 @@ Each tool has one of three permission classes:
 
 - **Read-only**: looks at things and changes nothing.
 - **Controlled action**: changes something in a limited, low-risk way, such as opening a browser tab, launching an app, saving a memory, creating a new note, or running a project command you marked as trusted (`confirm = false`).
-- **Sensitive action**: destructive, irreversible or able to run third-party code: changing or deleting a memory, overwriting an existing note, or running a project's tests or linter (the default, because that runs the project's own code).
+- **Sensitive action**: destructive, irreversible or able to run third-party code: changing or deleting a memory, overwriting an existing note, changing or creating a file in the workspace, or running a project's tests or linter (the default, because that runs the project's own code).
 
 The permission mode decides what happens to each class:
 
@@ -226,11 +250,12 @@ The permission mode decides what happens to each class:
 | Controlled action | denied | runs (asks you if the request is *tainted*, see below) | asks you |
 | Sensitive action | denied | asks you | asks you |
 
-**Prompt-injection guard (tainting).** `search_web`, `read_workspace_file`, `list_workspace_files`, `inspect_git_status` and `run_project_tests` return third-party text that could contain hidden instructions. Once one of them has returned content during a request, every later controlled action in that same request also needs your confirmation, and the prompt says why. This stops a booby-trapped web page or file from quietly opening a URL that carries your data, or writing an "instruction" into memory. The taint resets with each new message you type.
+**Prompt-injection guard (tainting).** `search_web`, `read_workspace_file`, `list_workspace_files`, `inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, `describe_project`, `search_workspace_code` and `run_project_tests` return third-party text that could contain hidden instructions. Once one of them has returned content during a request, every later controlled action in that same request also needs your confirmation, and the prompt says why. This stops a booby-trapped web page or file from quietly opening a URL that carries your data, or writing an "instruction" into memory. The taint resets with each new message you type.
 
 How confirmation works:
 
-- JARVIS itself prints the prompt and reads your answer from the terminal (`input()`). The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths.
+- JARVIS itself prints the prompt and reads your answer from the terminal (`input()`). The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths. For a file change it also shows the diff (see [Changing code](#changing-code)).
+- If JARVIS cannot prepare the operation, for example because the text to replace is not in the file, nothing is asked and nothing runs. The model gets status `denied` with the reason `Not done: <why>`, so it can correct the call.
 - Type `yes` (or `y`) to proceed. Anything else cancels: another word, Enter, Ctrl+C or Ctrl+D.
 - Each confirmation covers a single operation. There is no "always allow".
 - If standard input is not an interactive terminal, operations that need confirmation are denied.
@@ -240,16 +265,17 @@ The permission mode only governs tool calls made by the model. The `/forget` and
 
 ## Filesystem boundaries
 
-- **Workspace root** (`JARVIS_WORKSPACE`, default `~/Projects`): `list_workspace_files`, `read_workspace_file`, `open_project`, `inspect_git_status` and `run_project_tests` only work inside it. Relative paths are resolved against the root. Absolute paths are accepted only if they lie inside it.
+- **Workspace root** (`JARVIS_WORKSPACE`, default `~/Projects`): `open_project` and all the developer tools (`list_workspace_files`, `read_workspace_file`, `inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, `describe_project`, `search_workspace_code`, `edit_workspace_file`, `create_workspace_file` and `run_project_tests`) only work inside it. Relative paths are resolved against the root. Absolute paths are accepted only if they lie inside it.
 - **Symlinks are resolved** before the check, so a link inside the workspace that points outside it is refused.
-- **Protected names**: a path is refused if any part of it below the workspace root matches one of these. `list_workspace_files` hides matching entries and reports how many it hid.
+- **Protected names**: a path is refused if any part of it below the workspace root matches one of these, for reading, editing and creating alike. `list_workspace_files` hides matching entries and reports how many it hid; `describe_project` and `search_workspace_code` skip them.
   - Directories: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.password-store`, `.pki`, `.mozilla`, `google-chrome`, `chromium`, `BraveSoftware`, `keyrings`, `.git`
   - Files: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`, `.netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials`, `credentials.*`, `secrets.*`, `*.secret`, `master.key`, `.envrc`, `*_history` (shell histories), `.htpasswd`
   - Still allowed: `.env.example`, `.env.sample`, `.env.template`
 - **`read_workspace_file`** only reads text files; files with NUL bytes are treated as binary and refused. It reads at most the first 200 KB and returns 6,000 characters by default (`max_chars` 100-9,000). Known credential formats in the content are redacted.
-- **`inspect_git_status`** is read-only and hardened against hostile repositories: it overrides `core.fsmonitor`, `core.hooksPath` and every configured `filter.*` driver, disables external diff and textconv programs, credential prompts, optional locks and system config, and ignores inherited `GIT_*` variables. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
+- **The git tools** (`inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, and the git part of `describe_project`) are read-only and hardened against hostile repositories: it overrides `core.fsmonitor`, `core.hooksPath` and every configured `filter.*` driver, disables external diff and textconv programs, credential prompts, optional locks and system config, and ignores inherited `GIT_*` variables. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
 - **Notes folder** (`JARVIS_NOTES_DIR`) is separate from the workspace, and `create_note` can only write there. The file name comes from the title (letters, digits, `.`, `_`, `-`; spaces become `-`; at most 80 characters; `.md` added), so a title cannot escape the folder. A `# Title` heading is added if the content does not start with one. Notes are written atomically. An existing note is replaced only when `overwrite` is set, which is a sensitive action.
-- There is no general shell, no delete tool, and no JARVIS tool that writes files outside the notes folder and the memory file. The exception is the code of a project whose tests or linter you let JARVIS run: it runs with your user's rights and can write wherever you can (see [Safety](#safety)).
+- **Workspace files** change only through `edit_workspace_file` and `create_workspace_file`, each after you approve the diff (see [Changing code](#changing-code)). Edits keep a backup in `JARVIS_BACKUP_DIR`, outside the workspace.
+- There is no general shell, no delete, rename, commit or push tool, and no JARVIS tool that writes files anywhere other than the workspace (with your approval), the backup folder, the notes folder and the memory file. The exception is the code of a project whose tests or linter you let JARVIS run: it runs with your user's rights and can write wherever you can (see [Safety](#safety)).
 
 ## Permissions file
 
@@ -371,6 +397,177 @@ To trust RPMIS, so that its tests run without a prompt, add this to `config/perm
 tests = "rails-test"
 confirm = false
 ```
+
+## Developer mode
+
+The 10 developer tools (marked **Dev** in the [tools table](#tools-available-to-the-model)) are offered to the model only in developer mode. Otherwise each request carries only the 15 core tools. The reason is tokens: on the free tier every model call resends the tool definitions, and the developer tools double them, from roughly 1.4k to 2.8k tokens per call (see [Groq usage and limits](#groq-usage-and-limits)).
+
+- **It switches on by itself** for the rest of the session when a message looks like it is about code, and JARVIS prints `(developer tools on for this session; /dev off to hide them)`. A message counts when it contains one of these as a whole word, in any case:
+  - code words: code, codebase, source, repo(s), repository, git, diff, commit(s), branch, test(s), testing, lint, linter, bug(s), fix(es), refactor, function, method, class, module, file(s), folder, project(s), build, compile, error, exception, stack trace (or stacktrace), traceback, changed, changes, readme, architecture, implement;
+  - languages and frameworks: rails, ruby, python, flutter, dart, npm, node, javascript, typescript, expo, react;
+  - the name of a top-level folder in the workspace (hidden folders excluded), such as `rpmis` or `calc`.
+- The word list is broad on purpose, so some everyday messages ("I get an error when I open Firefox") switch it on too. That costs tokens, not safety.
+- `/dev on` turns it on and `/dev off` hides the tools again, until the next message about code switches them back on. `/dev` alone and `/status` show the current state.
+- **A tool that was not offered cannot run.** If the model calls one anyway, JARVIS does not run it and answers: `<tool> is not available right now. Developer tools are offered when the user's request is about code or projects (/dev on).`
+- **More rounds.** While developer mode is on, each request may use up to `JARVIS_MAX_DEV_TOOL_ROUNDS` tool rounds (default 14) instead of `JARVIS_MAX_TOOL_ROUNDS` (default 8), because a fix takes several steps: look, read, edit, test, and sometimes correct and test again.
+- Developer mode changes only which tools the model sees. Permission classes, confirmations and the workspace boundary are the same either way.
+
+## Inspecting code
+
+These tools are read-only, so they run in every permission mode, including `read_only`. Their output is untrusted and taints the request (see [Permission system](#permission-system)). Paths are relative to the workspace. The git tools use the same hardened git setup as `inspect_git_status` (see [Filesystem boundaries](#filesystem-boundaries)).
+
+### inspect_git_diff
+
+- Arguments: `path` (the repository folder), optionally `file` (a file inside the repository, relative to `path`) and `staged`.
+- Shows the working-tree changes that are not staged yet. With `staged` set, it shows the staged changes instead (`git diff --cached`).
+- Every file whose name matches a protected file pattern (`.env`, `*.key`, `credentials` and the rest of the list under [Filesystem boundaries](#filesystem-boundaries)) is left out of the diff. Asking for a protected `file` directly is refused.
+- The diff is redacted and capped at 8,000 characters; `diff_truncated` says when it was cut.
+- Untracked files have no diff. Their names are listed (up to 50, protected names left out).
+
+### inspect_git_history
+
+- Up to `limit` commits (1-50, default 10), newest first, each with its short hash, local date, author, subject and the files it changed. The current uncommitted changes (`git status --short`) are added at the end.
+- `since` accepts `today` (since midnight), `yesterday`, `N days ago` (also minutes, hours, weeks, months or years, with up to 3 digits) or a date such as `2026-10-01`. Anything else is refused with an example.
+- The output is redacted and capped at 8,000 characters. File names appear as git reports them, protected ones included, but never their contents.
+
+### describe_project
+
+A quick orientation, usually the model's first step in a project:
+
+| Field | Contents |
+| --- | --- |
+| `top_level` | The project's top-level entries (folders end in `/`), up to 80, without protected names and without the skipped folders listed under `search_workspace_code` |
+| `markers` | Which of these exist: `package.json`, `Gemfile`, `pubspec.yaml`, `pyproject.toml`, `pytest.ini`, `requirements.txt`, `setup.py`, `go.mod`, `Cargo.toml`, `composer.json`, `pom.xml`, `build.gradle`, `Makefile`, `Dockerfile`, `docker-compose.yml`, `bin/rails`, `app.json`, `tsconfig.json` |
+| `approved_commands` | The tests and lint commands from the [permissions file](#permissions-file) that fit the project |
+| `readme_start` | The first 3,000 characters of `README.md`, `README.rst`, `README.txt` or `README`, redacted |
+| `git` | The branch, the last 5 commits (short hash, date, subject) and the number of uncommitted files; or the reason there is no git information, for example that the folder is not a repository |
+
+### search_workspace_code
+
+- Plain text, not a regular expression. Case-insensitive unless `case_sensitive` is set.
+- `path` is a folder or a single file. The default is the whole workspace.
+- Skipped: folders named `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `build`, `dist`, `target`, `.dart_tool`, `.bundle`, `vendor`, `tmp`, `log`, `coverage`, `.next`, `.expo`, `.gradle`, `.idea`, `.tox` and `storage`, at any depth; protected names; symbolic links; files over 1 MB; binary files (a NUL byte in the first 8 KB).
+- Limits: `max_results` matches (1-100, default 40), and at most 5,000 files read. `truncated` says when either limit stopped the search.
+- Each match gives the file (relative to the workspace), the line number and the trimmed line, redacted and cut to 200 characters.
+
+## Changing code
+
+Two tools change files: `edit_workspace_file` and `create_workspace_file`. Both are sensitive actions, so you see the exact change and must type `yes` every time. There is no setting that trusts them, and in `read_only` mode they are denied.
+
+### Editing a file
+
+- **One exact, unique replacement per call.** `old_text` (up to 20,000 characters) must occur exactly once in the file, and is replaced by `new_text` (up to 40,000 characters; empty removes the text). Several changes take several calls, each confirmed separately.
+- **Windows line endings are kept.** If the file uses CRLF and `old_text` written with plain newlines is not found, it is matched with CRLF line endings, and the replacement gets CRLF too.
+- **UTF-8 text files up to 1 MB only.** Binary files (a NUL byte in the first 8 KB) and other encodings are refused.
+- **Everything else in the file stays as it is**, including your own uncommitted changes elsewhere in it.
+
+### The confirmation
+
+The prompt shows what will change and the file's git state, then the unified diff:
+
+```text
+!! Confirmation required [SENSITIVE ACTION: edit_workspace_file]
+   Operation: Edit calc/calc.py: 1 line(s) added, 1 removed (tracked by git, no other uncommitted changes).
+   Affects:   /home/you/Projects/calc/calc.py
+   --- a/calc/calc.py
+   +++ b/calc/calc.py
+   @@ -3,4 +3,4 @@
+
+
+    def subtract(a, b):
+   -    return a + b
+   +    return a - b
+   Type 'yes' to proceed, anything else cancels:
+```
+
+- Added lines are green, removed lines red and hunk headers cyan (`NO_COLOR` turns colour off). At most 120 lines of the diff are shown; a longer one ends with `... N more lines not shown`.
+- The git state is one of:
+
+  | Shown | Meaning |
+  | --- | --- |
+  | `tracked by git, no other uncommitted changes` | The file matches the last commit, so `git diff` afterwards shows exactly this change. |
+  | `has other uncommitted changes, which are kept` | You have your own changes in this file. They stay. |
+  | `not yet tracked by git; JARVIS keeps a backup` | Git has no copy of the file; the backup is the only copy of the old version. |
+  | `ignored by git; JARVIS keeps a backup` | The file matches a `.gitignore` rule, so git has no copy of it either. |
+  | `not in a git repository; JARVIS keeps a backup` | The same, outside any repository. |
+
+- **The approval is bound to the file as shown.** When the prompt is built, JARVIS records a checksum of the file. If the file changes before the write (you save it in your editor, or a formatter runs), nothing is written and the model is told: `<file> changed after the edit was approved. Nothing was written; read the file again and propose the edit afresh.`
+
+### Writing and verifying
+
+1. The current version is copied to the backup folder (see [Backups](#backups)).
+2. The new content is written to a temporary file in the same folder, flushed to disk, and renamed over the original, so the file is never half-written. The file keeps its permission bits.
+3. The file is read back and compared with what was intended. If it does not match, the result is `unverified`, never `success`.
+4. The result gives the diff, the git state, the backup path and a reminder to run the tests.
+
+### Backups
+
+- Each edit makes one folder in `JARVIS_BACKUP_DIR` (default `~/.local/share/jarvis-mark-50/backups`), named by the time, `YYYYMMDD-HHMMSS-<microseconds>`. It holds the old file at its path relative to the workspace.
+- The backup folder is set to mode `700` and each backup file to `600`. The newest 200 edit folders are kept; older ones are deleted at the next edit. Point `JARVIS_BACKUP_DIR` at a folder used for nothing else.
+- Backups are never restored automatically. To undo an edit by hand, copy the backup back:
+
+  ```bash
+  ls ~/.local/share/jarvis-mark-50/backups/        # one folder per edit; the newest sorts last
+  cp ~/.local/share/jarvis-mark-50/backups/20261022-143005-123456/calc/calc.py ~/Projects/calc/calc.py
+  ```
+
+- For a file that git tracks, `git diff` shows what changed. `git restore <file>` also undoes the edit, but it discards your own uncommitted changes in that file as well; the backup is exactly the version before JARVIS's edit.
+- A newly created file has no backup, because nothing existed before.
+
+### Creating a file
+
+- `create_workspace_file` never overwrites. If the path already exists (or is a symbolic link), it is refused: `<file> already exists; use edit_workspace_file to change it.`
+- Text only: at most 200,000 characters, no NUL characters.
+- Missing parent folders are created.
+- The prompt reads `Create <file> (N lines).` and shows the content as added lines, with the same 120-line display limit.
+- The file is written the same atomic way, with mode `644`, and read back to verify.
+
+### What is refused
+
+- Protected files and folders (such as `.env`) and any path outside the workspace: `Access denied: ...`. Nothing is asked and nothing is written.
+- There are no tools to delete, rename, commit or push. You review with `git diff` and commit yourself.
+
+### Proving the change
+
+An operating rule in the system prompt tells the model how to do code work: look first (`describe_project`, `inspect_git_status`, read the relevant files), give a one-line plan, make small, focused edits, never change unrelated code or undo your uncommitted work, and after changing files run the tests with `run_project_tests` and report exactly what passed or failed, never claiming a fix works without that evidence. Each edit's result also reminds it to run the tests. This is an instruction to the model, not something JARVIS enforces. The test run asks for its own confirmation unless the project is trusted.
+
+### Example session
+
+Shortened from the verified run on the demo project; paths and line numbers are illustrative.
+
+```text
+You: The tests in the calc project are failing. Find the bug, fix it, and prove it's fixed.
+  (developer tools on for this session; /dev off to hide them)
+  ...
+  > describe_project
+  > run_project_tests
+
+!! Confirmation required [SENSITIVE ACTION: run_project_tests]
+   Operation: Run tests for calc: python3 -m pytest -q (stops after 900s). This runs the project's code with your full user access.
+   Affects:   /home/you/Projects/calc
+   Type 'yes' to proceed, anything else cancels: yes
+  > read_workspace_file
+  > edit_workspace_file
+
+!! Confirmation required [SENSITIVE ACTION: edit_workspace_file]
+   Operation: Edit calc/calc.py: 1 line(s) added, 1 removed (tracked by git, no other uncommitted changes).
+   Affects:   /home/you/Projects/calc/calc.py
+   (the diff, as shown above)
+   Type 'yes' to proceed, anything else cancels: yes
+  > run_project_tests
+   (the second test run is confirmed the same way)
+
+JARVIS: Sir, the subtraction function mistakenly added the operands … All tests now pass: 2 passed
+```
+
+## Reliability
+
+Developer tasks run for minutes and change files, so failures in the middle are handled explicitly.
+
+- **Rate-limit waits of up to 60 s.** Each model call is retried up to 3 times. JARVIS waits as long as Groq's `retry-after` asks, up to 60 s; a longer wait ends the request. The free tier's per-minute token limit often asks for waits in the middle of a multi-step task.
+- **An unfinished task says what already happened.** If a model call fails after tools have already run (a rate limit, a network error, a used-up quota), JARVIS does not show a bare error. It replies `I couldn't finish: <error> Steps already done: <tool> on <target>: <status>; ...`, adds `(tests passed)` or `(tests failed)` to test runs, and when a file was changed adds `Files were changed; check them, and run the tests if the last step was not a test run.` The same list is given when the round limit is reached and the final summary cannot be fetched. Nothing is undone. If the failure comes before any tool ran, the plain error is shown.
+- **No stale results after a change.** An identical repeated call within a request reuses the earlier result instead of running again. After any successful step that is not read-only (an edit, a new file, a test run, a memory change), all remembered results are dropped, so re-running the tests after a fix really runs them.
+- **JARVIS validates tool calls itself.** JARVIS asks Groq not to validate tool calls (`disable_tool_validation`), so a malformed call reaches JARVIS instead of Groq rejecting the whole request. JARVIS then checks the arguments against the tool's schema and sends a precise error back, such as `Invalid arguments for edit_workspace_file: Missing required argument(s): old_text.`, and the model can correct the call. Edits that cannot be prepared come back the same way, as `Not done: <why>`. If a model or account rejects the option, JARVIS drops it for the rest of the session and repeats the call at once.
 
 ## Memory
 
@@ -581,6 +778,11 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 | "No approved tests command fits &lt;project&gt;" | No command in the permissions file fits that project: none of its `detect` markers exist, or `package.json` lacks the `npm_script` (RentDitoMobile has no `"test"` script, for example). Add a command that fits, or map one with `[projects.<folder>] tests = "<name>"`, then restart JARVIS. "No tests commands are approved" means the file has none of that kind, or was not found (`--check` shows which). |
 | "'python' is not installed, not on PATH, or not executable" | A custom command uses `python`, the project has no `.venv` or `venv`, and Zorin OS has no `python` command by default. Create the project's virtualenv, run `sudo apt install python-is-python3`, or use `python3` in the command's `argv` (the shipped `pytest` command already does) (see [Python projects and project scripts](#python-projects-and-project-scripts)). |
 | A project's tests fail with database or connection errors | The tests need a service, such as a database, that is not running. Start it the way you normally would, then ask again. JARVIS does not start services. |
+| "old_text was not found in the file" / "old_text appears N times" | The model's `old_text` did not match the file exactly (indentation, a changed line, a stale copy), or was too short to be unique. Nothing was asked or written. The error goes back to the model, which normally re-reads the file and tries again. If it keeps failing, name the exact lines you mean, or make the change yourself. |
+| "... changed after the edit was approved. Nothing was written" | The file changed between the confirmation and the write, for example because you saved it in your editor or a formatter ran. Nothing was written. Ask again; the model reads the file afresh and shows a new diff. |
+| A reply mentions "Not done: ..." | JARVIS could not prepare the change, so it asked nothing and wrote nothing. The reason follows: `Access denied: ...` (a protected file such as `.env`, or a path outside the workspace), `... already exists; use edit_workspace_file to change it`, `... is not a file; use create_workspace_file for a new one`, `... is larger than 1 MB`, `... looks like a binary file`, `... is not UTF-8 text`, `old_text must not be empty`, `old_text and new_text are identical`, or one of the two `old_text` errors above. See [Changing code](#changing-code). |
+| A request about code gets answered without looking at files, or the reply says a tool "is not available right now" | The message contained none of the trigger words, so developer mode stayed off and the developer tools were not offered. Type `/dev on` and ask again. `/status` shows whether developer tools are on. See [Developer mode](#developer-mode). |
+| Developer tasks are slow (minutes), with many "Retrying in Ns" lines | Expected on the free tier: every round resends the tool definitions (about 2.8k tokens in developer mode) and the growing conversation, against a limit of 8,000 tokens per minute. The verified bug fix took about 3.5 minutes. To speed it up: `/clear` before a big task, keep requests focused on one project, `/dev off` for everyday questions afterwards, or use a model with a higher limit. If Groq asks for a wait over 60 s, the task stops with a list of the steps already done; ask again to continue from there. |
 | "I heard only silence" | The microphone is muted, or the wrong input is selected. Check Settings > Sound > Input (input level and device). `wpctl status` lists the sources and shows the default one. Test outside JARVIS with `arecord -d 3 /tmp/t.wav && aplay /tmp/t.wav`. |
 | "The microphone could not be opened (... busy ...)" | Another program is using the microphone, for example a video call or a browser tab. Close it and try again. |
 | "No microphone recorder found" / "Speech input unavailable" | Run `sudo apt install alsa-utils` (provides `arecord`). `--check` shows which recorder was found. |
@@ -608,11 +810,16 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **Hands-free typing uses a plain line reader**, so there is no line-editing history.
 - **The hands-free listener uses `arecord` only.** `pw-record` is not used for streaming.
 - **Recognition quality depends on the laptop microphone** and on room noise. With a real voice, neither push-to-talk transcription nor the wake word has been tested yet (see [Status](#status--verification)).
-- **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget.
+- **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget, and a multi-step fix (look, test, edit, re-test) takes minutes: the verified one took about 3.5 minutes.
 - **Search returns snippets only.** JARVIS does not open or read the result pages.
 - **Memory of conversations is limited.** Context covers only the current session: the last `JARVIS_HISTORY_TURNS` exchanges, plus one-line summaries of older questions. Tool results are not carried between turns. The saved conversation log is a bounded record and is not fed back to the model.
 - **Tool timeouts cannot kill a hung tool.** Tools run in worker threads, and Python cannot stop a thread. A read-only tool that times out is reported as an error. A state-changing tool that times out is reported as `unverified`, because it may still finish. Pressing Ctrl+C has the same effect: the request is abandoned, but a tool already running may complete. `run_project_tests` is the exception: its command and everything it started are stopped on its own time limit and on cancel.
-- **No file editing yet.** JARVIS can read files and run approved tests, but it has no tool to edit files or apply a patch, so it can report a failing test but not fix it.
+- **One replacement per edit call.** `edit_workspace_file` replaces one exact, unique piece of text. A change spread over a file takes several calls and several confirmations, and there is no patch tool.
+- **No delete or rename.** JARVIS cannot delete, move or rename files, and cannot commit or push.
+- **Backups are not restored automatically.** Undoing an edit means copying the backup back by hand (see [Backups](#backups)). Only the newest 200 edits have a backup.
+- **The confirmation shows at most 120 lines** of a diff or a new file. For a longer change the rest is not on screen when you approve it; decline and ask for smaller steps if you want to see everything.
+- **Developer mode detection is keyword-based.** A request about code that uses none of the trigger words gets no developer tools until you type `/dev on`. A project name directly followed by a full stop ("look at RPMIS.") is not recognised as a name. `/dev off` lasts only until the next message that looks like code.
+- **Code search skips common build folder names everywhere**, such as `build`, `tmp`, `log`, `vendor` and `storage`, even when one of them holds source code you care about.
 - **Tests of real projects may need services.** A project's test suite may expect a database or another service to be running. JARVIS does not start services, so such tests fail until you start them.
 - **Project commands run your project's code.** Approving a test run is approving whatever that code does, with your user's rights. Only the Groq key and JARVIS's own settings are kept out of its environment.
 - **App launches cannot be confirmed visually.** JARVIS checks that the process did not exit straight away, but it cannot see whether a window appeared.
@@ -623,12 +830,12 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 
 JARVIS stays a single agent throughout. Later versions add capabilities, not more agents.
 
-The developer-assistant work follows the phases of the architecture blueprint. Phase 3 is done. Phase 4 is next: diff inspection, controlled file edits with your approval, verification after a change, a planner and checkpoints.
+The developer-assistant work follows the phases of the architecture blueprint. Phase 3 is done. Phase 4, slice 1 is done: developer mode, diff, history, project overview and code search, approved file edits and new files with backups, and verification by re-running the tests. Phase 4, slice 2 is next: a task planner and checkpoints, so that an interrupted task can be resumed and explained.
 
 | Version | Focus |
 | --- | --- |
 | V1.1 | Voice input. Done: push-to-talk with Groq Whisper, the "Hey JARVIS" wake word and interrupting JARVIS by voice. Still to do: local (offline) transcription. |
-| V1.2 | Developer assistant features. Done: opening projects, read-only git status, and running approved test and lint commands. Next: Phase 4. |
+| V1.2 | Developer assistant features. Done: opening projects, git status, diff and history, project overview, code search, running approved test and lint commands, and approved file edits with backups (Phase 4, slice 1). Next: the task planner and checkpoints (Phase 4, slice 2). |
 | V2 | SQLite-backed memory (the `MemoryStore` interface is designed to be swapped) |
 | V2.1 | Desktop UI |
 | V3 | More advanced agent behaviour, still a single agent |
@@ -647,13 +854,13 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `core/session.py` | The conversation session (recent turns) |
 | `intelligence/groq_client.py` | The Groq provider: client setup, model checks, chat calls and error translation |
 | `memory/json_store.py` | The JSON memory store |
-| `tools/registry.py` | Tool definitions, argument validation, and running a tool behind the permission policy |
-| `tools/catalog.py` | The tool set and its registration: schemas and permission classes |
+| `tools/registry.py` | Tool definitions and groups, argument validation, and running a tool behind the permission policy |
+| `tools/catalog.py` | The tool set and its registration: schemas, permission classes and which tools are developer tools |
 | `tools/linux_system.py` | Time, system status and battery, processes, network, applications, and the bounded command runner |
 | `tools/filesystem.py` | Workspace files, path restrictions and notes |
 | `tools/web_search.py` | DuckDuckGo search |
 | `tools/browser.py` | Opening web pages and YouTube searches |
-| `tools/developer.py` | Opening projects, git status, and running approved project commands |
+| `tools/developer.py` | Opening projects, git status, diff and history, project overview, code search, file edits and new files with backups, and running approved project commands |
 | `tools/memory_tools.py` | The memory tools |
 | `voice/output.py` | Spoken output: edge-tts and local playback |
 | `voice/input.py` | Push-to-talk recording and Groq Whisper transcription |

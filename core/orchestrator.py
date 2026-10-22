@@ -10,8 +10,10 @@ from typing import Callable
 from typing import TYPE_CHECKING
 
 from core.context import build_messages, build_system_prompt
+from core.policy import Permission
 from intelligence.groq_client import JarvisAPIError, call_model
-from tools.registry import STATUS_DENIED, ToolValidationError, execute_tool, parse_arguments, serialize_tool_result
+from tools.registry import (STATUS_DENIED, STATUS_ERROR, STATUS_SUCCESS, Tool, ToolValidationError, execute_tool,
+                            parse_arguments, serialize_tool_result)
 
 if TYPE_CHECKING:
     from config.settings import Config
@@ -71,11 +73,59 @@ def _canonical_call(name: str, raw_arguments: Any) -> str:
         return name + str(raw_arguments)
 
 
+# Tools whose success changes files on disk.
+CHANGING_TOOLS = frozenset({"edit_workspace_file", "create_workspace_file", "create_note"})
+
+
+def _changes_state(tool: Tool | None, raw_arguments: Any) -> bool:
+    """Whether a successful call may have changed anything (files, memory, the desktop)."""
+    if tool is None:
+        return False
+    try:
+        return tool.permission_for(parse_arguments(raw_arguments)) is not Permission.READ_ONLY
+    except Exception:  # noqa: BLE001 - when unsure, treat it as a change
+        return True
+
+
+def _event(name: str, raw_arguments: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """What a tool call did, kept for progress reports: tool, status and its target if any."""
+    event: dict[str, Any] = {"tool": name, "status": result["status"]}
+    try:
+        args = parse_arguments(raw_arguments)
+    except ToolValidationError:
+        args = {}
+    target = args.get("path") or args.get("project") or args.get("url") or args.get("name")
+    if isinstance(target, str):
+        event["target"] = target[:120]
+    data = result.get("result") if isinstance(result.get("result"), dict) else result
+    if "passed" in data:
+        event["passed"] = data["passed"]
+    return event
+
+
+def progress_report(events: list[dict[str, Any]]) -> str:
+    """Plain-language list of the steps that already ran, so an unfinished task is never misreported."""
+    if not events:
+        return "Nothing had been done yet."
+    steps = []
+    for e in events:
+        step = e["tool"] + (f" on {e['target']}" if e.get("target") else "") + f": {e['status']}"
+        if "passed" in e:
+            step += " (tests passed)" if e["passed"] else " (tests failed)"
+        steps.append(step)
+    changed = [e for e in events if e["tool"] in CHANGING_TOOLS and e["status"] == "success"]
+    note = (" Files were changed; check them, and run the tests if the last step was not a test run."
+            if changed else "")
+    return "Steps already done: " + "; ".join(steps) + "." + note
+
+
 def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] | None = None,
               history_summary: str = "", on_tool: Callable[[str], None] | None = None,
-              on_retry: Callable[[str, float], None] | None = None) -> AgentResult:
+              on_retry: Callable[[str, float], None] | None = None,
+              tool_groups: set[str] | None = None) -> AgentResult:
     """Run the model/tool loop until a final answer or the round limit.
 
+    `tool_groups` limits which tools the model is shown (and may call); None means all of them.
     Raises JarvisAPIError if the model cannot be reached; KeyboardInterrupt cancels.
     """
     memories, profile, warning = [], None, None
@@ -85,14 +135,24 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
         warning = ctx.memory.corruption_error
     system_prompt = build_system_prompt(ctx.config, memories, profile, history_summary, warning)
     messages = build_messages(system_prompt, history or [], user_input)
-    tools = ctx.registry.schemas()
+    tools = ctx.registry.schemas(tool_groups)
+    offered = {schema["function"]["name"] for schema in tools}
     events: list[dict[str, Any]] = []
     previous_results: dict[str, dict[str, Any]] = {}
     tainted = False  # becomes True once third-party content (web, files) is in the context
 
-    for round_number in range(1, ctx.config.max_tool_rounds + 1):
-        response = call_model(ctx.client, ctx.config.model, messages, tools, on_retry=on_retry,
-                              reasoning_effort=ctx.config.reasoning_effort)
+    # Developer tasks (look, edit, test, re-test) need more steps than everyday requests.
+    max_rounds = (ctx.config.max_dev_tool_rounds if tool_groups is not None and "developer" in tool_groups
+                  else ctx.config.max_tool_rounds)
+    for round_number in range(1, max_rounds + 1):
+        try:
+            response = call_model(ctx.client, ctx.config.model, messages, tools, on_retry=on_retry,
+                                  reasoning_effort=ctx.config.reasoning_effort)
+        except JarvisAPIError as exc:
+            if not events:
+                raise
+            # Steps already ran: say exactly which, rather than a bare error that hides them.
+            return AgentResult(f"I couldn't finish: {exc} {progress_report(events)}", "incomplete", events, round_number)
         message = response.choices[0].message
         if not message.tool_calls:
             return AgentResult(format_final_response(message.content), "complete", events, round_number)
@@ -104,28 +164,34 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
             if key in previous_results:
                 # Identical repeat within one request: never re-run an action; reuse the result.
                 result = {**previous_results[key], "note": "Identical call already made in this request; not repeated."}
+            elif name not in offered and ctx.registry.get(name) is not None:
+                # A real tool that was not offered this turn (e.g. developer mode is off): never run it.
+                result = {"status": STATUS_ERROR, "error": f"{name} is not available right now. Developer tools "
+                          "are offered when the user's request is about code or projects (/dev on)."}
             else:
                 if on_tool:
                     on_tool(name)
                 result = execute_tool(ctx.registry, ctx.policy, name, call.function.arguments, tainted=tainted)
-                previous_results[key] = result
                 tool = ctx.registry.get(name)
+                if result["status"] == STATUS_SUCCESS and _changes_state(tool, call.function.arguments):
+                    # Earlier results may now be stale (e.g. tests run before an edit): forget them.
+                    previous_results.clear()
+                previous_results[key] = result
                 # Any result that ran (even a failed or timed-out one) may carry third-party text.
                 if tool is not None and tool.untrusted_output and result["status"] != STATUS_DENIED:
                     tainted = True
-            events.append({"tool": name, "status": result["status"]})
+            events.append(_event(name, call.function.arguments, result))
             messages.append({"role": "tool", "tool_call_id": call.id, "name": name,
                              "content": serialize_tool_result(result)})
 
     # Round limit reached: ask for a summary of confirmed progress with tools disabled.
     messages.append({"role": "system", "content": (
-        f"The tool-round limit ({ctx.config.max_tool_rounds}) has been reached, so no more tools can run. "
+        f"The tool-round limit ({max_rounds}) has been reached, so no more tools can run. "
         "Tell the user the task is incomplete, summarise only what the tool results confirm, and say what remains.")})
     try:
         response = call_model(ctx.client, ctx.config.model, messages, tools, tool_choice="none", on_retry=on_retry,
                               reasoning_effort=ctx.config.reasoning_effort)
         text = format_final_response(response.choices[0].message.content)
     except JarvisAPIError:
-        done = ", ".join(f"{e['tool']} ({e['status']})" for e in events) or "nothing"
-        text = f"I reached my limit of {ctx.config.max_tool_rounds} tool rounds before finishing. Steps taken: {done}."
-    return AgentResult(text, "incomplete", events, ctx.config.max_tool_rounds)
+        text = f"I reached my limit of {max_rounds} tool rounds before finishing. {progress_report(events)}"
+    return AgentResult(text, "incomplete", events, max_rounds)

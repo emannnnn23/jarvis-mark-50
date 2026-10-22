@@ -27,6 +27,7 @@ class ConfirmationRequest:
     operation: str
     affected_paths: list[str]
     reason: str = ""
+    details: str = ""  # e.g. the exact diff of a file edit, shown before the user answers
 
 
 @dataclasses.dataclass
@@ -71,14 +72,16 @@ class PermissionPolicy:
         if self.confirm is None:
             return Decision(False, "This action needs the user's confirmation, and no interactive terminal is available.")
         try:
-            operation, paths = tool.describe_call(args)
+            described = tool.describe_call(args)
         except Exception as exc:  # noqa: BLE001
-            return Decision(False, f"Could not describe this operation for confirmation: {exc}")
+            return Decision(False, f"Not done: {exc}")  # e.g. the text to replace was not found
+        operation, paths = described[0], described[1]
+        details = described[2] if len(described) > 2 else ""
         reason = ""
         if tainted and level is Permission.CONTROLLED_ACTION and self.mode == "standard":
             reason = "Requested after reading web or file content, which could contain injected instructions."
         try:
-            approved = bool(self.confirm(ConfirmationRequest(tool.name, level, operation, paths, reason)))
+            approved = bool(self.confirm(ConfirmationRequest(tool.name, level, operation, paths, reason, details)))
         except (EOFError, KeyboardInterrupt):
             approved = False
         if self.cancel_requested is not None and self.cancel_requested():

@@ -61,11 +61,13 @@ class Tool:
     timeout: float = 30.0
     untrusted_output: bool = False  # results may contain third-party text (prompt-injection risk)
     cancel: Callable[[], Any] | None = None  # stops work still running when the user cancels
+    group: str = "core"  # "developer" tools are offered to the model only in developer mode
 
     def permission_for(self, args: dict[str, Any]) -> Permission:
         return self.permission(args) if callable(self.permission) else self.permission
 
-    def describe_call(self, args: dict[str, Any]) -> tuple[str, list[str]]:
+    def describe_call(self, args: dict[str, Any]) -> tuple[str, list[str]] | tuple[str, list[str], str]:
+        """(operation, affected paths) for the confirmation prompt, optionally with a details block."""
         if self.describe:
             return self.describe(args)
         return f"{self.name}({json.dumps(args, ensure_ascii=False)})", []
@@ -95,8 +97,9 @@ class ToolRegistry:
     def tools(self) -> list[Tool]:
         return list(self._tools.values())
 
-    def schemas(self) -> list[dict[str, Any]]:
-        return [tool.schema() for tool in self._tools.values()]
+    def schemas(self, groups: set[str] | None = None) -> list[dict[str, Any]]:
+        """Tool definitions for the model; only the given groups when `groups` is set."""
+        return [tool.schema() for tool in self._tools.values() if groups is None or tool.group in groups]
 
 
 def parse_arguments(raw: Any) -> dict[str, Any]:

@@ -79,7 +79,7 @@ class FileTools:
 
     # -- files ---------------------------------------------------------------
     def list_workspace_files(self, path: str = ".") -> dict[str, Any]:
-        target = resolve_safe_path(path, self.config.workspace)
+        target = resolve_safe_path(path or ".", self.config.workspace)  # empty means the workspace root
         if not target.exists():
             raise ToolError(f"{path!r} does not exist.")
         if not target.is_dir():

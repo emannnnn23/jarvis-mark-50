@@ -5,6 +5,7 @@ The only subprocesses are harmless `sh -c` scripts and `python -c` stand-ins ins
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import shutil
@@ -28,7 +29,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 )
 import jarvis  # noqa: E402
 from config.settings import DEFAULT_PERMISSIONS_FILE  # noqa: E402
-from tools import linux_system  # noqa: E402
+from tools import catalog, developer, linux_system  # noqa: E402
 
 
 def wait_until(predicate, timeout: float = 2.0) -> bool:
@@ -163,6 +164,8 @@ class RunBoundedTests(TempDirTestCase):
             cwd=self.workspace, timeout=30)), daemon=True)
         thread.start()
         self.assertTrue(wait_until(lambda: child_file.exists() and child_file.read_text().strip()))
+        # The child can write its file a moment before run_bounded registers it; wait for that too.
+        self.assertTrue(wait_until(lambda: len(linux_system._running) == 1))
         processes = list(linux_system._running)
         self.assertEqual(len(processes), 1)
         pgid = processes[0].pid
@@ -927,6 +930,768 @@ class ReviewRegressionTests(ProjectCommandTestCase):
         result = jarvis.execute_tool(registry, jarvis.PermissionPolicy("standard"), "slow", "{}")
         self.assertEqual(result["status"], "unverified")
         self.assertEqual(cancelled, [True])
+
+
+# --- Phase 4: git inspection, project orientation, code search and controlled file changes -------------
+
+GIT_IDENTITY = {"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com"}
+requires_git = unittest.skipUnless(shutil.which("git"), "git not installed")
+
+
+def git(repo: Path, *args, **env) -> str:
+    """Run the real git in a temp repository: inherited GIT_* variables dropped, a fixed identity, no signing."""
+    full_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    full_env.update(GIT_IDENTITY)
+    full_env.update(env)
+    return subprocess.run(["git", "-c", "commit.gpgsign=false", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True, env=full_env).stdout
+
+
+def commit_all(repo: Path, message: str, date: str | None = None) -> None:
+    git(repo, "add", "-A")
+    dates = {"GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date} if date else {}
+    git(repo, "commit", "-q", "--allow-empty", "-m", message, **dates)
+
+
+def git_calls(spy, subcommand: str) -> list[list[str]]:
+    """The argv of every run_command call (seen through a wraps= spy) for one git subcommand."""
+    return [call.args[0] for call in spy.call_args_list if subcommand in call.args[0]]
+
+
+class DeveloperTestCase(AgentTestCase):
+    """AgentTestCase whose backups go to the temp dir, with helpers for real git repositories."""
+
+    def make_config(self, **overrides):
+        overrides.setdefault("backup_dir", self.tmp / "backups")
+        return super().make_config(**overrides)
+
+    def make_repo(self, name: str = "repo", files: dict[str, str] | None = None, message: str = "initial commit",
+                  date: str | None = None) -> Path:
+        repo = self.workspace / name
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "main")
+        self.write_files(repo, files if files is not None else {"app.py": "x = 1\n"})
+        commit_all(repo, message, date=date)
+        return repo
+
+    @staticmethod
+    def write_files(root: Path, files: dict[str, str | bytes]) -> None:
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding="utf-8")
+
+    def run_dev_tool(self, name: str, **args) -> dict:
+        return jarvis.execute_tool(self.registry, self.policy, name, json.dumps(args))
+
+
+@requires_git
+class GitHelperTests(DeveloperTestCase):
+    def test_returns_folder_hardened_argv_and_clean_env(self):
+        repo = self.make_repo()
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent"}):
+            target, base, env = self.tools._git("repo")
+        self.assertEqual(target, repo)
+        self.assertEqual(base[:2], ["git", "--no-pager"])
+        self.assertEqual(base[-2:], ["-C", str(repo)])
+        for override in ("core.fsmonitor=false", "core.hooksPath=/dev/null", "core.pager=cat", "color.ui=false"):
+            self.assertIn(override, base)
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_WORK_TREE", env)
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(self.workspace.parent))
+
+    def test_repository_filter_drivers_are_neutralised(self):
+        repo = self.make_repo()
+        git(repo, "config", "filter.evil.clean", "touch PWNED && cat")
+        _, base, _ = self.tools._git("repo")
+        for override in ("filter.evil.clean=", "filter.evil.smudge=", "filter.evil.process=",
+                         "filter.evil.required=false"):
+            self.assertIn(override, base)
+
+    def test_refuses_files_folders_outside_and_non_repositories(self):
+        self.make_repo()
+        (self.workspace / "plain").mkdir()
+        (self.workspace / "file.txt").write_text("x")
+        for path, message in (("plain", "not inside a git repository"), ("file.txt", "is not a directory"),
+                              ("missing", "is not a directory"), ("..", "outside the approved directory")):
+            with self.subTest(path=path):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools._git(path)
+                self.assertIn(message, str(ctx.exception))
+
+    def test_subfolder_of_a_repository_is_accepted(self):
+        repo = self.make_repo(files={"src/app.py": "x = 1\n"})
+        target, _, _ = self.tools._git("repo/src")
+        self.assertEqual(target, repo / "src")
+
+    def test_inspect_git_status_uses_the_shared_helper(self):
+        self.make_repo()
+        with mock.patch.object(self.tools, "_git", wraps=self.tools._git) as helper:
+            result = self.tools.inspect_git_status("repo")
+        helper.assert_called_once_with("repo")
+        self.assertEqual(result["status"], "success")
+        self.assertIn("## main", result["git_status"])
+
+
+@requires_git
+class InspectGitDiffTests(DeveloperTestCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo(files={"app.py": "x = 1\n", "other.py": "y = 1\n", ".env": "MODE=one\n",
+                                          "server.pem": "pem one\n", "config/credentials.yml": "cred one\n"})
+
+    def test_protected_files_are_excluded_from_the_full_diff(self):
+        self.write_files(self.repo, {"app.py": "x = 2\n", ".env": "MODE=two\n", "server.pem": "pem two\n",
+                                     "config/credentials.yml": "cred two\n"})
+        result = self.tools.inspect_git_diff("repo")
+        self.assertIn("+x = 2", result["diff"])
+        for leaked in ("MODE=two", "pem two", "cred two", ".env", "server.pem", "credentials.yml"):
+            self.assertNotIn(leaked, result["diff"])
+        self.assertFalse(result["diff_truncated"])
+        self.assertFalse(result["staged"])
+        self.assertIsNone(result["file"])
+        self.assertIn("Protected files", result["note"])
+        self.assertEqual(result["notice"], jarvis.UNTRUSTED_NOTICE)
+
+    def test_protected_files_are_excluded_whatever_their_case_or_folder(self):
+        # read_workspace_file refuses all of these (names are compared case-insensitively, and protected
+        # folders such as .kube and .aws are refused whole), so the diff must not show their contents either.
+        self.write_files(self.repo, {"Secrets.yml": "launch one\n", "KEY.PEM": "launch one\n",
+                                     ".kube/config": "launch one\n", ".aws/config": "launch one\n"})
+        commit_all(self.repo, "add more")
+        self.write_files(self.repo, {"Secrets.yml": "launch two\n", "KEY.PEM": "launch two\n",
+                                     ".kube/config": "launch two\n", ".aws/config": "launch two\n",
+                                     "app.py": "x = 2\n"})
+        for name in ("Secrets.yml", "KEY.PEM", ".kube/config", ".aws/config"):
+            with self.assertRaises(jarvis.ToolError):
+                self.tools.read_workspace_file(f"repo/{name}")
+        diff = self.tools.inspect_git_diff("repo")["diff"]
+        self.assertIn("+x = 2", diff)
+        self.assertNotIn("launch two", diff)
+
+    def test_file_argument_limits_the_diff_and_uses_the_safe_path_rules(self):
+        self.write_files(self.repo, {"app.py": "x = 2\n", "other.py": "y = 2\n"})
+        result = self.tools.inspect_git_diff("repo", file="other.py")
+        self.assertIn("+y = 2", result["diff"])
+        self.assertNotIn("x = 2", result["diff"])
+        self.assertEqual(result["file"], "other.py")
+        for bad in (".env", "config/credentials.yml", "../../outside.py"):
+            with self.subTest(file=bad):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools.inspect_git_diff("repo", file=bad)
+                self.assertIn("Access denied", str(ctx.exception))
+
+    def test_staged_shows_only_the_index(self):
+        self.write_files(self.repo, {"app.py": "x = 2\n"})
+        git(self.repo, "add", "app.py")
+        self.write_files(self.repo, {"other.py": "y = 2\n"})
+        staged = self.tools.inspect_git_diff("repo", staged=True)
+        self.assertTrue(staged["staged"])
+        self.assertIn("+x = 2", staged["diff"])
+        self.assertNotIn("y = 2", staged["diff"])
+        unstaged = self.tools.inspect_git_diff("repo")
+        self.assertIn("+y = 2", unstaged["diff"])
+        self.assertNotIn("x = 2", unstaged["diff"])
+
+    def test_untracked_files_listed_without_protected_names(self):
+        self.write_files(self.repo, {"new.py": "", "docs/guide.md": "", ".env.local": "", "deploy/id_rsa": "",
+                                     ".ssh/config": "", "notes/Credentials.txt": ""})
+        result = self.tools.inspect_git_diff("repo")
+        self.assertEqual(sorted(result["untracked_files"]), ["docs/guide.md", "new.py"])
+        self.assertEqual(result["diff"], "")
+
+    def test_diff_is_redacted(self):
+        key = "gsk_" + "Q" * 40
+        self.write_files(self.repo, {"app.py": f"x = 1\nGROQ = '{key}'\n"})
+        diff = self.tools.inspect_git_diff("repo")["diff"]
+        self.assertNotIn(key, diff)
+        self.assertIn("[REDACTED]", diff)
+
+    def test_long_diff_is_truncated_at_max_diff_chars(self):
+        self.write_files(self.repo, {"app.py": "".join(f"line {i}\n" for i in range(50))})
+        with mock.patch.object(developer, "MAX_DIFF_CHARS", 120):
+            result = self.tools.inspect_git_diff("repo")
+        self.assertEqual(len(result["diff"]), 120)
+        self.assertTrue(result["diff_truncated"])
+        self.assertTrue(self.tools.inspect_git_diff("repo")["diff"].startswith(result["diff"]))
+        self.assertFalse(self.tools.inspect_git_diff("repo")["diff_truncated"])
+
+
+@requires_git
+class InspectGitHistoryTests(DeveloperTestCase):
+    def test_commits_with_changed_files_and_uncommitted_changes(self):
+        repo = self.make_repo()
+        self.write_files(repo, {"lib/util.py": "u = 1\n"})
+        commit_all(repo, "add util")
+        result = self.tools.inspect_git_history("repo")
+        self.assertIn("add util", result["commits"])
+        self.assertIn("A\tlib/util.py", result["commits"])
+        self.assertIn("initial commit", result["commits"])
+        self.assertEqual(result["uncommitted_changes"], "(none)")
+        self.assertFalse(result["commits_truncated"])
+        self.assertIsNone(result["since"])
+        self.assertEqual(result["notice"], jarvis.UNTRUSTED_NOTICE)
+        self.write_files(repo, {"app.py": "x = 2\n", "new.py": ""})
+        changes = self.tools.inspect_git_history("repo")["uncommitted_changes"]
+        self.assertIn("M app.py", changes)
+        self.assertIn("?? new.py", changes)
+
+    def test_since_must_match_the_allowed_forms(self):
+        self.make_repo()
+        for bad in ("--all", "last week", "3 days ago; rm -rf /", "tomorrow", "2026-10-1", "1234 days ago",
+                    "yesterday --author=x", "2026-10-01T00:00"):
+            with self.subTest(since=bad):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools.inspect_git_history("repo", since=bad)
+                self.assertIn("'since' must be like", str(ctx.exception))
+        for good, normalised in (("Yesterday", "yesterday"), (" 3 days ago ", "3 days ago"),
+                                 ("1 week ago", "1 week ago"), ("12 hours ago", "12 hours ago"),
+                                 ("2026-10-01", "2026-10-01")):
+            with self.subTest(since=good):
+                self.assertEqual(self.tools.inspect_git_history("repo", since=good)["since"], normalised)
+
+    def test_today_means_since_midnight(self):
+        repo = self.make_repo(message="old work", date="2020-01-01T12:00:00")
+        # One second after local midnight: included from midnight, but not by git's own "today" (which means now).
+        just_after_midnight = dt.datetime.combine(dt.date.today(), dt.time(0, 0, 1)).strftime("%Y-%m-%dT%H:%M:%S")
+        self.write_files(repo, {"early.py": ""})
+        commit_all(repo, "early bird", date=just_after_midnight)
+        with mock.patch("tools.developer.run_command", wraps=developer.run_command) as spy:
+            result = self.tools.inspect_git_history("repo", since="Today")
+        self.assertIn("--since=midnight", git_calls(spy, "log")[0])
+        self.assertEqual(result["since"], "today")
+        self.assertIn("early bird", result["commits"])
+        self.assertNotIn("old work", result["commits"])
+
+    def test_a_date_means_from_the_start_of_that_day(self):
+        repo = self.make_repo(message="new year work", date="2020-01-01T12:00:00")
+        self.write_files(repo, {"early.py": ""})
+        commit_all(repo, "early on the second", date="2020-01-02T00:00:01")
+        result = self.tools.inspect_git_history("repo", since="2020-01-02")
+        self.assertIn("early on the second", result["commits"])
+        self.assertNotIn("new year work", result["commits"])
+
+    def test_no_commits_in_range(self):
+        self.make_repo(message="old", date="2020-01-01T12:00:00")
+        self.assertEqual(self.tools.inspect_git_history("repo", since="2 days ago")["commits"],
+                         "(no commits in that range)")
+
+    def test_limit_is_clamped_between_1_and_50(self):
+        repo = self.make_repo()
+        for number in range(3):
+            commit_all(repo, f"change {number}")
+        with mock.patch("tools.developer.run_command", wraps=developer.run_command) as spy:
+            one = self.tools.inspect_git_history("repo", limit=0)
+            two = self.tools.inspect_git_history("repo", limit=2)
+            many = self.tools.inspect_git_history("repo", limit=500)
+        self.assertEqual(one["commits"].count("commit "), 1)
+        self.assertEqual(two["commits"].count("commit "), 2)
+        self.assertEqual(many["commits"].count("commit "), 4)
+        self.assertEqual([[a for a in argv if a.startswith("-n")] for argv in git_calls(spy, "log")],
+                         [["-n1"], ["-n2"], ["-n50"]])
+
+    def test_long_history_is_truncated_and_redacted(self):
+        repo = self.make_repo()
+        key = "gsk_" + "R" * 40
+        commit_all(repo, f"oops pasted {key}")
+        with mock.patch.object(developer, "MAX_DIFF_CHARS", 60):
+            result = self.tools.inspect_git_history("repo")
+        self.assertEqual(len(result["commits"]), 60)
+        self.assertTrue(result["commits_truncated"])
+        full = self.tools.inspect_git_history("repo")["commits"]
+        self.assertNotIn(key, full)
+        self.assertIn("[REDACTED]", full)
+
+
+class DescribeProjectTests(DeveloperTestCase):
+    def setUp(self):
+        super().setUp()
+        self.project = self.workspace / "shop"
+        key = "gsk_" + "D" * 40
+        self.write_files(self.project, {
+            "package.json": json.dumps({"scripts": {"test": "jest"}}), "Makefile": "all:\n",
+            "README.md": f"# Shop\nDeploy key {key}\n" + "x" * 5000, "src/index.js": "",
+            "node_modules/lib/index.js": "", ".venv/bin/python": "", "build/out.js": "", "dist/x": "",
+            ".env": "SECRET=1\n", "id_rsa": "key", "credentials.json": "{}", ".ssh/config": "",
+        })
+        self.key = key
+
+    def test_layout_markers_readme_and_commands(self):
+        self.config = self.make_config(commands={
+            "npm-test": cmd("npm-test", ["npm", "test"], detect=("package.json",), npm_script="test"),
+            "npm-lint": cmd("npm-lint", ["npm", "run", "lint"], kind="lint", detect=("package.json",), npm_script="lint"),
+            "pytest": cmd("pytest", ["pytest"], detect=("pyproject.toml",)),
+            "make-lint": cmd("make-lint", ["make", "lint"], kind="lint", detect=("Makefile",)),
+        })
+        self.tools = jarvis.JarvisTools(self.config, self.memory)
+        result = self.tools.describe_project("shop")
+        self.assertEqual(result["path"], str(self.project))
+        self.assertEqual(result["top_level"], ["src/", "Makefile", "package.json", "README.md"])
+        self.assertFalse(result["top_level_truncated"])
+        self.assertEqual(result["markers"], ["package.json", "Makefile"])
+        self.assertEqual(result["approved_commands"], {"tests": ["npm-test"], "lint": ["make-lint"]})
+        self.assertTrue(result["readme_start"].startswith("# Shop"))
+        self.assertNotIn(self.key, result["readme_start"])
+        self.assertIn("[REDACTED]", result["readme_start"])
+        self.assertLessEqual(len(result["readme_start"]), 3000)
+        self.assertEqual(result["notice"], jarvis.UNTRUSTED_NOTICE)
+
+    def test_outside_a_repository_git_is_the_error_text(self):
+        result = self.tools.describe_project("shop")
+        self.assertIsInstance(result["git"], str)
+        self.assertIn("not", result["git"])
+
+    @requires_git
+    def test_branch_recent_commits_and_uncommitted_count(self):
+        git(self.project, "init", "-q", "-b", "feature/cart")
+        commit_all(self.project, "first commit")
+        commit_all(self.project, "second commit")
+        (self.project / "src" / "index.js").write_text("changed")
+        info = self.tools.describe_project("shop")["git"]
+        self.assertEqual(info["branch"], "feature/cart")
+        self.assertEqual(len(info["recent_commits"]), 2)
+        self.assertIn("second commit", info["recent_commits"][0])
+        self.assertEqual(info["uncommitted_files"], 1)
+
+    @requires_git
+    def test_plain_folder_reports_no_repository(self):
+        self.assertIn("not inside a git repository", self.tools.describe_project("shop")["git"])
+
+    def test_many_entries_are_truncated_and_bad_paths_refused(self):
+        self.write_files(self.project, {f"file{i:03}.txt": "" for i in range(90)})
+        result = self.tools.describe_project("shop")
+        self.assertEqual(len(result["top_level"]), 80)
+        self.assertTrue(result["top_level_truncated"])
+        (self.workspace / "notes.txt").write_text("x")
+        for path in ("notes.txt", "missing", "..", "shop/.ssh"):
+            with self.subTest(path=path):
+                with self.assertRaises(jarvis.ToolError):
+                    self.tools.describe_project(path)
+
+
+class SearchWorkspaceCodeTests(DeveloperTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write_files(self.workspace, {
+            "app/main.py": "def Handler():\n    return a.c\nabc = 1\n",
+            "app/util.py": "HANDLER = 2\n",
+            "notes.txt": "nothing here\n",
+        })
+
+    def search(self, query, **kwargs):
+        return self.tools.search_workspace_code(query, **kwargs)
+
+    def found(self, result) -> list[tuple[str, int]]:
+        return [(match["file"], match["line"]) for match in result["matches"]]
+
+    def test_case_insensitive_by_default_and_case_sensitive_on_request(self):
+        result = self.search("handler")
+        self.assertEqual(self.found(result), [("app/main.py", 1), ("app/util.py", 1)])
+        self.assertEqual(result["matches"][0]["text"], "def Handler():")
+        self.assertEqual(self.found(self.search("Handler", case_sensitive=True)), [("app/main.py", 1)])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["notice"], jarvis.UNTRUSTED_NOTICE)
+
+    def test_query_is_literal_text_not_a_regex(self):
+        self.assertEqual(self.found(self.search("a.c")), [("app/main.py", 2)])
+        self.assertEqual(self.found(self.search("Handler(")), [("app/main.py", 1)])
+        self.assertEqual(self.found(self.search("[a-z]+")), [])
+
+    def test_empty_or_default_path_means_the_workspace_root(self):
+        for kwargs in ({}, {"path": ""}, {"path": "."}):
+            with self.subTest(kwargs=kwargs):
+                result = self.search("handler", **kwargs)
+                self.assertEqual(result["searched"], str(self.workspace))
+                self.assertEqual(len(result["matches"]), 2)
+
+    def test_folder_or_single_file_as_root(self):
+        self.assertEqual(self.found(self.search("handler", path="app/util.py")), [("app/util.py", 1)])
+        result = self.search("handler", path="app")
+        self.assertEqual(result["searched"], str(self.workspace / "app"))
+        self.assertEqual(result["files_scanned"], 2)
+
+    def test_skips_dependency_folders_protected_files_binaries_and_big_files(self):
+        self.write_files(self.workspace, {
+            "app/node_modules/pkg/index.js": "needle", "app/.venv/lib/x.py": "needle", "build/x.py": "needle",
+            "app/__pycache__/m.py": "needle", ".git/config": "needle", "app/.env": "needle",
+            "app/secrets.yml": "needle", "app/.ssh/config": "needle", "app/server.PEM": "needle",
+            "app/image.bin": b"needle\x00\x01\x02", "app/big.txt": "needle\n" + "x" * 500,
+            "app/real.py": "needle",
+        })
+        with mock.patch.object(developer, "MAX_SEARCH_FILE_BYTES", 100):
+            result = self.search("needle")
+        self.assertEqual(self.found(result), [("app/real.py", 1)])
+
+    def test_symlinked_files_and_folders_are_not_followed(self):
+        outside = self.tmp / "outside"
+        self.write_files(outside, {"secret.py": "needle"})
+        self.write_files(self.workspace, {"app/real.py": "needle"})
+        (self.workspace / "app" / "linked.py").symlink_to(outside / "secret.py")
+        (self.workspace / "app" / "linked_dir").symlink_to(outside, target_is_directory=True)
+        (self.workspace / "app" / "inner_link.py").symlink_to(self.workspace / "app" / "real.py")
+        self.assertEqual(self.found(self.search("needle")), [("app/real.py", 1)])
+
+    def test_max_results_and_file_limit(self):
+        self.write_files(self.workspace, {f"many/f{i}.py": "hit\nhit\n" for i in range(5)})
+        result = self.search("hit", path="many", max_results=3)
+        self.assertEqual(len(result["matches"]), 3)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(self.search("hit", path="many", max_results=0)["matches"]), 1)
+        self.assertEqual(len(self.search("hit", path="many", max_results=1000)["matches"]), 10)
+        with mock.patch.object(developer, "MAX_SEARCH_FILES", 2):
+            limited = self.search("hit", path="many")
+        self.assertEqual(limited["files_scanned"], 2)
+        self.assertEqual(len(limited["matches"]), 4)
+        self.assertTrue(limited["truncated"])
+
+    def test_matches_are_redacted_and_capped(self):
+        key = "gsk_" + "S" * 40
+        self.write_files(self.workspace, {"cfg/settings.py": f"    KEY = '{key}'  # needle\n"
+                                                             + "needle " + "y" * 500 + "\n"})
+        matches = self.search("needle", path="cfg")["matches"]
+        self.assertNotIn(key, matches[0]["text"])
+        self.assertIn("[REDACTED]", matches[0]["text"])
+        self.assertTrue(matches[0]["text"].startswith("KEY"))  # stripped
+        self.assertEqual(len(matches[1]["text"]), 200)
+
+    def test_bad_roots_are_refused(self):
+        for path, message in (("missing", "does not exist"), ("..", "outside"), ("app/.env", "protected")):
+            with self.subTest(path=path):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.search("x", path=path)
+                self.assertIn(message, str(ctx.exception))
+
+
+class TextEditHelperTests(TempDirTestCase):
+    def test_unified_diff(self):
+        diff = developer.unified_diff("a\nb\nc\n", "a\nB\nc\n", "src/x.py")
+        self.assertEqual(diff.splitlines(), ["--- a/src/x.py", "+++ b/src/x.py", "@@ -1,3 +1,3 @@",
+                                             " a", "-b", "+B", " c"])
+        self.assertEqual(developer.unified_diff("same\n", "same\n", "x"), "")
+
+    def test_replace_once(self):
+        self.assertEqual(developer.replace_once("a = 1\nb = 2\n", "b = 2", "b = 3"), "a = 1\nb = 3\n")
+        self.assertEqual(developer.replace_once("keep remove keep", " remove", ""), "keep keep")
+
+    def test_replace_once_refusals(self):
+        for old, new, message in (("", "x", "must not be empty"), ("a", "a", "identical"),
+                                  ("zzz", "y", "was not found"), ("dup", "x", "appears 2 times")):
+            with self.subTest(old=old):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    developer.replace_once("dup a dup", old, new)
+                self.assertIn(message, str(ctx.exception))
+
+    def test_overlapping_occurrences_are_ambiguous(self):
+        # "end\nend\n" occurs at two places in this text (they overlap); str.count sees only one.
+        with self.assertRaises(jarvis.ToolError) as ctx:
+            developer.replace_once("end\nend\nend\n", "end\nend\n", "end\n")
+        self.assertIn("appears 2 times", str(ctx.exception))
+
+    def test_crlf_file_matched_with_lf_old_text_and_kept(self):
+        text = "one\r\ntwo\r\nthree\r\n"
+        self.assertEqual(developer.replace_once(text, "one\ntwo\n", "uno\ndos\n"), "uno\r\ndos\r\nthree\r\n")
+        self.assertEqual(developer.replace_once(text, "two", "2"), "one\r\n2\r\nthree\r\n")
+        with self.assertRaises(jarvis.ToolError):
+            developer.replace_once("one\ntwo\n", "one\r\ntwo", "x")
+
+    def test_write_text_atomically(self):
+        target = self.workspace / "script.sh"
+        target.write_text("old")
+        developer.write_text_atomically(target, "line one\r\nline two\n", mode=0o750)
+        self.assertEqual(target.read_bytes(), b"line one\r\nline two\n")  # newline="": no translation
+        self.assertEqual(target.stat().st_mode & 0o7777, 0o750)
+        self.assertEqual(os.listdir(self.workspace), ["script.sh"])
+
+    def test_write_text_atomically_failure_leaves_original_and_no_temp_file(self):
+        target = self.workspace / "keep.txt"
+        target.write_text("original")
+        with mock.patch("tools.developer.os.replace", side_effect=OSError(28, "No space left")):
+            with self.assertRaises(OSError):
+                developer.write_text_atomically(target, "new", mode=0o644)
+        self.assertEqual(target.read_text(), "original")
+        self.assertEqual(os.listdir(self.workspace), ["keep.txt"])
+
+
+class ReadEditableTests(DeveloperTestCase):
+    def test_refusals(self):
+        self.write_files(self.workspace, {"dir/x": "", "binary.dat": b"abc\x00def", "latin1.txt": "café".encode("latin-1")})
+        (self.workspace / "big.txt").write_bytes(b"x" * (developer.MAX_EDIT_FILE_BYTES + 1))
+        for name, message in (("dir", "is not a file"), ("missing.txt", "is not a file"),
+                              ("big.txt", "larger than 1 MB"), ("binary.dat", "binary"), ("latin1.txt", "not UTF-8")):
+            with self.subTest(name=name):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools._read_editable(self.workspace / name)
+                self.assertIn(message, str(ctx.exception))
+                self.assertIn(name, str(ctx.exception))
+
+    def test_returns_bytes_and_text(self):
+        (self.workspace / "ok.txt").write_bytes("héllo\r\n".encode())
+        self.assertEqual(self.tools._read_editable(self.workspace / "ok.txt"), ("héllo\r\n".encode(), "héllo\r\n"))
+        (self.workspace / "limit.txt").write_bytes(b"x" * developer.MAX_EDIT_FILE_BYTES)
+        self.assertEqual(len(self.tools._read_editable(self.workspace / "limit.txt")[0]), developer.MAX_EDIT_FILE_BYTES)
+
+
+class FileGitStateTests(DeveloperTestCase):
+    def test_not_in_a_repository(self):
+        (self.workspace / "loose.txt").write_text("x")
+        self.assertEqual(self.tools._file_git_state(self.workspace / "loose.txt"),
+                         "not in a git repository; JARVIS keeps a backup")
+
+    @requires_git
+    def test_states_inside_a_repository(self):
+        repo = self.make_repo(files={"clean.py": "c\n", "edited.py": "e\n", "staged.py": "s\n"})
+        self.write_files(repo, {"edited.py": "e2\n", "staged.py": "s2\n", "fresh.py": "f\n"})
+        git(repo, "add", "staged.py")
+        state = self.tools._file_git_state
+        self.assertEqual(state(repo / "clean.py"), "tracked by git, no other uncommitted changes")
+        self.assertEqual(state(repo / "edited.py"), "has other uncommitted changes, which are kept")
+        self.assertEqual(state(repo / "staged.py"), "has other uncommitted changes, which are kept")
+        self.assertEqual(state(repo / "fresh.py"), "not yet tracked by git; JARVIS keeps a backup")
+        self.assertEqual(state(repo / "not-there.py"), "new file")
+
+    @requires_git
+    def test_ignored_file_is_not_called_tracked(self):
+        repo = self.make_repo(files={".gitignore": "local.cfg\n"})
+        self.write_files(repo, {"local.cfg": "debug = true\n"})
+        self.assertNotIn("tracked by git", self.tools._file_git_state(repo / "local.cfg"))
+
+
+class EditWorkspaceFileTests(DeveloperTestCase):
+    def setUp(self):
+        super().setUp()
+        self.target = self.workspace / "pkg" / "calc.py"
+        self.write_files(self.workspace, {"pkg/calc.py": "def add(a, b):\n    return a - b\n"})
+        self.original = self.target.read_bytes()
+
+    def edit(self, old="return a - b", new="return a + b", path="pkg/calc.py"):
+        return self.run_dev_tool("edit_workspace_file", path=path, old_text=old, new_text=new)
+
+    def backups(self) -> list[Path]:
+        root = self.config.backup_dir
+        return sorted(p for p in root.rglob("*") if p.is_file()) if root.exists() else []
+
+    def test_confirmation_shows_the_diff_and_the_edit_is_applied_and_verified(self):
+        result = self.edit()
+        self.assertEqual(result["status"], "success", result)
+        report = result["result"]
+        self.assertTrue(report["applied"])
+        self.assertTrue(report["verified"])
+        self.assertEqual(report["path"], "pkg/calc.py")
+        self.assertIn("run_project_tests", report["next_step"])
+        self.assertEqual(self.target.read_text(), "def add(a, b):\n    return a + b\n")
+        [request] = self.confirm.calls
+        self.assertEqual(request.tool_name, "edit_workspace_file")
+        self.assertIs(request.permission, jarvis.Permission.SENSITIVE_ACTION)
+        self.assertEqual(request.affected_paths, [str(self.target)])
+        self.assertIn("Edit pkg/calc.py: 1 line(s) added, 1 removed", request.operation)
+        self.assertIn("not in a git repository", request.operation)
+        self.assertIn("--- a/pkg/calc.py", request.details)
+        self.assertIn("-    return a - b", request.details)
+        self.assertIn("+    return a + b", request.details)
+        self.assertEqual(report["diff"], request.details)
+
+    def test_declined_edit_writes_nothing(self):
+        self.confirm.answer = False
+        result = self.edit()
+        self.assertEqual(result["status"], "denied")
+        self.assertEqual(self.target.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
+
+    def test_file_changed_while_the_prompt_was_open_is_not_written(self):
+        def approve_then_change(request):
+            with self.target.open("a", encoding="utf-8") as handle:
+                handle.write("# added by the user meanwhile\n")
+            return True
+
+        self.policy.confirm = approve_then_change
+        result = self.edit()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("changed after the edit was approved", result["error"])
+        self.assertEqual(self.target.read_text(),
+                         "def add(a, b):\n    return a - b\n# added by the user meanwhile\n")
+        self.assertEqual(self.backups(), [])
+
+    def test_backup_is_private_and_holds_the_previous_version(self):
+        report = self.edit()["result"]
+        backup = Path(report["backup"])
+        self.assertEqual(self.backups(), [backup])
+        self.assertTrue(backup.is_relative_to(self.config.backup_dir))
+        self.assertTrue(str(backup).endswith("pkg/calc.py"))
+        self.assertEqual(backup.read_bytes(), self.original)
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(backup.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.config.backup_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_only_the_newest_backups_are_kept(self):
+        steps = [("return a - b", "return a + b"), ("return a + b", "return b + a"), ("return b + a", "return a + b")]
+        with mock.patch.object(developer, "BACKUPS_KEPT", 2):
+            for old, new in steps:
+                self.assertEqual(self.edit(old, new)["status"], "success")
+        stamps = sorted(p for p in self.config.backup_dir.iterdir())
+        self.assertEqual(len(stamps), 2)
+        self.assertEqual([(s / "pkg" / "calc.py").read_text().splitlines()[1] for s in stamps],
+                         ["    return a + b", "    return b + a"])
+
+    def test_file_mode_and_line_endings_are_preserved(self):
+        script = self.workspace / "run.sh"
+        script.write_bytes(b"#!/bin/sh\r\necho one\r\n")
+        script.chmod(0o751)
+        result = self.run_dev_tool("edit_workspace_file", path="run.sh", old_text="echo one\n", new_text="echo two\n")
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(script.read_bytes(), b"#!/bin/sh\r\necho two\r\n")
+        self.assertEqual(script.stat().st_mode & 0o7777, 0o751)
+        self.assertEqual(sorted(os.listdir(self.workspace)), ["pkg", "run.sh"])  # no temp files left
+
+    @requires_git
+    def test_other_uncommitted_changes_in_the_same_file_are_kept(self):
+        repo = self.make_repo(files={"lib.py": "A = 1\nB = 2\nC = 3\n"})
+        self.write_files(repo, {"lib.py": "A = 100\nB = 2\nC = 3\n"})  # the user's own unfinished work
+        result = self.run_dev_tool("edit_workspace_file", path="repo/lib.py", old_text="C = 3", new_text="C = 30")
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual((repo / "lib.py").read_text(), "A = 100\nB = 2\nC = 30\n")
+        self.assertEqual(result["result"]["git"], "has other uncommitted changes, which are kept")
+        self.assertIn("has other uncommitted changes", self.confirm.calls[0].operation)
+        self.assertIn("+A = 100", git(repo, "diff"))
+
+    def test_protected_and_outside_files_are_refused_without_asking(self):
+        self.write_files(self.workspace, {".env": "MODE=dev\n"})
+        outside = self.tmp / "outside.py"
+        outside.write_text("x = 1\n")
+        for path in (".env", "../outside.py", str(outside)):
+            with self.subTest(path=path):
+                result = self.edit("x = 1" if path != ".env" else "MODE=dev", "changed", path=path)
+                self.assertEqual(result["status"], "denied")
+                self.assertTrue(result["reason"].startswith("Not done: Access denied"), result["reason"])
+        self.assertEqual(self.confirm.calls, [])
+        self.assertEqual((self.workspace / ".env").read_text(), "MODE=dev\n")
+        self.assertEqual(outside.read_text(), "x = 1\n")
+        self.assertEqual(self.backups(), [])
+
+    def test_text_not_found_is_refused_before_asking(self):
+        result = self.edit("return a * b", "return a + b")
+        self.assertEqual(result["status"], "denied")
+        self.assertIn("Not done: old_text was not found", result["reason"])
+        self.assertEqual(self.confirm.calls, [])
+
+
+class CreateWorkspaceFileTests(DeveloperTestCase):
+    def create(self, path="pkg/new/module.py", content="A = 1\nB = 2\n"):
+        return self.run_dev_tool("create_workspace_file", path=path, content=content)
+
+    def test_creates_parent_folders_with_mode_0644_and_verifies(self):
+        previous = os.umask(0o077)
+        try:
+            result = self.create()
+        finally:
+            os.umask(previous)
+        self.assertEqual(result["status"], "success", result)
+        target = self.workspace / "pkg" / "new" / "module.py"
+        self.assertEqual(target.read_text(), "A = 1\nB = 2\n")
+        self.assertEqual(target.stat().st_mode & 0o7777, 0o644)
+        report = result["result"]
+        self.assertTrue(report["created"])
+        self.assertTrue(report["verified"])
+        self.assertEqual(report["path"], "pkg/new/module.py")
+        [request] = self.confirm.calls
+        self.assertIs(request.permission, jarvis.Permission.SENSITIVE_ACTION)
+        self.assertEqual(request.operation, "Create pkg/new/module.py (2 lines).")
+        self.assertEqual(request.affected_paths, [str(target)])
+        self.assertIn("+A = 1", request.details)
+        self.assertIn("+++ b/pkg/new/module.py", request.details)
+        self.assertEqual(os.listdir(target.parent), ["module.py"])
+
+    def test_declined_creates_nothing(self):
+        self.confirm.answer = False
+        self.assertEqual(self.create()["status"], "denied")
+        self.assertFalse((self.workspace / "pkg").exists())
+
+    def test_never_overwrites_a_file_or_symlink(self):
+        existing = self.workspace / "existing.py"
+        existing.write_text("keep\n")
+        (self.workspace / "link.py").symlink_to(existing)
+        (self.workspace / "escape.py").symlink_to(self.tmp / "outside-new.py")
+        for path, message in (("existing.py", "already exists"), ("link.py", "already exists"),
+                              ("escape.py", "Access denied")):
+            with self.subTest(path=path):
+                result = self.create(path=path, content="replaced\n")
+                self.assertEqual(result["status"], "denied")
+                self.assertIn(message, result["reason"])
+        self.assertEqual(existing.read_text(), "keep\n")
+        self.assertFalse((self.tmp / "outside-new.py").exists())
+        self.assertEqual(self.confirm.calls, [])
+
+    def test_size_and_nul_limits(self):
+        with self.assertRaises(jarvis.ToolError):
+            self.tools.create_workspace_file("nul.txt", "a\x00b")
+        with mock.patch.object(developer, "MAX_NEW_FILE_CHARS", 10):
+            with self.assertRaises(jarvis.ToolError) as ctx:
+                self.tools.create_workspace_file("big.txt", "x" * 11)
+            self.assertIn("at most", str(ctx.exception))
+            self.assertTrue(self.tools.create_workspace_file("ok.txt", "x" * 10)["verified"])
+        self.assertFalse((self.workspace / "nul.txt").exists())
+        self.assertFalse((self.workspace / "big.txt").exists())
+
+    def test_protected_names_are_refused(self):
+        for path in (".env", "config/secrets.yml", ".ssh/authorized_keys", "../outside.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(self.create(path=path, content="x")["status"], "denied")
+        self.assertEqual(self.confirm.calls, [])
+
+    @requires_git
+    def test_new_file_in_a_repository_is_reported_untracked(self):
+        self.make_repo()
+        result = self.create(path="repo/added.py", content="")
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["result"]["git"], "not yet tracked by git; JARVIS keeps a backup")
+        self.assertEqual((self.workspace / "repo" / "added.py").read_text(), "")
+
+
+class DeveloperCatalogTests(DeveloperTestCase):
+    NEW_READ_ONLY = ("inspect_git_diff", "inspect_git_history", "describe_project", "search_workspace_code")
+
+    def test_exactly_the_developer_tools_are_in_the_developer_group(self):
+        self.assertEqual(catalog.DEVELOPER_TOOLS, {
+            "list_workspace_files", "read_workspace_file", "inspect_git_status", "inspect_git_diff",
+            "inspect_git_history", "describe_project", "search_workspace_code", "edit_workspace_file",
+            "create_workspace_file", "run_project_tests"})
+        groups = {tool.name: tool.group for tool in self.registry.tools()}
+        self.assertTrue(catalog.DEVELOPER_TOOLS <= set(groups))
+        for name, group in groups.items():
+            with self.subTest(tool=name):
+                self.assertEqual(group, "developer" if name in catalog.DEVELOPER_TOOLS else "core")
+
+    def test_new_tools_permission_classes(self):
+        for name in self.NEW_READ_ONLY:
+            with self.subTest(tool=name):
+                tool = self.registry.get(name)
+                self.assertIs(tool.permission, jarvis.Permission.READ_ONLY)
+                self.assertTrue(tool.untrusted_output)
+        for name, describe in (("edit_workspace_file", self.tools._describe_edit),
+                               ("create_workspace_file", self.tools._describe_create)):
+            with self.subTest(tool=name):
+                tool = self.registry.get(name)
+                self.assertIs(tool.permission, jarvis.Permission.SENSITIVE_ACTION)
+                self.assertEqual(tool.describe, describe)
+                self.assertFalse(tool.untrusted_output)
+
+    def test_new_tool_schemas(self):
+        required = {"inspect_git_diff": ["path"], "inspect_git_history": ["path"], "describe_project": ["path"],
+                    "search_workspace_code": ["query"], "edit_workspace_file": ["path", "old_text", "new_text"],
+                    "create_workspace_file": ["path", "content"]}
+        for name, fields in required.items():
+            with self.subTest(tool=name):
+                params = self.registry.get(name).parameters
+                self.assertEqual(params["required"], fields)
+                self.assertFalse(params["additionalProperties"])
+        limit = self.registry.get("inspect_git_history").parameters["properties"]["limit"]
+        self.assertEqual((limit["minimum"], limit["maximum"]), (1, 50))
+        self.assertEqual(self.registry.get("search_workspace_code").parameters["properties"]["path"]["minLength"], 0)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,13 @@ def split_into_chunks(text: str, max_chars: int = 350) -> list[str]:
     return chunks
 
 
+async def _cancel_pending_tasks() -> None:
+    tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class VoiceEngine:
     """edge-tts synthesis plus a local MP3 player, on a background event loop.
 
@@ -281,6 +288,12 @@ class VoiceEngine:
         if current is not None:  # let the cancelled task terminate its player process first
             concurrent.futures.wait([current], timeout=3)
         if self._loop is not None:
+            # Cancel anything still pending (e.g. a chime scheduled a moment ago) and let it unwind,
+            # so no player is left running and no coroutine is dropped without being awaited.
+            try:
+                asyncio.run_coroutine_threadsafe(_cancel_pending_tasks(), self._loop).result(timeout=3)
+            except (concurrent.futures.TimeoutError, RuntimeError):
+                pass
             self._loop.call_soon_threadsafe(self._loop.stop)
             if self._thread is not None:
                 self._thread.join(timeout=3)
