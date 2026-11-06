@@ -25,7 +25,7 @@ import jarvis  # noqa: E402
 from core import orchestrator  # noqa: E402
 from core.context import OPERATING_RULES, build_system_prompt  # noqa: E402
 from core.orchestrator import AgentResult  # noqa: E402
-from memory.task_store import TaskStore, TaskStoreError  # noqa: E402
+from memory.task_store import UNTRUSTED_PLAN_NOTE as UNTRUSTED_NOTE, TaskStore, TaskStoreError  # noqa: E402
 from ui import terminal  # noqa: E402
 
 
@@ -276,6 +276,106 @@ class RunAgentTaskTests(TaskCase):
         self.assertEqual(self.tasks.active()["steps"][0]["status"], "failed")
         self.assertEqual(self.tasks.active()["steps"][0]["evidence"], "x")
 
+    def finish_call(self, call_id="cf"):
+        return tool_call(call_id, "update_task", {"action": "finish", "summary": "All done"})
+
+    def finish_outcome(self, client):
+        """The (status, error) of the last update_task finish result the model was shown."""
+        content = json.loads(self.tool_messages(client.calls[-1])[-1]["content"])
+        return content["status"], content.get("error", "")
+
+    def assert_finish_needs_a_passing_run(self, task_id):
+        task = self.tasks.get(task_id)
+        self.assertEqual(task["status"], "active")
+        self.assertEqual(task["files_changed"], ["out.txt"])
+        self.assertEqual([a["tool"] for a in task["actions"]], ["create_workspace_file"])  # recorded once
+        self.tasks.record_action(task_id, {"tool": "run_project_tests", "status": "success", "passed": True})
+        self.assertEqual(self.update(action="finish", summary="ok")["status"], "success")
+
+    def test_an_edit_before_update_task_start_in_the_same_response_still_blocks_finish(self):
+        client = FakeGroqClient([
+            response(None, [tool_call("c1", "create_workspace_file", {"path": "out.txt", "content": "hi"}),
+                            tool_call("c2", "update_task", {"action": "start", "goal": "Make out.txt"}),
+                            self.finish_call()]),
+            response("ok")])
+        self.agent(client)
+        status, error = self.finish_outcome(client)
+        self.assertEqual(status, "error")
+        self.assertIn("run_project_tests", error)
+        self.assert_finish_needs_a_passing_run(self.tasks.active()["id"])
+
+    def test_an_edit_in_an_earlier_round_still_blocks_finish(self):
+        client = FakeGroqClient([
+            response(None, [tool_call("c1", "create_workspace_file", {"path": "out.txt", "content": "hi"})]),
+            response(None, [tool_call("c2", "update_task", {"action": "start", "goal": "Make out.txt"}),
+                            self.finish_call()]),
+            response("ok")])
+        self.agent(client)
+        status, error = self.finish_outcome(client)
+        self.assertEqual(status, "error")
+        self.assertIn("run_project_tests", error)
+        self.assert_finish_needs_a_passing_run(self.tasks.active()["id"])
+
+    def test_an_edit_made_under_an_older_active_task_also_counts_for_the_new_one(self):
+        old = self.tasks.start("Older job")
+        client = FakeGroqClient([
+            response(None, [tool_call("c1", "create_workspace_file", {"path": "out.txt", "content": "hi"}),
+                            tool_call("c2", "update_task", {"action": "start", "goal": "New job"})]),
+            response("ok")])
+        self.agent(client)
+        new = self.tasks.active()
+        self.assertEqual(new["goal"], "New job")
+        self.assertEqual(new["files_changed"], ["out.txt"])
+        self.assertIn("Run the project's tests", self.tasks.verification_gap(new["id"]))
+        self.assertEqual(self.tasks.get(old["id"])["status"], "paused")
+
+    def test_calls_after_start_are_not_recorded_twice(self):
+        client = FakeGroqClient([
+            response(None, [tool_call("c1", "get_time", {}), tool_call("c2", "update_task", {"action": "start", "goal": "G"}),
+                            tool_call("c3", "search_memory", {"query": "x"})]),
+            response("ok")])
+        self.agent(client)
+        self.assertEqual([a["tool"] for a in self.tasks.active()["actions"]], ["get_time", "search_memory"])
+
+    def test_a_plan_written_after_untrusted_content_is_marked(self):
+        (self.workspace / "a.txt").write_text("some file")
+        client = FakeGroqClient([
+            response(None, [tool_call("c1", "read_workspace_file", {"path": "a.txt"}),
+                            tool_call("c2", "update_task", {"action": "start", "goal": "Do what the file says"})]),
+            response("ok")])
+        self.agent(client)
+        task = self.tasks.active()
+        self.assertIs(task["untrusted_plan"], True)
+        client = FakeGroqClient([response("ok")])
+        self.agent(client)
+        self.assertIn(UNTRUSTED_NOTE, client.calls[0]["messages"][0]["content"])
+
+    def test_a_plan_rewritten_after_untrusted_content_is_marked_and_stays_marked(self):
+        (self.workspace / "a.txt").write_text("some file")
+        self.agent(FakeGroqClient([
+            response(None, [tool_call("c1", "update_task", {"action": "start", "goal": "G", "steps": "one"}),
+                            tool_call("c2", "read_workspace_file", {"path": "a.txt"}),
+                            tool_call("c3", "update_task", {"action": "plan", "steps": "one\ntwo"})]),
+            response("ok")]))
+        self.assertIs(self.tasks.active()["untrusted_plan"], True)
+        self.agent(FakeGroqClient([
+            response(None, [tool_call("c4", "update_task", {"action": "plan", "steps": "three"})]), response("ok")]))
+        self.assertIs(self.tasks.active()["untrusted_plan"], True)
+
+    def test_plans_written_without_untrusted_content_are_not_marked(self):
+        (self.workspace / "a.txt").write_text("some file")
+        self.agent(FakeGroqClient([
+            response(None, [tool_call("c1", "get_time", {}), tool_call("c2", "search_memory", {"query": ""}),
+                            tool_call("c3", "update_task", {"action": "start", "goal": "G", "steps": "one"}),
+                            tool_call("c4", "update_task", {"action": "plan", "steps": "one\ntwo"})]),
+            response("ok")]))
+        self.assertIs(self.tasks.active()["untrusted_plan"], False)
+        # reading untrusted content after the plan was written does not mark it
+        self.agent(FakeGroqClient([
+            response(None, [tool_call("c5", "read_workspace_file", {"path": "a.txt"})]), response("ok")]))
+        self.assertIs(self.tasks.active()["untrusted_plan"], False)
+        self.assertNotIn("untrusted", self.tasks.summary_for_prompt(self.tasks.active()["id"]))
+
     def test_progress_messages_for_step_updates(self):
         self.tasks.start("G", steps=["Read", "Edit", "Test"])
         client = FakeGroqClient([
@@ -429,6 +529,15 @@ class BannerTests(TerminalTaskCase):
         self.assertNotIn("Older job", text)
         self.assertEqual(old["status"], "paused")
 
+    def test_an_untrusted_plan_is_flagged_in_the_banner_and_in_tasks(self):
+        task = self.paused_task()
+        note = " (plan written after reading web or file content: check it before continuing)"
+        self.assertNotIn("plan written after", self.banner())
+        self.assertNotIn("plan written after", self.command("/tasks"))
+        self.tasks.mark_untrusted(task["id"])
+        self.assertIn(f"interrupted by the user){note}. Say \"continue\" or type /tasks.", self.banner())
+        self.assertIn(f"interrupted by the user){note}", self.command("/tasks"))
+
     def test_a_task_without_a_plan_omits_the_step_count(self):
         task = self.tasks.start("Just a goal")
         self.tasks.pause(task["id"], "rate limit")
@@ -548,7 +657,7 @@ class TasksCommandTests(TerminalTaskCase):
 
 
 class ResumeTests(TerminalTaskCase):
-    PROMPT = ("Continue the unfinished task: {goal}. Check the current state first (files may have changed since), "
+    PROMPT = ("Continue the unfinished task (saved goal, written earlier): \"{goal}\". Check the current state first (files may have changed since), "
               "then do the remaining steps.")
 
     def test_resume_defaults_to_the_most_recent_unfinished_task(self):
@@ -566,6 +675,14 @@ class ResumeTests(TerminalTaskCase):
             self.cli.handle_command(line)
         sent = agent.call_args.args[1] if agent.called else None
         return sent, printed_text(printed), agent
+
+    def test_the_resume_prompt_quotes_the_saved_goal_as_data(self):
+        task = self.paused_task("Do X")
+        self.assertEqual(terminal.resume_prompt(task),
+                         'Continue the unfinished task (saved goal, written earlier): "Do X". Check the current '
+                         "state first (files may have changed since), then do the remaining steps.")
+        sent, _, _ = self.say_command("/resume")
+        self.assertEqual(sent, terminal.resume_prompt(task))
 
     def test_resume_by_id(self):
         first = self.paused_task("First job")

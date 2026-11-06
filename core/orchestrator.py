@@ -176,6 +176,29 @@ def _record_action(ctx: AgentContext, event: dict[str, Any]) -> None:
         log.warning("Could not record a task action: %s", exc)
 
 
+def _after_update_task(ctx: AgentContext, raw_arguments: Any, result: dict[str, Any], earlier: list[dict[str, Any]],
+                       tainted: bool) -> None:
+    """Bookkeeping once update_task start or plan has run.
+
+    A plan written after untrusted content was read is marked as such. A new task also takes over what
+    this request already did, so the finish check holds whatever order the model used."""
+    if ctx.tasks is None or result["status"] != STATUS_SUCCESS:
+        return
+    try:
+        action = parse_arguments(raw_arguments).get("action")
+        data = result.get("result") if isinstance(result.get("result"), dict) else {}
+        task_id = data.get("task_id")
+        if action not in ("start", "plan") or not task_id:
+            return
+        if tainted:
+            ctx.tasks.mark_untrusted(task_id)
+        if action == "start":
+            for event in earlier:
+                ctx.tasks.record_action(task_id, event)
+    except (ToolValidationError, TaskStoreError) as exc:
+        log.warning("Could not update the task after update_task: %s", exc)
+
+
 def _pause_task(ctx: AgentContext, reason: str) -> None:
     """The request ended unfinished: say why on the active task and pause it, so it can be resumed."""
     if ctx.tasks is None:
@@ -212,6 +235,7 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
     tools = ctx.registry.schemas(tool_groups)
     offered = {schema["function"]["name"] for schema in tools}
     events: list[dict[str, Any]] = []
+    ran: list[dict[str, Any]] = []  # events of tools that ran in this request, update_task excluded
     previous_results: dict[str, dict[str, Any]] = {}
     tainted = False  # becomes True once third-party content (web, files) is in the context
 
@@ -261,12 +285,14 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
                     tainted = True
             event = _event(name, call.function.arguments, result)
             events.append(event)
-            if executed:  # a reused result or a refused call did nothing new to record
+            if executed and name == UPDATE_TASK:
+                _after_update_task(ctx, call.function.arguments, result, ran, tainted)
+                progress = _step_progress(ctx, call.function.arguments, result) if on_progress else None
+                if progress:
+                    on_progress(progress)
+            elif executed:  # a reused result or a refused call did nothing new to record
                 _record_action(ctx, event)
-                if name == UPDATE_TASK and on_progress:
-                    progress = _step_progress(ctx, call.function.arguments, result)
-                    if progress:
-                        on_progress(progress)
+                ran.append(event)
             messages.append({"role": "tool", "tool_call_id": call.id, "name": name,
                              "content": serialize_tool_result(result)})
 

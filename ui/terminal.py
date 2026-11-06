@@ -93,6 +93,9 @@ def style(text: str, colour: str) -> str:
 _RESUME_PHRASE = re.compile(r"^\W*(?:jarvis\W+)?(?:continue|resume|carry\s+on)(?:\W+jarvis)?\W*$", re.IGNORECASE)
 
 
+UNTRUSTED_PLAN_BANNER = "plan written after reading web or file content: check it before continuing"
+
+
 def is_resume_phrase(text: str) -> bool:
     return bool(_RESUME_PHRASE.match(text))
 
@@ -103,8 +106,8 @@ def task_topic(task: dict) -> str:
 
 
 def resume_prompt(task: dict) -> str:
-    return (f"Continue the unfinished task: {task['goal']}. Check the current state first (files may have "
-            "changed since), then do the remaining steps.")
+    return (f'Continue the unfinished task (saved goal, written earlier): "{task["goal"]}". Check the current '
+            "state first (files may have changed since), then do the remaining steps.")
 
 
 EXIT_WORDS = {"exit", "quit", "/exit", "/quit", "goodbye", "goodbye jarvis", "bye jarvis"}
@@ -432,7 +435,8 @@ class JarvisCLI:
         reason = f": {task['paused_reason']}" if task.get("paused_reason") else ""
         state = f"paused {describe_time_since(task['updated_at'])}{reason}" if task["status"] in ("paused", "active") \
             else f"{task['status']} {describe_time_since(task['updated_at'])}"
-        return safe_display(f"{task['goal']} ({steps}{state})")
+        note = f" ({UNTRUSTED_PLAN_BANNER})" if task.get("untrusted_plan") else ""
+        return safe_display(f"{task['goal']} ({steps}{state}){note}")
 
     def banner(self) -> None:
         print(style("\nJARVIS MARK 50", "bold") + style(f"  v{VERSION}", "dim"))

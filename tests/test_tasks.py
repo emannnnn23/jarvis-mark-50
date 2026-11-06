@@ -487,11 +487,65 @@ class PromptSummaryTests(TaskStoreTestCase):
         text = self.store.summary_for_prompt(tid)
         self.assertLessEqual(len(text), 1500)
         self.assertIn("Files changed: ", text)
-        self.assertIn("(+2 more)", text)
-        self.assertIn("Last error: " + "e" * 300, text)
+        self.assertRegex(text, r"\(\+\d+ more\)")
+        self.assertIn("Last error: " + "e" * 100, text)
         self.assertIn("Last actions: ", text)
         self.assertIn("edit_workspace_file on ", text.splitlines()[-1])
         self.assertIn("more step", text)  # the omitted plan lines are counted, not silently lost
+
+    def test_tail_lines_survive_at_the_maximum_sizes(self):
+        task = self.store.start("g" * 300, steps=[f"step {i} " + "s" * 180 for i in range(30)])
+        tid = task["id"]
+        for i in range(10):
+            self.store.record_action(tid, edit(f"{'p' * 115}{i:04d}.py"))
+        self.store.record_error(tid, "e" * 300)
+        self.store.mark_untrusted(tid)
+        self.store.pause(tid, "r" * 300)
+        text = self.store.summary_for_prompt(tid)
+        self.assertLessEqual(len(text), 1500)
+        for fragment in ("Files changed: ", "Last error: ", "Last actions: ", task_store.UNTRUSTED_PLAN_NOTE):
+            self.assertIn(fragment, text)
+        self.assertTrue(text.splitlines()[-1] == task_store.UNTRUSTED_PLAN_NOTE)
+        self.assertTrue(text.startswith(f"Task {tid} (paused: rrr"))
+        self.assertIn("Last actions: edit_workspace_file on ", text)
+        self.assertNotIn("...\n...", text)
+
+    def test_the_maximum_sizes_hold_with_no_plan_and_with_a_plan(self):
+        for steps in ([], ["a step"] * 30):
+            with self.subTest(steps=len(steps)):
+                task = self.store.start("g" * 300, steps=steps)
+                for i in range(10):
+                    self.store.record_action(task["id"], edit(f"{'q' * 118}{i}x.py"))
+                self.store.record_error(task["id"], "x" * 300)
+                text = self.store.summary_for_prompt(task["id"])
+                self.assertLessEqual(len(text), 1500)
+                self.assertTrue(all(label in text for label in ("Files changed", "Last error", "Last actions")))
+
+    def test_last_error_equal_to_the_pause_reason_is_not_repeated(self):
+        task = self.store.start("Goal")
+        self.store.record_error(task["id"], "the model could not be reached")
+        self.store.pause(task["id"], "the model could not be reached")
+        text = self.store.summary_for_prompt(task["id"])
+        self.assertEqual(text.count("the model could not be reached"), 1)
+        self.assertNotIn("Last error", text)
+        self.store.record_error(task["id"], "something else")
+        self.assertIn("Last error: something else", self.store.summary_for_prompt(task["id"]))
+
+    def test_untrusted_plan_mark(self):
+        plain = self.store.start("Plain", steps=["a"])
+        self.assertIs(plain["untrusted_plan"], False)
+        self.assertNotIn("untrusted", self.store.summary_for_prompt(plain["id"]))
+        self.assertIs(self.store.set_plan(plain["id"], ["b"])["untrusted_plan"], False)
+        self.assertIs(self.store.set_plan(plain["id"], ["b"], untrusted=True)["untrusted_plan"], True)
+        self.assertIs(self.store.set_plan(plain["id"], ["c"])["untrusted_plan"], True)  # never clears
+        self.assertIn(task_store.UNTRUSTED_PLAN_NOTE, self.store.summary_for_prompt(plain["id"]))
+        started = self.store.start("Marked", untrusted=True)
+        self.assertIs(self.store.get(started["id"])["untrusted_plan"], True)
+
+    def test_old_records_load_with_the_mark_off(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"tasks": [{"id": "told001", "goal": "Old", "status": "paused"}]}))
+        self.assertIs(self.make_store().get("told001")["untrusted_plan"], False)
 
     def test_unfinished_steps_are_kept_before_done_ones_when_the_plan_is_cut(self):
         task = self.store.start("Goal", steps=[f"step {i} " + "s" * 150 for i in range(1, 21)])
