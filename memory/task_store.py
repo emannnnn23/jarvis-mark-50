@@ -10,13 +10,13 @@ import datetime as dt
 import json
 import os
 import re
-import tempfile
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
 from core.audit import clean_text, log, redact
+from memory.json_store import _now_iso, save_memory
 
 
 TASK_STATUSES = ("active", "paused", "done", "abandoned")
@@ -51,10 +51,6 @@ class TaskCorruptedError(TaskStoreError):
     """The task file exists but cannot be parsed. It is never overwritten automatically."""
 
 
-def _now_iso() -> str:
-    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
-
-
 def _clean(value: Any, limit: int) -> str:
     """Model- or user-provided text made safe to store: no secrets, one line, bounded.
 
@@ -79,23 +75,6 @@ def _normalize_task(item: Any) -> dict[str, Any] | None:
         if not isinstance(task[key], list):
             task[key] = []
     return task
-
-
-def _write_atomic(data: dict[str, Any], path: Path) -> None:
-    """Temp file in the same directory, fsync, then rename; the file is private to the user."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
 
 
 class TaskStore:
@@ -151,7 +130,7 @@ class TaskStore:
                     "task store to back it up and start fresh."
                 )
             try:
-                _write_atomic(self.data, self.path)
+                save_memory(self.data, self.path)
             except (OSError, UnicodeError, ValueError, TypeError) as exc:
                 raise TaskStoreError(f"Could not save tasks to {self.path}: {exc}") from exc
 
