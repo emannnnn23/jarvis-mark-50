@@ -42,7 +42,8 @@ OPERATING_RULES = """Operating rules:
 
 def build_system_prompt(config: Config, memories: list[dict[str, Any]] | None = None,
                         profile: dict[str, Any] | None = None, history_summary: str = "",
-                        memory_warning: str | None = None, voice_state: str = "") -> str:
+                        memory_warning: str | None = None, voice_state: str = "",
+                        last_seen: str = "") -> str:
     parts = [SYSTEM_PROMPT, OPERATING_RULES]
     context = [f"- Workspace root for file and project tools: {config.workspace}",
                f"- Notes folder: {config.notes_dir}"]
@@ -52,6 +53,8 @@ def build_system_prompt(config: Config, memories: list[dict[str, Any]] | None = 
         context.append(f"- Voice: {voice_state}")
     if profile and profile.get("location"):
         context.append(f"- The user's location: {profile['location']}")
+    if last_seen:
+        context.append(f"- Last conversation with the user: {last_seen}")
     parts.append("Context:\n" + "\n".join(context))
     if memories:
         lines = "\n".join(f"- [{m['id']}] {m['text']}" for m in memories)

@@ -140,6 +140,25 @@ class MemoryStoreTests(TempDirTestCase):
         on_disk = json.loads(self.memory_path.read_text(encoding="utf-8"))
         self.assertEqual(len(on_disk["conversations"]), 3)
 
+    def test_recent_conversations_returns_copies_of_the_last_entries_oldest_first(self):
+        store = self.make_memory()
+        for i in range(5):
+            store.add_conversation(f"question {i}", f"answer {i}")
+        recent = store.recent_conversations(3)
+        self.assertEqual([c["user"] for c in recent], ["question 2", "question 3", "question 4"])
+        recent[0]["user"] = "tampered"
+        recent.pop()
+        self.assertEqual(store.data["conversations"][2]["user"], "question 2")
+        self.assertEqual(len(store.data["conversations"]), 5)
+        self.assertEqual(len(store.recent_conversations(50)), 5)
+
+    def test_recent_conversations_with_no_limit_or_no_history_is_empty(self):
+        store = self.make_memory()
+        self.assertEqual(store.recent_conversations(6), [])
+        store.add_conversation("hello", "hi there")
+        self.assertEqual(store.recent_conversations(0), [])
+        self.assertEqual(store.recent_conversations(-2), [])
+
     def test_conversation_text_is_redacted(self):
         store = self.make_memory()
         key = "gsk_" + "k" * 30

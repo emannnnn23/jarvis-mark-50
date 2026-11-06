@@ -126,6 +126,28 @@ Press Ctrl+C while JARVIS is working to cancel the current request.
 Confirmation prompts must always be typed; a spoken "yes" cannot approve an action."""
 
 
+def describe_time_since(iso: str, now: dt.datetime | None = None) -> str:
+    """How long ago an ISO timestamp was, in words: "a moment ago", "3 hours ago", "yesterday"..."""
+    try:
+        then = dt.datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return "a while ago"
+    if then.tzinfo is None:
+        then = then.astimezone()  # no offset recorded: it was local time
+    now = now or dt.datetime.now().astimezone()
+    seconds = (now - then).total_seconds()
+    if seconds < 120:  # also a clock that was set back
+        return "a moment ago"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} minutes ago"
+    hours = minutes // 60
+    if hours < 24:
+        return "1 hour ago" if hours == 1 else f"{hours} hours ago"
+    days = hours // 24
+    return "yesterday" if days == 1 else f"{days} days ago"
+
+
 def greeting() -> str:
     hour = dt.datetime.now().hour
     part = "morning" if 5 <= hour < 12 else "afternoon" if 12 <= hour < 18 else "evening"
@@ -144,6 +166,8 @@ class JarvisCLI:
         self._speech_disclosed = False
         self._mic_hint_shown = False
         self.conversation = Conversation(max_turns=ctx.config.history_turns)
+        self.last_seen = ""  # "<when> (<iso timestamp>)" of the last saved exchange, set by restore_conversation
+        self._restored_when = ""
         self.developer_mode = False  # offer the developer tools (files, git, edits, tests) to the model
         self._dev_auto = True  # switch developer mode on by itself when a message is about code
         self.wake_factory = wake_factory
@@ -349,12 +373,29 @@ class JarvisCLI:
         if speak:
             self.voice.say(text)
 
+    def restore_conversation(self) -> int:
+        """Reload the last `restore_turns` saved exchanges (already redacted) into this session.
+        They are not saved again. Returns how many turns were restored."""
+        entries = self.memory.recent_conversations(self.ctx.config.restore_turns)
+        restored = self.conversation.restore(entries)
+        if restored:
+            stamp = entries[-1].get("timestamp")
+            try:  # re-render a valid timestamp; anything else is dropped, never sent to the model
+                stamp = dt.datetime.fromisoformat(stamp).isoformat()
+            except (TypeError, ValueError):
+                stamp = ""
+            self._restored_when = describe_time_since(stamp)
+            self.last_seen = f"{self._restored_when} ({stamp})" if stamp else self._restored_when
+        return restored
+
     def banner(self) -> None:
         print(style("\nJARVIS MARK 50", "bold") + style(f"  v{VERSION}", "dim"))
         print("Personal AI Assistant")
         voice = f"spoken replies on ({self.voice.voice})" if self.voice.enabled else "replies in text only"
         print(style(f"Model: {self.ctx.config.model} | {voice} | permissions: {self.ctx.policy.mode} | "
                     "/help for commands", "dim"))
+        if self._restored_when:
+            print(style(f"Picking up where we left off (last talked {self._restored_when}).", "dim"))
         if self.voice.unavailable_reason:
             print(style(f"Voice unavailable: {self.voice.unavailable_reason}", "yellow"))
         if self.listen_mode:
@@ -514,7 +555,7 @@ class JarvisCLI:
                                on_tool=lambda name: print(style(f"  > {name}", "dim")),
                                on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
                                tool_groups={"core", "developer"} if self.developer_mode else {"core"},
-                               voice_state=self.voice_state())
+                               voice_state=self.voice_state(), last_seen=self.last_seen)
         except KeyboardInterrupt:
             self._consume_interrupt()  # a wake-word interruption is fully handled here
             print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))
@@ -539,6 +580,7 @@ class JarvisCLI:
 
     def loop(self) -> int:
         try:
+            self.restore_conversation()
             self.banner()
             self.say(greeting())
             while True:

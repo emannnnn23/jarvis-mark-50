@@ -18,6 +18,22 @@ class Conversation:
         self.turns.append((user_text, assistant_text))
         self._trim()
 
+    def restore(self, entries: list[dict]) -> int:
+        """Reload turns from the saved log (oldest first). Entries missing either text are skipped.
+        The usual limits apply; returns how many of these turns are in the conversation afterwards."""
+        added = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            user_text, assistant_text = entry.get("user"), entry.get("assistant")
+            if not (isinstance(user_text, str) and isinstance(assistant_text, str)
+                    and user_text.strip() and assistant_text.strip()):
+                continue
+            self.turns.append((user_text, assistant_text))
+            added += 1
+        self._trim()
+        return min(added, len(self.turns))
+
     def _trim(self) -> None:
         while self.turns and (len(self.turns) > self.max_turns
                               or sum(len(u) + len(a) for u, a in self.turns) > self.max_chars):

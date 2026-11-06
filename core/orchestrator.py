@@ -122,7 +122,8 @@ def progress_report(events: list[dict[str, Any]]) -> str:
 def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] | None = None,
               history_summary: str = "", on_tool: Callable[[str], None] | None = None,
               on_retry: Callable[[str, float], None] | None = None,
-              tool_groups: set[str] | None = None, voice_state: str = "") -> AgentResult:
+              tool_groups: set[str] | None = None, voice_state: str = "",
+              last_seen: str = "") -> AgentResult:
     """Run the model/tool loop until a final answer or the round limit.
 
     `tool_groups` limits which tools the model is shown (and may call); None means all of them.
@@ -133,7 +134,8 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
         memories = ctx.memory.get_relevant_memories(user_input, limit=5)
         profile = ctx.memory.profile()
         warning = ctx.memory.corruption_error
-    system_prompt = build_system_prompt(ctx.config, memories, profile, history_summary, warning, voice_state)
+    system_prompt = build_system_prompt(ctx.config, memories, profile, history_summary, warning, voice_state,
+                                        last_seen)
     messages = build_messages(system_prompt, history or [], user_input)
     tools = ctx.registry.schemas(tool_groups)
     offered = {schema["function"]["name"] for schema in tools}
