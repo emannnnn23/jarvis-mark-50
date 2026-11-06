@@ -19,8 +19,11 @@ def edit(target: str, status: str = "success") -> dict:
     return {"tool": "edit_workspace_file", "status": status, "target": target}
 
 
-def project_tests(passed: bool) -> dict:
-    return {"tool": "run_project_tests", "status": "success", "target": "proj", "passed": passed}
+def project_tests(passed: bool, project: str = "proj", check: str | None = None) -> dict:
+    event = {"tool": "run_project_tests", "status": "success", "target": project, "project": project, "passed": passed}
+    if check is not None:
+        event["check"] = check
+    return event
 
 
 class TaskStoreTestCase(TempDirTestCase):
@@ -161,6 +164,111 @@ class CorruptionTests(TaskStoreTestCase):
         self.assertEqual(second.read_bytes(), b"{second")
 
 
+    def test_a_non_utf8_file_is_treated_as_corrupted_and_left_untouched(self):
+        original = self.corrupt(b'{"tasks": [\xff\xfe]}')
+        store = self.make_store()
+        self.assertIn("not valid UTF-8", store.corruption_error)
+        self.assertFalse(store.writable)
+        with self.assertRaises(TaskStoreError):
+            store.start("New goal")
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_an_unreadable_file_is_treated_as_corrupted_and_never_raises(self):
+        original = self.corrupt(b'{"tasks": []}')
+        with mock.patch.object(task_store.Path, "read_text", side_effect=PermissionError(13, "Permission denied")):
+            store = self.make_store()
+        self.assertIn("Cannot read task file", store.corruption_error)
+        self.assertIn("Permission denied", store.corruption_error)
+        with self.assertRaises(TaskStoreError):
+            store.save()
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_a_directory_in_place_of_the_file_is_treated_as_corrupted(self):
+        self.path.mkdir(parents=True)
+        store = self.make_store()
+        self.assertIn("Cannot read task file", store.corruption_error)
+        self.assertTrue(self.path.is_dir())
+
+    def test_a_file_nested_too_deeply_is_treated_as_corrupted(self):
+        original = self.corrupt(b'{"tasks": ' + b"[" * 200000 + b"]" * 200000 + b"}")
+        store = self.make_store()
+        self.assertIsNotNone(store.corruption_error)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_any_other_load_failure_is_treated_as_corrupted(self):
+        original = self.corrupt(b'{"tasks": [{"id": "t1", "goal": "g"}]}')
+        with mock.patch.object(task_store, "_normalize_task", side_effect=RuntimeError("surprise")):
+            store = self.make_store()
+        self.assertIn("could not be loaded (RuntimeError)", store.corruption_error)
+        self.assertEqual(self.path.read_bytes(), original)
+
+
+class RepairTests(TaskStoreTestCase):
+    """A hand-edited or damaged task file with wrong types loads, and nothing that reads it fails."""
+
+    def load_tasks(self, tasks: list) -> TaskStore:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"tasks": tasks}), encoding="utf-8")
+        return self.make_store()
+
+    def assert_usable(self, store: TaskStore) -> None:
+        for task in store.unfinished() + store.recent(50):
+            task_store.count_done_steps(task)
+            store.summary_for_prompt(task["id"])
+            store.verification_gap(task["id"])
+        store.active()
+
+    def test_each_probe_case_loads_and_stays_usable(self):
+        cases = {
+            "step is a string": [{"id": "t1", "goal": "g", "status": "paused", "steps": ["a"]}],
+            "updated_at is a number": [{"id": "t1", "goal": "g", "updated_at": 5}, {"id": "t2", "goal": "h"}],
+            "goal is null": [{"id": "t1", "goal": None, "status": "paused"}],
+        }
+        for name, tasks in cases.items():
+            with self.subTest(name):
+                store = self.load_tasks(tasks)
+                self.assertIsNone(store.corruption_error)
+                self.assert_usable(store)
+
+    def test_fields_are_repaired_to_their_types(self):
+        store = self.load_tasks([{
+            "id": "t1", "goal": 42, "status": "running", "created_at": [], "updated_at": 5,
+            "paused_reason": {"x": 1}, "request": None, "last_error": 7, "summary": False,
+            "untrusted_plan": "yes", "files_changed": ["a.py", 3, None],
+            "steps": ["a", {"text": "Read", "status": "weird", "evidence": 5, "updated_at": 1}, {"status": "done"},
+                     {"text": "Edit", "status": "done", "evidence": "edited"}],
+            "actions": ["junk", {"tool": None, "status": 3, "target": ["x"], "passed": 1, "check": 5},
+                       {"tool": "get_time", "status": "success", "at": "2026-11-01T10:00:00+00:00"}],
+        }, "not a task", {"id": "t2", "goal": "fine", "steps": "not a list", "actions": {}, "files_changed": "a.py"}])
+        task = store.get("t1")
+        self.assertEqual((task["goal"], task["status"], task["request"]), ("42", "paused", ""))
+        self.assertEqual((task["created_at"], task["updated_at"]), (None, None))
+        self.assertEqual((task["paused_reason"], task["last_error"], task["summary"]), (None, "7", None))
+        self.assertIs(task["untrusted_plan"], True)
+        self.assertEqual(task["files_changed"], ["a.py"])
+        self.assertEqual([(s["text"], s["status"], s["evidence"], s["updated_at"]) for s in task["steps"]],
+                         [("Read", "pending", "5", None), ("Edit", "done", "edited", task["steps"][1]["updated_at"])])
+        self.assertEqual(task["actions"][0], {"tool": "", "status": "3", "passed": True, "check": "5"})
+        self.assertEqual(task["actions"][1]["tool"], "get_time")
+        other = store.get("t2")
+        self.assertEqual((other["steps"], other["actions"], other["files_changed"]), ([], [], []))
+        self.assertEqual([t["id"] for t in store.recent()], ["t2", "t1"])  # a task with no time sorts last
+        self.assert_usable(store)
+
+    def test_tasks_without_a_usable_time_can_still_be_trimmed(self):
+        tasks = [{"id": f"t{i}", "goal": "old", "status": "done", "updated_at": None} for i in range(MAX_TASKS)]
+        store = self.load_tasks(tasks)
+        store.start("one more")
+        self.assertEqual(len(store.recent(1000)), MAX_TASKS)
+
+    def test_the_original_bytes_are_untouched_by_loading(self):
+        self.load_tasks([{"id": "t1", "goal": None, "steps": ["a"], "updated_at": 5}])
+        before = self.path.read_bytes()
+        self.make_store()
+        self.assertEqual(self.path.read_bytes(), before)
+
+
+
 class LifecycleTests(TaskStoreTestCase):
     def test_start_pauses_the_previous_active_task(self):
         first = self.store.start("First")
@@ -232,6 +340,77 @@ class LifecycleTests(TaskStoreTestCase):
         self.assertEqual([t["id"] for t in self.store.recent(limit=2)], [c["id"], a["id"]])
 
 
+    def test_pause_can_keep_the_last_activity_time(self):
+        task = self.store.start("Crashed job")
+        self.store.data["tasks"][0]["updated_at"] = "2026-11-01T10:00:00+00:00"
+        kept = self.store.pause(task["id"], "JARVIS was closed before it finished", keep_time=True)
+        self.assertEqual((kept["status"], kept["updated_at"]), ("paused", "2026-11-01T10:00:00+00:00"))
+        self.assertEqual(self.make_store().get(task["id"])["updated_at"], "2026-11-01T10:00:00+00:00")
+        self.store.resume(task["id"])
+        self.assertNotEqual(self.store.pause(task["id"], "later")["updated_at"], "2026-11-01T10:00:00+00:00")
+
+    def test_an_abandoned_task_can_be_reopened_only_when_asked_and_a_done_one_never(self):
+        dropped = self.store.start("Dropped")
+        self.store.abandon(dropped["id"])
+        with self.assertRaises(TaskStoreError):
+            self.store.resume(dropped["id"])
+        other = self.store.start("Other")
+        reopened = self.store.resume(dropped["id"], reopen_abandoned=True)
+        self.assertEqual(reopened["status"], "active")
+        self.assertEqual(self.store.get(other["id"])["status"], "paused")
+        self.store.finish(dropped["id"], "ok")
+        with self.assertRaises(TaskStoreError) as caught:
+            self.store.resume(dropped["id"], reopen_abandoned=True)
+        self.assertIn("already done", str(caught.exception))
+
+    def test_set_request_stores_the_message_redacted_and_capped(self):
+        task = self.store.start("Goal")
+        self.store.set_request(task["id"], f"please use {FAKE_KEY} " + "r" * 900)
+        request = self.make_store().get(task["id"])["request"]
+        self.assertEqual(len(request), 500)
+        self.assertNotIn(FAKE_KEY, request)
+
+
+class FinishRuleTests(TaskStoreTestCase):
+    def test_finish_needs_a_summary(self):
+        task = self.store.start("Goal")
+        for summary in ("", "   ", "\n"):
+            with self.subTest(summary=summary):
+                with self.assertRaises(TaskStoreError) as caught:
+                    self.store.finish(task["id"], summary)
+                self.assertIn("summary", str(caught.exception))
+        self.assertEqual(self.store.get(task["id"])["status"], "active")
+
+    def test_finish_is_refused_while_a_step_is_pending_in_progress_or_failed(self):
+        task = self.store.start("Goal", steps=["a", "b", "c", "d"])
+        self.store.set_step(task["id"], 1, "done", "did a")
+        self.store.set_step(task["id"], 3, "in_progress")
+        self.store.set_step(task["id"], 4, "failed", "it broke")
+        with self.assertRaises(TaskStoreError) as caught:
+            self.store.finish(task["id"], "All good")
+        message = str(caught.exception)
+        self.assertIn("Step(s) 2 (pending), 3 (in progress), 4 (failed) are not done", message)
+        self.assertIn("skipped", message)
+        self.assertIn("update_task plan", message)
+        self.assertEqual(self.store.get(task["id"])["status"], "active")
+
+    def test_finish_succeeds_once_every_step_is_done_or_skipped(self):
+        task = self.store.start("Goal", steps=["a", "b"])
+        self.store.set_step(task["id"], 1, "done", "did a")
+        self.store.set_step(task["id"], 2, "skipped", "b was already done upstream")
+        self.assertEqual(self.store.finish(task["id"], "All good")["status"], "done")
+
+    def test_a_task_without_steps_may_finish(self):
+        task = self.store.start("Quick question")
+        self.assertEqual(self.store.finish(task["id"], "Answered")["status"], "done")
+
+    def test_revising_the_plan_lets_the_task_finish(self):
+        task = self.store.start("Goal", steps=["a", "b"])
+        self.store.set_step(task["id"], 1, "done", "did a")
+        self.store.set_plan(task["id"], ["a"])
+        self.assertEqual(self.store.finish(task["id"], "Done")["status"], "done")
+
+
 class StepTests(TaskStoreTestCase):
     def setUp(self):
         super().setUp()
@@ -265,6 +444,15 @@ class StepTests(TaskStoreTestCase):
         self.store.set_step(self.task["id"], 1, "done", "proof")
         reopened = self.store.set_step(self.task["id"], 1, "failed")
         self.assertEqual((reopened["steps"][0]["status"], reopened["steps"][0]["evidence"]), ("failed", "proof"))
+
+    def test_skipped_needs_non_empty_evidence(self):
+        for evidence in (None, "", "   "):
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(TaskStoreError) as caught:
+                    self.store.set_step(self.task["id"], 1, "skipped", evidence)
+                self.assertIn("skipped with evidence", str(caught.exception))
+        self.assertEqual(self.store.get(self.task["id"])["steps"][0]["status"], "pending")
+        self.assertEqual(self.store.set_step(self.task["id"], 1, "skipped", "not needed")["steps"][0]["status"], "skipped")
 
     def test_set_plan_keeps_done_steps_by_text(self):
         self.store.set_step(self.task["id"], 1, "done", "proof")
@@ -342,34 +530,34 @@ class VerificationGapTests(TaskStoreTestCase):
         self.assertIsNone(self.store.verification_gap(self.task_id))
 
     def test_change_without_any_test_run_is_a_gap_with_exact_text(self):
-        self.record(edit("a.py"), edit("b.py"))
+        self.record(edit("proj/a.py"), edit("proj/b.py"))
         self.assertEqual(
             self.store.verification_gap(self.task_id),
             "Run the project's tests (run_project_tests) after the last change before finishing: "
             "2 file(s) changed since the last passing run.")
 
     def test_change_then_failing_test_is_a_gap(self):
-        self.record(edit("a.py"), project_tests(False))
+        self.record(edit("proj/a.py"), project_tests(False))
         self.assertIsNotNone(self.store.verification_gap(self.task_id))
 
     def test_change_then_passing_test_is_clear(self):
-        self.record(edit("a.py"), project_tests(False), project_tests(True))
+        self.record(edit("proj/a.py"), project_tests(False), project_tests(True))
         self.assertIsNone(self.store.verification_gap(self.task_id))
 
     def test_passing_test_then_another_change_is_a_gap(self):
-        self.record(edit("a.py"), project_tests(True), edit("b.py"))
-        self.assertIn("2 file(s) changed", self.store.verification_gap(self.task_id))
+        self.record(edit("proj/a.py"), project_tests(True), edit("proj/b.py"))
+        self.assertIn("1 file(s) changed", self.store.verification_gap(self.task_id))  # only b.py is untested
 
     def test_failed_edit_after_passing_test_does_not_reopen_the_gap(self):
-        self.record(edit("a.py"), project_tests(True), edit("b.py", "error"))
+        self.record(edit("proj/a.py"), project_tests(True), edit("proj/b.py", "error"))
         self.assertIsNone(self.store.verification_gap(self.task_id))
 
     def test_other_tools_with_passed_do_not_count_as_a_test_run(self):
-        self.record(edit("a.py"), {"tool": "something_else", "status": "success", "passed": True})
+        self.record(edit("proj/a.py"), {"tool": "something_else", "status": "success", "passed": True})
         self.assertIsNotNone(self.store.verification_gap(self.task_id))
 
     def test_finish_refused_on_a_gap_and_allowed_after_a_passing_run(self):
-        self.record(edit("a.py"), project_tests(False))
+        self.record(edit("proj/a.py"), project_tests(False))
         with self.assertRaises(TaskStoreError) as caught:
             self.store.finish(self.task_id, "done")
         self.assertEqual(str(caught.exception), self.store.verification_gap(self.task_id))
@@ -378,13 +566,59 @@ class VerificationGapTests(TaskStoreTestCase):
         self.assertEqual(self.store.finish(self.task_id, "done")["status"], "done")
 
     def test_gap_survives_the_action_cap(self):
-        self.record(edit("a.py"))
+        self.record(edit("proj/a.py"))
         for i in range(MAX_ACTIONS):  # pushes the edit out of the action window
             self.record({"tool": "read_workspace_file", "status": "success", "target": f"{i}"})
         self.assertIsNotNone(self.store.verification_gap(self.task_id))
         self.record(project_tests(True))
         self.assertIsNone(self.store.verification_gap(self.task_id))
 
+
+    def test_a_passing_lint_does_not_clear_the_gap(self):
+        self.record(edit("projA/a.py"), project_tests(True, "projA", check="lint"))
+        self.assertIsNotNone(self.store.verification_gap(self.task_id))
+        self.record(project_tests(True, "projA", check="tests"))
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+
+    def test_a_passing_run_on_another_project_does_not_clear_the_gap(self):
+        self.record(edit("projA/a.py"), project_tests(True, "projB"))
+        self.assertIsNotNone(self.store.verification_gap(self.task_id))
+        self.record(project_tests(True, "projAB"))  # a name that only starts the same is another folder
+        self.assertIsNotNone(self.store.verification_gap(self.task_id))
+        self.record(project_tests(True, "projA"))
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+
+    def test_paths_are_compared_in_one_spelling(self):
+        self.record(edit("./projA//src/a.py"), project_tests(True, "projA/"))
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+        self.record(edit("projA/b.py"), project_tests(True, "./projA/src"))
+        self.assertIsNotNone(self.store.verification_gap(self.task_id))  # b.py is outside projA/src
+
+    def test_the_workspace_root_contains_every_project(self):
+        self.record(edit("projA/a.py"), edit("projB/b.py"), project_tests(True, "."))
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+
+    def test_a_run_must_hold_every_file_changed_since_the_last_clearing_run(self):
+        self.record(edit("projA/a.py"), edit("projB/b.py"), project_tests(True, "projA"), project_tests(True, "projB"))
+        self.assertIn("2 file(s) changed", self.store.verification_gap(self.task_id))
+        self.record(project_tests(True, "."))
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+
+    def test_old_actions_without_check_or_project_count_as_test_runs_on_their_target(self):
+        self.record(edit("proj/a.py"), {"tool": "run_project_tests", "status": "success", "target": "proj",
+                                        "passed": True})
+        self.assertIsNone(self.store.verification_gap(self.task_id))
+
+    def test_a_passing_run_with_no_project_does_not_count(self):
+        self.record(edit("proj/a.py"), {"tool": "run_project_tests", "status": "success", "passed": True})
+        self.assertIsNotNone(self.store.verification_gap(self.task_id))
+
+    def test_record_action_keeps_the_check_and_project(self):
+        self.record(project_tests(True, "projA", check="lint"))
+        action = self.store.get(self.task_id)["actions"][-1]
+        self.assertEqual((action["check"], action["project"]), ("lint", "projA"))
+        self.assertIn("run_project_tests on projA: success (lint passed)",
+                      self.store.summary_for_prompt(self.task_id))
 
 class CapTests(TaskStoreTestCase):
     def test_max_tasks_drops_oldest_finished_and_keeps_unfinished(self):

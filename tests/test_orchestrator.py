@@ -409,8 +409,8 @@ class HelperTests(unittest.TestCase):
         stamp = "2 hours ago (2026-11-06T09:00:00+00:00)"
         prompt = build_system_prompt(config, last_seen=stamp)
         context = prompt.split("Context:\n", 1)[1]
-        self.assertIn(f"- Last conversation with the user: {stamp}", context)
-        self.assertNotIn("Last conversation with the user", build_system_prompt(config))
+        self.assertIn(f"- Previous conversation (before this session): {stamp}", context)
+        self.assertNotIn("Previous conversation", build_system_prompt(config))
 
     def test_conversation_restore_appends_complete_turns_and_respects_the_limits(self):
         conversation = jarvis.Conversation(max_turns=3)
@@ -444,10 +444,10 @@ class LastSeenAgentTests(AgentTestCase):
 
     def test_run_agent_passes_last_seen_into_the_system_message(self):
         stamp = "yesterday (2026-11-05T21:30:00+00:00)"
-        self.assertIn(f"- Last conversation with the user: {stamp}", self.system_prompt(last_seen=stamp))
+        self.assertIn(f"- Previous conversation (before this session): {stamp}", self.system_prompt(last_seen=stamp))
 
     def test_run_agent_without_last_seen_has_no_such_line(self):
-        self.assertNotIn("Last conversation with the user", self.system_prompt())
+        self.assertNotIn("Previous conversation", self.system_prompt())
 
 
 class DeveloperModeAgentTests(AgentTestCase):
@@ -582,7 +582,8 @@ class DeveloperModeAgentTests(AgentTestCase):
                          {"tool": "edit_workspace_file", "status": "success", "target": "a/b.py"})
         self.assertEqual(event("run_project_tests", {"project": "shop"},
                                {"status": "success", "result": {"passed": False, "exit_code": 1}}),
-                         {"tool": "run_project_tests", "status": "success", "target": "shop", "passed": False})
+                         {"tool": "run_project_tests", "status": "success", "target": "shop", "passed": False,
+                          "check": "tests", "project": "shop"})
         self.assertEqual(event("open_url", {"url": "https://x.example/" + "p" * 300}, {"status": "denied"})["target"],
                          ("https://x.example/" + "p" * 300)[:120])
         self.assertEqual(event("remember", {"name": "Ann"}, {"status": "success", "result": "ok"})["target"], "Ann")

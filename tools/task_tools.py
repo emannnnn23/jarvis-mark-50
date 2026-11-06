@@ -71,7 +71,8 @@ class TaskTools:
             task = store.set_step(task_id, step, status, evidence)
             return {"message": f"Step {step} marked {status}.", "task_id": task_id, "plan": format_plan(task)}
         if action == "finish":
-            task = store.finish(task_id, summary or "")  # refused while changed files lack a passing test run
+            # Refused without a summary, while a step is still open, or while changed files lack a passing test run.
+            task = store.finish(task_id, summary or "")
             return {"message": "Task finished.", "task_id": task_id, "plan": format_plan(task)}
         if action == "abandon":
             task = store.abandon(task_id)

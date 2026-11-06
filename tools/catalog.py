@@ -93,15 +93,16 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
         Tool("update_task", "Keep the plan for a multi-step job so it survives interruptions and restarts. Call it "
              "in the same response as your other tool calls, never as a response of its own. action start: begin a "
              "task with a goal and a short plan (steps, one per line). plan: replace the plan. step: record a "
-             "step's status; done needs evidence of what was done. finish: close the task, only with evidence "
-             "that the goal is met. abandon: give the task up. It acts on the active task.",
+             "step's status; done needs evidence of what was done, skipped the reason. finish: close the task once "
+             "every step is done or skipped, with a summary, only with evidence that the goal is met. abandon: give "
+             "the task up. It acts on the active task.",
              _object({"action": {"type": "string", "enum": list(UPDATE_TASK_ACTIONS)},
                       "goal": _string("What the task is for, in one line (start)", 1000),
                       "steps": _string("The plan, one step per line (start, plan)", 3000),
                       "step": {"type": "integer", "minimum": 1, "description": "Step number from 1 (step)"},
                       "status": {"type": "string", "enum": list(STEP_STATUSES), "description": "New step status (step)"},
                       "evidence": _string("What was done, e.g. the file changed or the test result (step; required "
-                                          "for done)", 1000),
+                                          "for done and skipped)", 1000),
                       "summary": _string("What was achieved (finish)", 1000)},
                      ["action"]),
              tools.update_task, R, timeout=10),

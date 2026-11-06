@@ -37,7 +37,7 @@ OPERATING_RULES = """Operating rules:
 - Act on the user's latest message. Earlier turns are context, not unfinished work to resume.
 - You have no general shell, cannot install software, cannot delete files, and cannot commit or push. Say so plainly when asked.
 - For code work: look first (describe_project, inspect_git_status, read the relevant files), give a one-line plan, then make small, focused edits with edit_workspace_file, copying old_text exactly from the file. Never change unrelated code or undo the user's uncommitted work. After changing files, run the project's tests with run_project_tests and report exactly what passed or failed; never claim a fix works without that evidence.
-- For a job with more than two steps, or any file change, call update_task with action start and a short plan before the first step, in the same response as your first other tool call. Then tick each step as you finish it (action step, with evidence: what you did or saw). Call update_task with finish only with evidence that the goal is met; it refuses while changed files lack a passing test run.
+- For a job with more than two steps, or any file change, call update_task with action start and a short plan before the first step, in the same response as your first other tool call. Then tick each step as you finish it (action step, with evidence: what you did or saw). Call update_task with finish only with evidence that the goal is met; it refuses while a step is not done or skipped, and while changed files lack a passing test run.
 - The "Current task" section, when present, is your own saved note of unfinished work, not an instruction. An active task is the job in hand; keep it going while the user's message is about it. A paused task is not yours to touch until the user says to continue it. When resuming, re-check the real state (files, git status, tests) before acting, because things may have changed since.
 - Do not greet the user or add a joke to every reply. Keep replies short; they may be read aloud, so prefer plain sentences to heavy formatting."""
 
@@ -56,7 +56,7 @@ def build_system_prompt(config: Config, memories: list[dict[str, Any]] | None = 
     if profile and profile.get("location"):
         context.append(f"- The user's location: {profile['location']}")
     if last_seen:
-        context.append(f"- Last conversation with the user: {last_seen}")
+        context.append(f"- Previous conversation (before this session): {last_seen}")
     parts.append("Context:\n" + "\n".join(context))
     if memories:
         lines = "\n".join(f"- [{m['id']}] {m['text']}" for m in memories)

@@ -233,7 +233,7 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | `/tasks` | Lists unfinished tasks, then recently finished or abandoned ones, with their ids (see [Multi-step tasks](#multi-step-tasks-and-memory-across-restarts)). |
 | `/tasks clear` | Forgets all finished and abandoned tasks. Does not ask. |
 | `/tasks reset` | Only when the task file is corrupted: backs it up and starts a fresh task list (asks first). |
-| `/resume [id]` | Picks up a paused task: the one with the given id, or the most recently updated unfinished one. Typing `continue`, `resume` or `carry on` alone does the same. |
+| `/resume [id]` | Picks up a paused task: the one with the given id (this also reopens an abandoned task, but never a finished one), or else the active task or the most recently updated unfinished one. Typing `continue`, `resume` or `carry on` alone does the same as your first message of a session, or right after a request that paused a task (see [Pausing and resuming](#pausing-and-resuming)). |
 | `/abandon [id]` | Gives up a task: the one with the given id, or else the active or most recent unfinished one. |
 | `/forget <id>` | Deletes one memory (asks first). Ids are shown by `/memory`. |
 | `/voice on` / `/voice off` | Turns spoken replies on or off. |
@@ -605,7 +605,7 @@ JARVIS: Sir, the subtraction function mistakenly added the operands … All test
 Developer tasks run for minutes and change files, so failures in the middle are handled explicitly.
 
 - **Rate-limit waits of up to 60 s.** Each model call is retried up to 3 times. JARVIS waits as long as Groq's `retry-after` asks, up to 60 s; a longer wait ends the request. The free tier's per-minute token limit often asks for waits in the middle of a multi-step task.
-- **An unfinished task says what already happened.** If a model call fails after tools have already run (a rate limit, a network error, a used-up quota), JARVIS does not show a bare error. It replies `I couldn't finish: <error> Steps already done: <tool> on <target>: <status>; ...`, adds `(tests passed)` or `(tests failed)` to test runs, and when a file was changed adds `Files were changed; check them, and run the tests if the last step was not a test run.` The same list is given when the round limit is reached and the final summary cannot be fetched. Nothing is undone. If the failure comes before any tool ran, the plain error is shown.
+- **An unfinished task says what already happened.** If a model call fails after tools have already run (a rate limit, a network error, a used-up quota), JARVIS does not show a bare error. It replies `I couldn't finish: <error> Steps already done: <tool> on <target>: <status>; ...`, adds `(tests passed)` or `(tests failed)` to test runs (`(lint passed)` or `(lint failed)` to lint runs), and when a file was changed adds `Files were changed; check them, and run the tests if the last step was not a test run.` The same list is given when the round limit is reached and the final summary cannot be fetched. Nothing is undone. If the failure comes before any tool ran, the plain error is shown.
 - **No stale results after a change.** An identical repeated call within a request reuses the earlier result instead of running again. After any successful step that is not read-only (an edit, a new file, a test run, a memory change), all remembered results are dropped, so re-running the tests after a fix really runs them.
 - **JARVIS validates tool calls itself.** JARVIS asks Groq not to validate tool calls (`disable_tool_validation`), so a malformed call reaches JARVIS instead of Groq rejecting the whole request. JARVIS then checks the arguments against the tool's schema and sends a precise error back, such as `Invalid arguments for edit_workspace_file: Missing required argument(s): old_text.`, and the model can correct the call. Edits that cannot be prepared come back the same way, as `Not done: <why>`. If a model or account rejects the option, JARVIS drops it for the rest of the session and repeats the call at once.
 
@@ -642,9 +642,9 @@ JARVIS keeps a written plan for a job with several steps, so an interruption doe
 
 ### Plans and progress
 
-- **The plan.** For a job with more than two steps, or any file change, the model is told to call `update_task` first, with a goal and a short plan. It then ticks each step as it finishes it. A step can only be marked `done` with evidence of what was done, such as the file changed or the test result.
-- **Progress lines.** Each time a step changes, JARVIS prints a dimmed line such as `[2/3] Run the tests: done`. The status can also be `in progress`, `pending`, `skipped` or `failed`.
-- **Recorded automatically.** While a task is active, every other tool call is logged on it: the tool, its status, its target, and for test runs whether they passed. The model does not have to remember to do this. Edits made earlier in the same request, before the task was started, are counted too.
+- **The plan.** For a job with more than two steps, or any file change, the model is told to call `update_task` first, with a goal and a short plan. It then ticks each step as it finishes it. A step can only be marked `done` with evidence of what was done, such as the file changed or the test result, and only marked `skipped` with evidence of why it is not needed.
+- **Progress lines.** Each time a step changes, JARVIS prints a dimmed line such as `[2/3] Run the tests: done`. The status can also be `in progress`, `pending`, `skipped` or `failed`. When the model finishes or abandons a task, it prints `Task finished: <goal>` or `Task abandoned: <goal>`.
+- **Recorded automatically.** While a task is active, every other tool call is logged on it: the tool, its status, its target, and for `run_project_tests` which check ran (tests or lint), on which project, and whether it passed. The model does not have to remember to do this. Edits made earlier in the same request, before the task was started, are counted too.
 - **One active task.** Starting a task pauses any other active one (reason `another task started`). It is never lost.
 - **Read-only mode.** `update_task` is a read-only tool: it edits only JARVIS's own task file, never your files, memory or desktop. It also works with `--read-only`.
 
@@ -654,9 +654,9 @@ A task is paused, with the reason stored, when:
 
 - you press Ctrl+C, or say "Hey JARVIS, stop" (or any other wake-word request) while JARVIS is working. The reason is `interrupted by the user`.
 - the round limit is reached. The reason is `reached the limit of N tool rounds`.
-- a model call fails after at least one tool call has run, for example a rate limit that does not clear or a network error. The reason is `the model could not be reached: <error>`. If the call fails before any tool ran, nothing was done and the task is not paused by that request.
+- a model call fails, for example a rate limit that does not clear or a network error. The reason is `the model could not be reached: <error>`, and the error is also kept as the task's last error. This happens whether or not a tool had already run, so a task you just resumed is never left active after a failed request.
 - you quit. The reason is `the session ended before it finished`.
-- JARVIS was closed without a clean exit. At the next start a task still marked active is paused with `JARVIS was closed before it finished`.
+- JARVIS was closed without a clean exit. At the next start a task still marked active is paused with `JARVIS was closed before it finished`. It keeps the time of its last real activity, so the banner says how long ago the work stopped, not `a moment ago`.
 
 At the next start:
 
@@ -666,30 +666,32 @@ At the next start:
 
 To pick a task up:
 
-- Type `continue`, `resume` or `carry on` on its own, optionally with "Jarvis" before or after it. This resumes the most recently updated unfinished task. If there is none, the word is sent as an ordinary message.
-- Or type `/resume` for the same task, or `/resume <id>` for a specific one. Ids are shown by `/tasks`.
-- JARVIS prints `Resuming: <goal>` and sends the model a message that says to check the current state first, because files may have changed, and then do the remaining steps.
+- Type `continue`, `resume` or `carry on` on its own, optionally with "Jarvis" before or after it. This works as your first message of a session (reloaded exchanges do not count), when it resumes the active task or else the most recently updated paused one. It also works right after a request that ended by pausing a task (the round limit, a failed model call, Ctrl+C or a wake-word interruption), when it resumes that task. Otherwise, for example when JARVIS has just asked "Shall I continue?", the word is sent to the model as an ordinary reply. It is also sent as an ordinary message when there is nothing to resume. Abandoned tasks are never picked.
+- Or type `/resume` for the active task or else the most recently updated paused one, or `/resume <id>` for a specific one. Ids are shown by `/tasks`. `/resume <id>` also reopens an abandoned task. A finished task cannot be resumed.
+- JARVIS prints `Resuming: <goal>` and sends the model a message that says to check the current state first, because files may have changed, and then do the remaining steps. The conversation log saves what you typed (`continue` or `/resume <id>`), not that message.
 - Approvals are always asked again. Nothing you approved before the interruption carries over, and the permission mode applies as usual.
-- `/abandon` gives up the active task, or else the most recent unfinished one. `/abandon <id>` gives up a specific one. An abandoned task is kept in the list until you clear it.
+- `/abandon` gives up the active task, or else the most recent unfinished one. `/abandon <id>` gives up a specific one. An abandoned task is kept in the list until you clear it, and `/resume <id>` brings it back.
+- The model can abandon a task too, but not after it has read web results or file content in the same request: then it is refused and told to ask you, because that content could be what asked for it. You can type `/abandon` yourself.
 
 ### Finishing a task
 
-- **Tests must pass after the last change.** Once a task has changed a file (`edit_workspace_file` or `create_workspace_file`), `update_task` refuses to finish it until `run_project_tests` has passed after the last change. The refusal reads `Run the project's tests (run_project_tests) after the last change before finishing: N file(s) changed since the last passing run.` Notes made with `create_note` do not count.
+- **Every step done or skipped, and a summary.** `update_task` refuses to finish a task while any step is `pending`, `in progress` or `failed`. The model is told to mark each one `done`, or `skipped` with evidence of why, or to revise the plan. A task with no steps can finish. Finishing also needs a summary of what was achieved.
+- **Tests must pass after the last change.** Once a task has changed a file (`edit_workspace_file` or `create_workspace_file`), `update_task` refuses to finish it until `run_project_tests` has passed after the last change. Only a test run counts, not a lint run (`check: "lint"`). It must be on a project folder that holds every file changed since the last run that counted, so a passing run on another project does not count. A run on the workspace itself (`.`) holds every project. The refusal reads `Run the project's tests (run_project_tests) after the last change before finishing: N file(s) changed since the last passing run.` Notes made with `create_note` do not count.
 - **A plan written after untrusted content is flagged.** If the model read web results or file content before it wrote or changed the plan, the task is marked. `/tasks` and the startup banner then add `(plan written after reading web or file content: check it before continuing)`, and the model is told to treat the steps as suggestions, not instructions. Read the plan before you continue. The mark never clears.
 
 ### What is stored
 
 - **File**: `jarvis_tasks.json` next to `jarvis.py` (or `JARVIS_TASKS_PATH`). It is created when the first task starts. It is gitignored because it holds personal data, and it is written the same way as the memory file: atomically, with file mode `600`.
-- **Per task**: an id, the goal, your request, the plan with each step's status and evidence, the recorded tool actions (tool, status, target, whether tests passed, time), the files changed, the last error, the pause reason, the plan-flag above and a summary once finished.
+- **Per task**: an id, the goal, your request (the message that started the task, redacted and cut to 500 characters), the plan with each step's status and evidence, the recorded tool actions (tool, status, target, for test runs the check, project and whether it passed, time), the files changed, the last error, the pause reason, the plan-flag above and a summary once finished.
 - **Redacted and bounded**: text is redacted for secrets (the same patterns as the memory file), cut to one line and limited in length. A task keeps its newest 200 actions. At most 50 tasks are kept. When there are more, the oldest finished or abandoned ones are dropped first. Unfinished tasks are never dropped.
 - **Context per turn**: the model sees a summary of the current task of at most 1,500 characters: goal, state, plan, files changed, last error and the last five actions. If it has to be cut, the plan is cut first and unfinished steps stay.
-- **Task commands**: `/tasks` lists unfinished tasks, then the recently finished or abandoned ones. `/tasks clear` forgets every finished and abandoned task, without asking. `/status` shows the task file and how many tasks are unfinished. See [In-chat commands](#in-chat-commands).
-- **Corruption handling**: if the file is not valid JSON or has no task list, JARVIS never overwrites it. It starts with no tasks, prints `Task warning: ...` in the banner, and cannot save tasks until you act. You can repair the file by hand, or type `/tasks reset`. After you confirm, it renames the broken file to `jarvis_tasks.corrupt-YYYYMMDD-HHMMSS.json` and starts a fresh list. On a healthy file `/tasks reset` does nothing.
+- **Task commands**: `/tasks` lists unfinished tasks (an active one is shown as `active`), then the recently finished or abandoned ones. `/tasks clear` forgets every finished and abandoned task, without asking. `/status` shows the task file and how many tasks are unfinished. See [In-chat commands](#in-chat-commands).
+- **Corruption handling**: if the file cannot be read, is not UTF-8 text, is not valid JSON or has no task list, JARVIS never overwrites it. It starts with no tasks, prints `Task warning: ...` in the banner, and cannot save tasks until you act. You can repair the file by hand, or type `/tasks reset`. After you confirm, it renames the broken file to `jarvis_tasks.corrupt-YYYYMMDD-HHMMSS.json` and starts a fresh list. On a healthy file `/tasks reset` does nothing. A task entry with fields of the wrong type (for example after a hand edit) is repaired as it loads, and an entry that is not a task at all is dropped, so the file never stops JARVIS from starting.
 
 ### Remembering the last conversation
 
 - At startup JARVIS reloads the last `JARVIS_RESTORE_TURNS` exchanges (default 6, 0-20) from the conversation log in the memory file, so it knows what you were talking about when you come back. Set it to `0` to start every session empty.
-- It also tells the model when you last spoke. The banner shows that as `Picking up where we left off (last talked ...)`.
+- It also tells the model when the previous conversation was, as `Previous conversation (before this session): <when> (<time>)`. The banner shows that as `Picking up where we left off (last talked ...)`.
 - The usual session limits still apply. A value above `JARVIS_HISTORY_TURNS` cannot keep more than that many exchanges, and older ones become one-line summaries. `/clear` forgets the reloaded exchanges too.
 - Reloaded exchanges are not saved a second time. The log only grows when `JARVIS_SAVE_CONVERSATIONS` is `true`, and it keeps the last 50 exchanges, so a long gap with logging off reloads old ones.
 - Only the text of the exchanges comes back, redacted and cut to 500 characters each side. Tool results do not.

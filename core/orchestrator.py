@@ -68,6 +68,7 @@ class AgentResult:
     status: str  # "complete" or "incomplete"
     tool_events: list[dict[str, Any]]
     rounds: int
+    paused_task: str | None = None  # the id of the task this request paused because it ended unfinished
 
 
 def _canonical_call(name: str, raw_arguments: Any) -> str:
@@ -76,6 +77,8 @@ def _canonical_call(name: str, raw_arguments: Any) -> str:
     except ToolValidationError:
         return name + str(raw_arguments)
 
+
+RUN_PROJECT_TESTS = "run_project_tests"
 
 # Tools whose success changes files on disk.
 CHANGING_TOOLS = frozenset({"edit_workspace_file", "create_workspace_file", "create_note"})
@@ -104,6 +107,12 @@ def _event(name: str, raw_arguments: Any, result: dict[str, Any]) -> dict[str, A
     data = result.get("result") if isinstance(result.get("result"), dict) else result
     if "passed" in data:
         event["passed"] = data["passed"]
+    if name == RUN_PROJECT_TESTS:
+        # Only a test run (not a lint) on a folder holding the changed files lets a task finish.
+        check = data.get("check") or args.get("check") or "tests"
+        event["check"] = str(check)[:60]
+        if isinstance(args.get("project"), str):
+            event["project"] = args["project"][:120]
     return event
 
 
@@ -114,8 +123,8 @@ def progress_report(events: list[dict[str, Any]]) -> str:
     steps = []
     for e in events:
         step = e["tool"] + (f" on {e['target']}" if e.get("target") else "") + f": {e['status']}"
-        if "passed" in e:
-            step += " (tests passed)" if e["passed"] else " (tests failed)"
+        if "passed" in e:  # a lint run must never read as a test run
+            step += f" ({e.get('check', 'tests')} {'passed' if e['passed'] else 'failed'})"
         steps.append(step)
     changed = [e for e in events if e["tool"] in CHANGING_TOOLS and e["status"] == "success"]
     note = (" Files were changed; check them, and run the tests if the last step was not a test run."
@@ -147,15 +156,31 @@ def task_prompt_summary(tasks: TaskStore | None) -> str:
     return summary if task["status"] == "active" else f"{summary}\n{PAUSED_TASK_NOTE}"
 
 
+TAINTED_ABANDON_ERROR = ("update_task abandon is not allowed after web or file content was read in this "
+                         "request. Ask the user whether to give the task up; they can type /abandon.")
+
+
+def _update_action(raw_arguments: Any) -> Any:
+    try:
+        return parse_arguments(raw_arguments).get("action")
+    except ToolValidationError:
+        return None
+
+
 def _step_progress(ctx: AgentContext, raw_arguments: Any, result: dict[str, Any]) -> str | None:
-    """"[2/3] <step text>: done" after update_task changed a step, else None."""
+    """"[2/3] <step text>: done" after update_task changed a step, "Task finished: <goal>" or "Task
+    abandoned: <goal>" when it closed the task, else None. Closing a task is always shown to the user."""
     if ctx.tasks is None or result["status"] != STATUS_SUCCESS:
         return None
     try:
         args = parse_arguments(raw_arguments)
         data = result.get("result") if isinstance(result.get("result"), dict) else {}
         task = ctx.tasks.get(data.get("task_id", ""))
-        if args.get("action") != "step" or task is None:
+        if task is None:
+            return None
+        if args.get("action") in ("finish", "abandon"):
+            return f"Task {'finished' if args['action'] == 'finish' else 'abandoned'}: {task['goal']}"
+        if args.get("action") != "step":
             return None
         number = int(args["step"])
         text = task["steps"][number - 1]["text"]
@@ -177,11 +202,12 @@ def _record_action(ctx: AgentContext, event: dict[str, Any]) -> None:
 
 
 def _after_update_task(ctx: AgentContext, raw_arguments: Any, result: dict[str, Any], earlier: list[dict[str, Any]],
-                       tainted: bool) -> None:
+                       tainted: bool, user_input: str = "") -> None:
     """Bookkeeping once update_task start or plan has run.
 
     A plan written after untrusted content was read is marked as such. A new task also takes over what
-    this request already did, so the finish check holds whatever order the model used."""
+    this request already did, so the finish check holds whatever order the model used, and keeps the
+    user's message that asked for it."""
     if ctx.tasks is None or result["status"] != STATUS_SUCCESS:
         return
     try:
@@ -193,23 +219,27 @@ def _after_update_task(ctx: AgentContext, raw_arguments: Any, result: dict[str, 
         if tainted:
             ctx.tasks.mark_untrusted(task_id)
         if action == "start":
+            ctx.tasks.set_request(task_id, user_input)
             for event in earlier:
                 ctx.tasks.record_action(task_id, event)
     except (ToolValidationError, TaskStoreError) as exc:
         log.warning("Could not update the task after update_task: %s", exc)
 
 
-def _pause_task(ctx: AgentContext, reason: str) -> None:
-    """The request ended unfinished: say why on the active task and pause it, so it can be resumed."""
+def _pause_task(ctx: AgentContext, reason: str) -> str | None:
+    """The request ended unfinished: say why on the active task and pause it, so it can be resumed.
+    Returns the id of the task it paused, if any."""
     if ctx.tasks is None:
-        return
+        return None
     try:
         task = ctx.tasks.active()
         if task is not None:
             ctx.tasks.record_error(task["id"], reason)
             ctx.tasks.pause(task["id"], reason)
+            return task["id"]
     except TaskStoreError as exc:
         log.warning("Could not pause the task: %s", exc)
+    return None
 
 
 def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] | None = None,
@@ -221,7 +251,7 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
 
     `tool_groups` limits which tools the model is shown (and may call); None means all of them.
     With `ctx.tasks`, every tool call is logged on the active task, an unfinished request pauses it, and
-    `on_progress` hears about each step update_task changes.
+    `on_progress` hears about each step update_task changes and about a task finished or abandoned.
     Raises JarvisAPIError if the model cannot be reached; KeyboardInterrupt cancels.
     """
     memories, profile, warning = [], None, None
@@ -250,9 +280,9 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
             if not events:
                 raise
             # Steps already ran: say exactly which, rather than a bare error that hides them.
-            _pause_task(ctx, f"the model could not be reached: {exc}")
+            paused = _pause_task(ctx, f"the model could not be reached: {exc}")
             return AgentResult(f"I couldn't finish: {exc} {progress_report(events)}", "incomplete", events,
-                               round_number - 1)  # rounds actually completed
+                               round_number - 1, paused)  # rounds actually completed
         message = response.choices[0].message
         if not message.tool_calls:
             return AgentResult(format_final_response(message.content), "complete", events, round_number)
@@ -265,6 +295,9 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
             if key in previous_results:
                 # Identical repeat within one request: never re-run an action; reuse the result.
                 result = {**previous_results[key], "note": "Identical call already made in this request; not repeated."}
+            elif name == UPDATE_TASK and tainted and _update_action(call.function.arguments) == "abandon":
+                # Text from the web or a file may be what asks for this; giving a task up is the user's call.
+                result = {"status": STATUS_ERROR, "error": TAINTED_ABANDON_ERROR}
             elif name not in offered and ctx.registry.get(name) is not None:
                 # A real tool that was not offered this turn (e.g. developer mode is off): never run it.
                 result = {"status": STATUS_ERROR, "error": f"{name} is not available right now. Developer tools "
@@ -286,7 +319,7 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
             event = _event(name, call.function.arguments, result)
             events.append(event)
             if executed and name == UPDATE_TASK:
-                _after_update_task(ctx, call.function.arguments, result, ran, tainted)
+                _after_update_task(ctx, call.function.arguments, result, ran, tainted, user_input)
                 progress = _step_progress(ctx, call.function.arguments, result) if on_progress else None
                 if progress:
                     on_progress(progress)
@@ -306,5 +339,5 @@ def run_agent(ctx: AgentContext, user_input: str, history: list[dict[str, Any]] 
         text = format_final_response(response.choices[0].message.content)
     except JarvisAPIError:
         text = f"I reached my limit of {max_rounds} tool rounds before finishing. {progress_report(events)}"
-    _pause_task(ctx, f"reached the limit of {max_rounds} tool rounds")
-    return AgentResult(text, "incomplete", events, max_rounds)
+    paused = _pause_task(ctx, f"reached the limit of {max_rounds} tool rounds")
+    return AgentResult(text, "incomplete", events, max_rounds, paused)
