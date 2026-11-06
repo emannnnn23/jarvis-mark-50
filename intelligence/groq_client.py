@@ -140,7 +140,8 @@ def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[d
             return client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
             error = classify_api_error(exc, model)
-            if error.kind == "bad_request" and "disable_tool_validation" in str(error) \
+            # Look in the full error, not the shortened user-facing message, for the option's name.
+            if error.kind == "bad_request" and "disable_tool_validation" in f"{exc} {error}" \
                     and kwargs.pop("disable_tool_validation", None):
                 _flag_unsupported()  # this model or account does not take the option: carry on without it
                 continue

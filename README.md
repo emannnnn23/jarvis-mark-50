@@ -23,7 +23,8 @@ JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python
 | Hands-free: CPU | Inference costs about 3 ms per 80 ms frame, or about 4% of one CPU core, for as long as hands-free mode is on. |
 | Hands-free: end to end | Verified on 2026-10-17 with the real model and real Groq Whisper, on generated audio. (1) "Hey Jarvis, what is the weather like in Manila today?" from idle: one detection, transcript "what is the weather like in Manila today?". (2) "Hey Jarvis, stop" mixed over JARVIS's own voice while it was speaking: one detection, transcript "stop.", handled as a stop phrase. (3) JARVIS's voice alone: 0 detections. (4) Ordinary chatter without the wake word: 0 detections. |
 | Hands-free: microphone | Real microphone, local only (nothing was transcribed): 6.1 s processed, maximum wake score 0.047 in a quiet room, no false triggers. The estimated room noise RMS was 0.0045, giving a speech threshold of 0.013. The push-to-talk recorder could open the microphone at the same time (PipeWire allows several capture clients). |
-| Hands-free: real spoken "Hey JARVIS" | **Not tested yet.** Nobody has yet said "Hey JARVIS" into the microphone, so wake-up, interruption and end-of-request detection with a real voice are unverified. |
+| Hands-free: real spoken "Hey JARVIS" | **Failed on 2026-10-23, cause found.** A real "Hey Jarvis" got no response. A 150 s local measurement showed the voice clipping (RMS 0.97-1.0) and a best wake score of 0.45 against the 0.6 needed. The cause was the microphone's hardware gain, not the model (see [No response to "Hey JARVIS"](#case-no-response-to-hey-jarvis-2026-10-23)). A wake-up with a real voice after lowering the gain is not recorded here yet, so interruption and end-of-request detection with a real voice are still unverified. |
+| Hands-free: `--wake-test` | `python jarvis.py --wake-test` listens locally for 20 s, shows the live level and wake score, and says what to change (see [Testing the microphone](#testing-the-microphone-and-wake-word---wake-test)). Covered by the automated tests with a fake detector and microphone. |
 | Project tests: results | Verified on 2026-10-21 with real runs on temporary demo projects. A passing pytest project gave `passed=true`. A failing one gave `passed=false` and exit code 1, and the output named the failing test. |
 | Project tests: environment | Verified on 2026-10-21: `GROQ_API_KEY` was absent in the child process. |
 | Project tests: time limit | Verified on 2026-10-21: a hanging test that had started a child `sleep` was stopped at a 5 s limit, and the child `sleep` was gone too. |
@@ -34,6 +35,7 @@ JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python
 | Developer tools: live end to end | Verified on 2026-10-21/22 with `openai/gpt-oss-120b` and the request "The tests in the calc project are failing. Find the bug, fix it, and prove it's fixed." The model looked at the project, ran the tests (failed), read the code, and proposed the exact diff (`a + b` to `a - b`), which was applied after approval. Its first edit attempt was wrong and was corrected after JARVIS's own validation feedback. It re-ran the tests (2 passed) and reported "Sir, the subtraction function mistakenly added the operands … All tests now pass: 2 passed". It took 10 rounds and about 3.5 minutes, mostly waiting on the free-tier limit of 8,000 tokens per minute. |
 | Developer tools: problems found and fixed | Found during those runs and fixed (see [Reliability](#reliability)): (1) a rate-limit wait over 30 s aborted the task without saying a file had already been changed; waits of up to 60 s are now allowed, and an API failure after steps ran reports exactly which steps ran. (2) The identical-call cache served a stale test result after an edit; it now resets after any step that changes something. (3) Groq rejected a malformed tool call outright; Groq's own tool-call validation is now turned off, and JARVIS's validation sends correctable errors back to the model. |
 | Developer tools: your real projects | **Not tested.** All the runs above used the temporary demo repository. |
+| Developer tools: security fixes (after 2026-10-22) | Three ways a hostile repository could make the read-only git tools run a program were confirmed exploitable before the fix: a repository's `gpg.program` (run when signatures are shown), transports such as partial-clone lazy fetches and `core.sshCommand`/`uploadpack`, and a filter driver whose name contains a space. Each needs a hostile `.git/config`, which comes with a repository unpacked from a tarball or zip or opened from a shared folder; `git clone` does not copy `.git/config`. The git hardening was changed to close all three (see [Filesystem boundaries](#filesystem-boundaries)). The same batch hardened `describe_project`, `inspect_git_diff`, the review of changes, approvals, new files and backups (see [Changing code](#changing-code)). |
 
 ## Features
 
@@ -79,19 +81,20 @@ Built-in app names for `open_application`: `vscode` (`code`, falls back to `codi
 
 ### How a request is handled
 
-- The model may call tools for up to `JARVIS_MAX_TOOL_ROUNDS` rounds (default 8), or `JARVIS_MAX_DEV_TOOL_ROUNDS` (default 14) while [developer mode](#developer-mode) is on. If it runs out of rounds, it is asked to say the task is incomplete and to summarise only what the tool results confirm.
+- The model may call tools for up to `JARVIS_MAX_TOOL_ROUNDS` rounds (default 8), or `JARVIS_MAX_DEV_TOOL_ROUNDS` (default 14) while [developer mode](#developer-mode) is on. If it runs out of rounds, it is asked to say the task is incomplete and to summarise only what the tool results confirm. An unfinished reply ends with `(The task is incomplete.)`.
+- Each request tells the model its current voice state: whether replies are spoken or text only, and whether hands-free, push-to-talk or neither is on, with how to turn voice on. An operating rule tells it to answer questions about waking or listening from that, and never to claim it is always listening.
 - The model is shown only the tools for the current mode. A call to a tool it was not offered does not run.
 - If the model repeats an identical tool call within one request, the call does not run again. The earlier result is reused, so an action never runs twice by accident. After any successful step that is not read-only, such as an edit or a test run, the earlier results are forgotten, so a check made after a change really runs again (see [Reliability](#reliability)).
-- JARVIS checks every tool call's arguments itself and sends precise errors back, so the model can correct a malformed call.
+- JARVIS checks every tool call's arguments itself and sends precise errors back, so the model can correct a malformed call. Arguments nested absurdly deep, or with numbers too large to parse, get the validation error `Arguments were not valid JSON (too deeply nested or too large).` instead of crashing the turn.
 - Every tool result carries a status (`success`, `error`, `denied`, `partial` or `unverified`). The system prompt tells the model to report that status accurately.
 - Web results and file contents are marked as untrusted data, and the model is told not to follow instructions found inside them.
 - A tool result longer than 10,000 characters is cut short before it is sent to the model.
 
 ### Developer tools
 
-- Offered only in developer mode, which switches on by itself when a message is about code. `/dev on|off` controls it. Details: [Developer mode](#developer-mode).
+- Offered only in developer mode, which switches on by itself when a message is about code. `/dev on|off|auto` controls it. Details: [Developer mode](#developer-mode).
 - Inspect: git status, diff and history, a project overview, plain-text code search, reading files. Details: [Inspecting code](#inspecting-code).
-- Change: one exact replacement per edit, or a new file, each shown as a diff that you approve by typing `yes`. Every edit keeps a backup. Details: [Changing code](#changing-code).
+- Change: one exact replacement per edit, or a new file, each shown in full as a diff that you approve by typing `yes`. A change too large to show in full (over 400 diff lines, or a line over 1,000 characters) is refused. Every edit keeps a backup. Details: [Changing code](#changing-code).
 - Verify: the model is told to re-run the project's tests after a change and report the result, never claiming a fix works without it.
 
 ### Voice input (push-to-talk)
@@ -103,10 +106,11 @@ Built-in app names for `open_application`: `vscode` (`code`, falls back to `codi
 
 ### Hands-free mode
 
-- Off by default. Turn it on with `--wake`, `/wake on` or `JARVIS_WAKE_ENABLED=true`. It needs the optional wake-word engine (`requirements-wake.txt`) and `arecord`.
-- Say "Hey JARVIS", then your request. The wake word is detected locally with [openWakeWord](https://github.com/dscripka/openWakeWord). Only the request that follows is sent to Groq for transcription.
+- Off by default. Turn it on with `--wake`, `/wake on` or `JARVIS_WAKE_ENABLED=true`. It needs the optional wake-word engine (`requirements-wake.txt`) and `arecord`. Started without `--wake` (and without `--listen`), the microphone is off, and the banner says so: `Microphone off. To talk: /wake on (say "Hey JARVIS") or /listen on (push-to-talk).`
+- Say "Hey JARVIS", then your request. The wake word is detected locally with [openWakeWord](https://github.com/dscripka/openWakeWord). Only the request that follows is sent to Groq for transcription. Typing "hey Jarvis" is an ordinary text message, not the wake word; a spoken request shows as `You (voice): ...`.
 - Saying "Hey JARVIS" while JARVIS is speaking stops the speech. While it is working, it cancels the request like Ctrl+C. "Hey JARVIS, stop" only stops.
 - Typing keeps working at the same time.
+- `python jarvis.py --wake-test` checks the microphone and the wake word locally, without an API key, and says what to change.
 - Details, privacy and tuning: [Hands-free mode](#hands-free-mode-wake-word).
 
 ## Quick start
@@ -139,6 +143,7 @@ nano .env                       # set GROQ_API_KEY=gsk_...
 # pip warns that tflite-runtime is not installed; that is expected and harmless.
 .venv/bin/pip install --no-deps openwakeword==0.6.0
 .venv/bin/pip install -r requirements-wake.txt
+.venv/bin/python jarvis.py --wake-test     # 20 s local microphone and wake-word check
 .venv/bin/python jarvis.py --wake
 ```
 
@@ -154,6 +159,7 @@ nano .env                       # set GROQ_API_KEY=gsk_...
 | `--listen` | Starts with push-to-talk on (see [Voice input](#voice-input)). Audio is sent to Groq. Can be combined with `--text`. |
 | `--wake` | Starts with hands-free mode on (see [Hands-free mode](#hands-free-mode-wake-word)). Detection is local; the request after the wake word is sent to Groq. Can be combined with `--text` and `--listen`. |
 | `--check` | Runs the environment diagnostics and exits. No API key is needed to start it. |
+| `--wake-test` | Listens locally for 20 s for "Hey JARVIS", shows the live microphone level and wake score, then says what to change, and exits (see [Testing the microphone](#testing-the-microphone-and-wake-word---wake-test)). Nothing is recorded or sent anywhere, and no API key is needed. Exit code 0 if the wake word was heard, otherwise 1. |
 | `--version` | Prints the version and exits. |
 
 At startup JARVIS confirms that the key works and that the model is offered to your account. A bad key (401), access denied (403) or an unavailable model stops it with exit code 2, as does a configuration error. A temporary failure such as a rate limit or a network problem only prints a warning, and JARVIS starts anyway.
@@ -173,7 +179,7 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_WORKSPACE` | `~/Projects` | Root for the file, project and git tools. |
 | `JARVIS_NOTES_DIR` | `~/Documents/JARVIS Notes` | Where notes are written. |
 | `JARVIS_LOG_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/logs` (normally `~/.local/share/jarvis-mark-50/logs`) | Path. |
-| `JARVIS_BACKUP_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/backups` (normally `~/.local/share/jarvis-mark-50/backups`) | Path; `~` is expanded. Where `edit_workspace_file` keeps the previous version of each file it changes (see [Backups](#backups)). Use a folder that holds nothing else: JARVIS sets it to mode `700` and deletes the oldest folders in it beyond the newest 200. |
+| `JARVIS_BACKUP_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/backups` (normally `~/.local/share/jarvis-mark-50/backups`) | Path; `~` is expanded. Where `edit_workspace_file` keeps the previous version of each file it changes (see [Backups](#backups)). Use a dedicated folder: JARVIS sets it to mode `700`. Pruning deletes only JARVIS's own timestamped backup folders beyond the newest 200, never other folders in it. |
 | `JARVIS_MAX_TOOL_ROUNDS` | `8` | 1-25. Tool rounds per request while developer mode is off. |
 | `JARVIS_MAX_DEV_TOOL_ROUNDS` | `14` | 1-40. Tool rounds per request while [developer mode](#developer-mode) is on, since looking, editing, testing and re-testing takes more steps. |
 | `JARVIS_SEARCH_LIMIT` | `5` | 1-10. Also caps the model's own `max_results`. |
@@ -225,10 +231,11 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | `/stop` | Stops speaking. |
 | `/talk` | Records and sends one spoken message, whether push-to-talk is on or off. |
 | `/listen on` / `/listen off` | Turns push-to-talk on or off. `/listen` alone shows the current state. |
-| Enter on an empty line | With push-to-talk on: starts recording. Press Enter again to stop. |
+| Enter on an empty line | With push-to-talk on: starts recording. Press Enter again to stop. With the microphone off (neither push-to-talk nor hands-free on), the first empty Enter of the session prints a one-time hint on how to turn voice on; later ones do nothing. |
 | `/wake on` / `/wake off` | Turns hands-free mode on or off. `/wake off` closes the microphone. `/wake` alone shows the current state. |
 | "Hey JARVIS" (spoken, hands-free on) | Starts a spoken request. While JARVIS is speaking or working, it interrupts first (see [Interrupting JARVIS](#interrupting-jarvis)). |
-| `/dev on` / `/dev off` | Turns [developer mode](#developer-mode) on or off: whether the model is offered the developer tools (files, git, code search, edits, tests). It also switches on by itself when a message is about code. `/dev` alone shows the current state. |
+| `/dev on` / `/dev off` | Turns [developer mode](#developer-mode) on or off: whether the model is offered the developer tools (files, git, code search, edits, tests). `/dev off` stays off: messages about code no longer switch it back on. `/dev` alone shows the current state. |
+| `/dev auto` | Restores automatic switching (the default): developer mode is off and switches on by itself when a message is about code. |
 | `/clear` | Forgets this session's conversation context. Saved memories are unaffected. |
 | `/status` | Shows the model, voice, permission mode, memory file, workspace, notes, logs, the tool-round limits (for example `8 (14 with developer tools)`), whether developer tools are on, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
 | `exit`, `quit`, `goodbye`, `bye jarvis`, Ctrl+D | Leaves JARVIS. |
@@ -267,14 +274,27 @@ The permission mode only governs tool calls made by the model. The `/forget` and
 
 - **Workspace root** (`JARVIS_WORKSPACE`, default `~/Projects`): `open_project` and all the developer tools (`list_workspace_files`, `read_workspace_file`, `inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, `describe_project`, `search_workspace_code`, `edit_workspace_file`, `create_workspace_file` and `run_project_tests`) only work inside it. Relative paths are resolved against the root. Absolute paths are accepted only if they lie inside it.
 - **Symlinks are resolved** before the check, so a link inside the workspace that points outside it is refused.
+- **Paths with a newline or carriage return** (or a NUL character) are refused with `Invalid path.`, for every workspace tool.
 - **Protected names**: a path is refused if any part of it below the workspace root matches one of these, for reading, editing and creating alike. `list_workspace_files` hides matching entries and reports how many it hid; `describe_project` and `search_workspace_code` skip them.
   - Directories: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.password-store`, `.pki`, `.mozilla`, `google-chrome`, `chromium`, `BraveSoftware`, `keyrings`, `.git`
-  - Files: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`, `.netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials`, `credentials.*`, `secrets.*`, `*.secret`, `master.key`, `.envrc`, `*_history` (shell histories), `.htpasswd`
+  - Files: `.env`, `.env.*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`, `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`, `.netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials`, `credentials.*`, `secrets.*`, `*.secret`, `master.key`, `.envrc`, `*_history` (shell histories), `.htpasswd`, `mise.toml`, `.mise.toml`, `mise.*.toml`, `.mise.*.toml` (mise runs tasks from these automatically when you `cd` into the folder, like `.envrc`)
   - Still allowed: `.env.example`, `.env.sample`, `.env.template`
+- **No writes inside a git directory.** `edit_workspace_file` and `create_workspace_file` also refuse any path inside a folder whose name ends in `.git` (any case), such as a bare repository `project.git/`, whose hooks would run on its next git command: `<path> is inside a git directory; JARVIS does not write there.`
 - **`read_workspace_file`** only reads text files; files with NUL bytes are treated as binary and refused. It reads at most the first 200 KB and returns 6,000 characters by default (`max_chars` 100-9,000). Known credential formats in the content are redacted.
-- **The git tools** (`inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, and the git part of `describe_project`) are read-only and hardened against hostile repositories: it overrides `core.fsmonitor`, `core.hooksPath` and every configured `filter.*` driver, disables external diff and textconv programs, credential prompts, optional locks and system config, and ignores inherited `GIT_*` variables. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
+- **The git tools** (`inspect_git_status`, `inspect_git_diff`, `inspect_git_history`, and the git part of `describe_project`) are read-only and hardened against hostile repositories, that is, a repository whose `.git/config` was written by someone else (one unpacked from a tarball or zip, or opened from a shared folder; `git clone` does not copy `.git/config`):
+
+  | Setting | Value | What it stops |
+  | --- | --- | --- |
+  | `core.fsmonitor`, `core.untrackedCache` | `false` | An fsmonitor program from the repository |
+  | `core.hooksPath` | `/dev/null` | Repository hooks |
+  | `core.pager`, `color.ui` (plus `--no-pager`) | `cat`, `false` | A pager program |
+  | `log.showSignature` (plus `--no-show-signature` on every `git log`) | `false` | The repository's `gpg.program`, which runs when signatures are verified |
+  | `protocol.allow` (plus the variable `GIT_NO_LAZY_FETCH=1`) | `never` | Every transport, so a partial-clone lazy fetch, `core.sshCommand` or `uploadpack` cannot run |
+  | `<filter>.clean`, `.smudge`, `.process` for every configured `filter.*` driver | empty | Filter programs. The driver names are read NUL-separated, so a name containing any kind of space is still neutralised. `<filter>.required` is set to `false`. |
+
+  These settings are passed through the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` environment variables rather than `-c`. They override the repository's config, and git takes each key literally, so an unusual filter name cannot change which setting is meant. This needs git 2.31 or newer (Zorin OS 18 ships 2.43). External diff and textconv programs (`--no-ext-diff`, `--no-textconv`), credential prompts, optional locks and system config are also off, and inherited `GIT_*` variables are ignored. `GIT_CEILING_DIRECTORIES` stops git from finding a repository above the workspace (such as a dotfiles repo in `$HOME`), and the repository's top level must be inside the workspace. These protections are covered by tests that run real git against a booby-trapped repository.
 - **Notes folder** (`JARVIS_NOTES_DIR`) is separate from the workspace, and `create_note` can only write there. The file name comes from the title (letters, digits, `.`, `_`, `-`; spaces become `-`; at most 80 characters; `.md` added), so a title cannot escape the folder. A `# Title` heading is added if the content does not start with one. Notes are written atomically. An existing note is replaced only when `overwrite` is set, which is a sensitive action.
-- **Workspace files** change only through `edit_workspace_file` and `create_workspace_file`, each after you approve the diff (see [Changing code](#changing-code)). Edits keep a backup in `JARVIS_BACKUP_DIR`, outside the workspace.
+- **Workspace files** change only through `edit_workspace_file` and `create_workspace_file`, each only after you were shown the diff and approved it (see [Changing code](#changing-code)). Edits keep a backup in `JARVIS_BACKUP_DIR`, outside the workspace.
 - There is no general shell, no delete, rename, commit or push tool, and no JARVIS tool that writes files anywhere other than the workspace (with your approval), the backup folder, the notes folder and the memory file. The exception is the code of a project whose tests or linter you let JARVIS run: it runs with your user's rights and can write wherever you can (see [Safety](#safety)).
 
 ## Permissions file
@@ -346,7 +366,7 @@ Only commands of the requested kind (`tests` or `lint`) are considered. If there
 
 1. If the model passed the name of an approved command, that command is used. Any other name is refused, with the list of approved names.
 2. Otherwise, if the project has a `[projects.<folder>]` rule for that kind, the rule's command is used.
-3. Otherwise, the first command in the file that fits the project is used. A command fits when one of its `detect` markers exists in the project and, if it sets `npm_script`, `package.json` defines that script.
+3. Otherwise, the first command in the file that fits the project is used. A command fits when one of its `detect` markers exists in the project and, if it sets `npm_script`, `package.json` defines that script. A `package.json` that is a symbolic link to a file outside the project is ignored, so such a command does not fit.
 4. If nothing fits, the result is the error `No approved tests command fits <project>.` (or `lint`), with the approved names and the path of the permissions file.
 
 ### Safety
@@ -407,7 +427,7 @@ The 10 developer tools (marked **Dev** in the [tools table](#tools-available-to-
   - languages and frameworks: rails, ruby, python, flutter, dart, npm, node, javascript, typescript, expo, react;
   - the name of a top-level folder in the workspace (hidden folders excluded), such as `rpmis` or `calc`.
 - The word list is broad on purpose, so some everyday messages ("I get an error when I open Firefox") switch it on too. That costs tokens, not safety.
-- `/dev on` turns it on and `/dev off` hides the tools again, until the next message about code switches them back on. `/dev` alone and `/status` show the current state.
+- `/dev on` turns it on. `/dev off` hides the tools and keeps them hidden: a message about code no longer switches them back on. `/dev auto` restores the automatic switching (and turns the tools off until the next message about code). `/dev` alone shows the current state: `on`, `off, switching on when you ask about code` or `off until you type /dev on or /dev auto`. `/status` shows on or off.
 - **A tool that was not offered cannot run.** If the model calls one anyway, JARVIS does not run it and answers: `<tool> is not available right now. Developer tools are offered when the user's request is about code or projects (/dev on).`
 - **More rounds.** While developer mode is on, each request may use up to `JARVIS_MAX_DEV_TOOL_ROUNDS` tool rounds (default 14) instead of `JARVIS_MAX_TOOL_ROUNDS` (default 8), because a fix takes several steps: look, read, edit, test, and sometimes correct and test again.
 - Developer mode changes only which tools the model sees. Permission classes, confirmations and the workspace boundary are the same either way.
@@ -418,9 +438,10 @@ These tools are read-only, so they run in every permission mode, including `read
 
 ### inspect_git_diff
 
-- Arguments: `path` (the repository folder), optionally `file` (a file inside the repository, relative to `path`) and `staged`.
+- Arguments: `path` (the repository folder), optionally `file` (a file or folder inside the repository, relative to `path`) and `staged`.
+- `file` is taken literally: `*`, `?` and `[...]` are ordinary characters, not wildcards.
 - Shows the working-tree changes that are not staged yet. With `staged` set, it shows the staged changes instead (`git diff --cached`).
-- Every file whose name matches a protected file pattern (`.env`, `*.key`, `credentials` and the rest of the list under [Filesystem boundaries](#filesystem-boundaries)) is left out of the diff. Asking for a protected `file` directly is refused.
+- Every changed path that matches a protected name (`.env`, `*.key`, `credentials`, a protected folder such as `.kube`, and the rest of the list under [Filesystem boundaries](#filesystem-boundaries)) is left out of the diff, also when `file` is a folder that contains it. Asking for a protected `file` directly is refused.
 - The diff is redacted and capped at 8,000 characters; `diff_truncated` says when it was cut.
 - Untracked files have no diff. Their names are listed (up to 50, protected names left out).
 
@@ -439,7 +460,7 @@ A quick orientation, usually the model's first step in a project:
 | `top_level` | The project's top-level entries (folders end in `/`), up to 80, without protected names and without the skipped folders listed under `search_workspace_code` |
 | `markers` | Which of these exist: `package.json`, `Gemfile`, `pubspec.yaml`, `pyproject.toml`, `pytest.ini`, `requirements.txt`, `setup.py`, `go.mod`, `Cargo.toml`, `composer.json`, `pom.xml`, `build.gradle`, `Makefile`, `Dockerfile`, `docker-compose.yml`, `bin/rails`, `app.json`, `tsconfig.json` |
 | `approved_commands` | The tests and lint commands from the [permissions file](#permissions-file) that fit the project |
-| `readme_start` | The first 3,000 characters of `README.md`, `README.rst`, `README.txt` or `README`, redacted |
+| `readme_start` | The first 3,000 characters of `README.md`, `README.rst`, `README.txt` or `README`, redacted. A README is read only if it resolves inside the workspace: one that is a symbolic link to a file elsewhere (for example `~/.aws/credentials`) is skipped. |
 | `git` | The branch, the last 5 commits (short hash, date, subject) and the number of uncommitted files; or the reason there is no git information, for example that the folder is not a repository |
 
 ### search_workspace_code
@@ -480,7 +501,10 @@ The prompt shows what will change and the file's git state, then the unified dif
    Type 'yes' to proceed, anything else cancels:
 ```
 
-- Added lines are green, removed lines red and hunk headers cyan (`NO_COLOR` turns colour off). At most 120 lines of the diff are shown; a longer one ends with `... N more lines not shown`.
+- Added lines are green, removed lines red and hunk headers cyan (`NO_COLOR` turns colour off).
+- **Every change fits on the screen, so nothing you approve is hidden.** A change whose diff has more than 400 lines, or a line longer than 1,000 characters, is refused before anything is asked (status `denied`, `Not done: ...`): `This change is too large to review in one step (N diff lines; the limit is 400). Split it into smaller edits.` or `A line in this change is N characters long, too long to review on screen (limit 1000). Break it into shorter lines.` The confirmation shows up to 400 lines, matching the limit.
+- **Invisible characters are made visible.** Invisible and text-direction Unicode characters (bidi overrides, zero-width characters, line and paragraph separators: the "Trojan Source" trick, which makes code read differently from what it does) are shown as `\u{...}`, for example `\u{202e}`. A yellow line `!! N invisible or text-direction character(s), shown as \u{...}` comes before the diff, and the Operation line ends with `WARNING: the change contains N invisible or text-direction character(s), shown as \u{...}; they can make code read differently from what it does.`
+- **Files that run by themselves get a note.** For a file that build tools, CI or your editor run or obey automatically, the Operation line adds `Note: build tools, CI or your editor run or obey this file automatically; read the change carefully.` That covers any file inside a folder named `.github`, `.vscode`, `.husky`, `.devcontainer`, `.circleci`, `bin` or `scripts`, and files named `Makefile`, `makefile`, `GNUmakefile`, `Justfile`, `justfile`, `package.json`, `conftest.py`, `setup.py`, `pyproject.toml`, `tox.ini`, `noxfile.py`, `Gemfile`, `Rakefile`, `*.gemspec`, `Procfile`, `Dockerfile`, `docker-compose.yml`, `compose.yaml`, `.yarnrc`, `.yarnrc.yml`, `.pre-commit-config.yaml`, `.gitlab-ci.yml`, `.gitattributes`, `.gitmodules`, `build.gradle`, `pubspec.yaml` and `*.sh` (`RUN_BY_TOOLS` and `RUN_BY_TOOL_DIRS` in `tools/developer.py`).
 - The git state is one of:
 
   | Shown | Meaning |
@@ -491,19 +515,21 @@ The prompt shows what will change and the file's git state, then the unified dif
   | `ignored by git; JARVIS keeps a backup` | The file matches a `.gitignore` rule, so git has no copy of it either. |
   | `not in a git repository; JARVIS keeps a backup` | The same, outside any repository. |
 
-- **The approval is bound to the file as shown.** When the prompt is built, JARVIS records a checksum of the file. If the file changes before the write (you save it in your editor, or a formatter runs), nothing is written and the model is told: `<file> changed after the edit was approved. Nothing was written; read the file again and propose the edit afresh.`
+- **Approvals fail closed.** An edit or a new file is written only if that exact change was shown to you in a confirmation and you approved it. A call that never went through a confirmation writes nothing: `This edit was not shown to the user for approval, so nothing was written.` (or `This new file was not shown ...`).
+- **The approval is bound to the file as shown.** When the prompt is built, JARVIS records a checksum of the file. If the file changes before the write (you save it in your editor, or a formatter runs), nothing is written and the model is told: `<file> changed after the edit was approved. Nothing was written; read the file again and propose the edit afresh.` The checksum is compared first, so you get this message even when the change removed the text the edit was going to replace.
+- Declined prompts do not pile up: JARVIS remembers at most the 32 most recent prepared changes.
 
 ### Writing and verifying
 
 1. The current version is copied to the backup folder (see [Backups](#backups)).
 2. The new content is written to a temporary file in the same folder, flushed to disk, and renamed over the original, so the file is never half-written. The file keeps its permission bits.
 3. The file is read back and compared with what was intended. If it does not match, the result is `unverified`, never `success`.
-4. The result gives the diff, the git state, the backup path and a reminder to run the tests.
+4. The result gives the diff (redacted), the git state, the backup path and a reminder to run the tests.
 
 ### Backups
 
 - Each edit makes one folder in `JARVIS_BACKUP_DIR` (default `~/.local/share/jarvis-mark-50/backups`), named by the time, `YYYYMMDD-HHMMSS-<microseconds>`. It holds the old file at its path relative to the workspace.
-- The backup folder is set to mode `700` and each backup file to `600`. The newest 200 edit folders are kept; older ones are deleted at the next edit. Point `JARVIS_BACKUP_DIR` at a folder used for nothing else.
+- The backup folder and each timestamped folder in it are set to mode `700`, and each backup file to `600`. The newest 200 edit folders are kept; older ones are deleted at the next edit. Pruning deletes only folders named exactly like JARVIS's own (`YYYYMMDD-HHMMSS-<microseconds>`), never other folders in `JARVIS_BACKUP_DIR`. Still point it at a dedicated folder, since JARVIS sets the folder itself to mode `700`.
 - Backups are never restored automatically. To undo an edit by hand, copy the backup back:
 
   ```bash
@@ -516,15 +542,20 @@ The prompt shows what will change and the file's git state, then the unified dif
 
 ### Creating a file
 
-- `create_workspace_file` never overwrites. If the path already exists (or is a symbolic link), it is refused: `<file> already exists; use edit_workspace_file to change it.`
+- `create_workspace_file` never overwrites. If the path already exists (or is a symbolic link), it is refused: `<file> already exists; use edit_workspace_file to change it.` The check is made again after you approve, and the final step is exclusive: the file is linked into place only if nothing is there yet. A file that appears at that last moment is never overwritten: `<file> appeared while waiting for approval; nothing was overwritten.`
 - Text only: at most 200,000 characters, no NUL characters.
 - Missing parent folders are created.
-- The prompt reads `Create <file> (N lines).` and shows the content as added lines, with the same 120-line display limit.
+- The prompt reads `Create <file> (N lines).` and shows the content as added lines, with the same review limits (400 diff lines, 1,000 characters per line) and the same warnings as an edit.
 - The file is written the same atomic way, with mode `644`, and read back to verify.
+- The result gives the redacted diff and the file's git state, without a backup claim (a new file has no backup), for example `not yet tracked by git`.
 
 ### What is refused
 
-- Protected files and folders (such as `.env`) and any path outside the workspace: `Access denied: ...`. Nothing is asked and nothing is written.
+- Protected files and folders (such as `.env` or `mise.toml`) and any path outside the workspace: `Access denied: ...`. Nothing is asked and nothing is written.
+- A path inside any folder whose name ends in `.git`, such as a bare repository: `<path> is inside a git directory; JARVIS does not write there.`
+- A path containing a newline or carriage return: `Invalid path.`
+- A change too large to review in one step (see [The confirmation](#the-confirmation)).
+- A write that was not shown to you and approved.
 - There are no tools to delete, rename, commit or push. You review with `git diff` and commit yourself.
 
 ### Proving the change
@@ -690,6 +721,62 @@ When it starts, JARVIS prints: `Hands-free on: listening on this computer for "H
 - While a push-to-talk recording runs (`/talk`, or Enter with push-to-talk on), the hands-free listener ignores the microphone. It keeps the capture device open, which is fine with PipeWire (Zorin OS 18's default) but would make push-to-talk fail with "busy" on a raw ALSA `hw:` device.
 - If the microphone stream ends, JARVIS prints `Hands-free listening stopped: the microphone stream ended. Type /wake on to try again.` Everything else keeps working.
 - `/wake off` stops the listener and closes the microphone, and discards any request it had captured but not yet transcribed. Leaving JARVIS does the same. If the listener crashes, its microphone is closed too. `/status` shows whether hands-free is on.
+- **Typing "hey Jarvis" is not the wake word.** A typed line is an ordinary text message. Only a spoken request shows as `You (voice): ...`.
+- **Started without `--wake`, the microphone is off.** The banner says `Microphone off. To talk: /wake on (say "Hey JARVIS") or /listen on (push-to-talk).`, and the first empty Enter of the session prints a one-time hint.
+- **JARVIS knows its own voice state.** Each request tells the model whether replies are spoken or text only, and whether hands-free, push-to-talk or neither is on, with how to turn voice on. Asked "are you listening?" or "how do I wake you?", it answers from that, and it is told never to claim it is always listening.
+
+### Testing the microphone and wake word (`--wake-test`)
+
+```bash
+.venv/bin/python jarvis.py --wake-test
+```
+
+- Listens on this computer for 20 s (Ctrl+C stops early). Nothing is recorded to disk or sent anywhere, and no API key is needed. It needs the wake-word engine and `arecord`, like hands-free mode; the first run downloads the wake-word model (about 7 MB) if it is missing.
+- Say "Hey JARVIS" a few times, with a pause between tries. A live line shows the microphone level (RMS, with a bar of one `#` per 0.01, full at 0.2), the current wake score, the best score so far and how many times the wake word was heard:
+
+  ```text
+    level [####################] 0.312   wake score 0.91   best 0.97   heard: 2
+  ```
+
+- It ends with one piece of advice, checked in this order:
+
+  | Result | Advice | Exit code |
+  | --- | --- | --- |
+  | No audio frames arrived | `No sound reached JARVIS from the microphone.` Check it is connected and selected in Settings > Sound > Input. | 1 |
+  | Heard at least once | `Heard "Hey JARVIS" N time(s); best score ... (needed 0.6). Hands-free works: start JARVIS with  python jarvis.py --wake` | 0 |
+  | Loudest sound below 0.05 | `Your microphone is very quiet ...` Raise the input volume in Settings > Sound > Input, or run `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 80%`. | 1 |
+  | Best score 0.3 or more (a near miss) | `It nearly heard you ...` Speak a little closer, say it as two clear words, or set `JARVIS_WAKE_THRESHOLD=0.5` in `.env`. | 1 |
+  | Anything else | `It did not recognise "Hey JARVIS" ...` Say "Hey" and "JARVIS" clearly, about arm's length from the laptop. | 1 |
+
+  If the engine is missing or the microphone cannot be opened, it says so and exits with 1.
+- **Read the level as well as the advice.** The test has no "too loud" verdict. If the level stays above about 0.05 while you are silent, or your voice reaches 0.9-1.0, the microphone gain is too high and the voice is distorted, so it can report a near miss and suggest a lower threshold when the real fix is lowering the gain (see the case below). Aim for voice peaks around 0.2-0.6.
+
+### Case: no response to "Hey JARVIS" (2026-10-23)
+
+The user said "Hey Jarvis" and got no response. A 150 s local measurement showed:
+
+| Measurement | 2026-10-23 | Working |
+| --- | --- | --- |
+| Voice peak (RMS) | 0.97-1.0 (clipping) | aim for about 0.2-0.6 |
+| Background noise (RMS) | 0.09-0.18 | about 0.005 on a working day |
+| Best wake score | 0.45 | 0.6 needed (`JARVIS_WAKE_THRESHOLD`) |
+
+**Cause: hardware gain.** The ALSA control "Mic Boost" was at +12 dB and "Capture" at 100% (+6 dB), with the "Mic" (jack) input active and "Internal Mic" off. With that much gain the voice clipped and the background noise was 20-35 times the level of a working day, so the distorted voice scored below the threshold. Lowering the threshold does not fix that.
+
+**Fix:**
+
+```bash
+amixer -c 0 sset 'Mic Boost' 0
+amixer -c 0 sset 'Capture' 60%
+wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 70%
+```
+
+`-c 0` is sound card 0, the built-in HDA Intel PCH on the test laptop; `arecord -l` lists the cards, and `amixer -c 0 sget 'Mic Boost'` shows the current value. Then run `.venv/bin/python jarvis.py --wake-test` and aim for voice peaks around 0.2-0.6.
+
+Two things that look like the same problem but are not:
+
+- **Typing "hey Jarvis"** sends a text message; it is not the wake word. A spoken request shows as `You (voice): ...`.
+- **Starting without `--wake`** (or `/wake on`) leaves the microphone off, so nothing listens for the wake word.
 
 ### Interrupting JARVIS
 
@@ -753,7 +840,7 @@ The test suite lives in `tests/`, one file per area:
 | `test_developer.py` | Developer tools (being added) |
 | `test_voice_output.py` | Spoken output: text cleanup, the voice engine and the chime |
 | `test_speech_input.py` | Push-to-talk recording and transcription |
-| `test_wake.py` | Hands-free mode and voice interruption |
+| `test_wake.py` | Hands-free mode, voice interruption and `--wake-test` |
 | `helpers.py` | Shared fakes and base test cases |
 | `conftest.py` | Makes the project packages importable |
 
@@ -780,15 +867,21 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 | A project's tests fail with database or connection errors | The tests need a service, such as a database, that is not running. Start it the way you normally would, then ask again. JARVIS does not start services. |
 | "old_text was not found in the file" / "old_text appears N times" | The model's `old_text` did not match the file exactly (indentation, a changed line, a stale copy), or was too short to be unique. Nothing was asked or written. The error goes back to the model, which normally re-reads the file and tries again. If it keeps failing, name the exact lines you mean, or make the change yourself. |
 | "... changed after the edit was approved. Nothing was written" | The file changed between the confirmation and the write, for example because you saved it in your editor or a formatter ran. Nothing was written. Ask again; the model reads the file afresh and shows a new diff. |
-| A reply mentions "Not done: ..." | JARVIS could not prepare the change, so it asked nothing and wrote nothing. The reason follows: `Access denied: ...` (a protected file such as `.env`, or a path outside the workspace), `... already exists; use edit_workspace_file to change it`, `... is not a file; use create_workspace_file for a new one`, `... is larger than 1 MB`, `... looks like a binary file`, `... is not UTF-8 text`, `old_text must not be empty`, `old_text and new_text are identical`, or one of the two `old_text` errors above. See [Changing code](#changing-code). |
-| A request about code gets answered without looking at files, or the reply says a tool "is not available right now" | The message contained none of the trigger words, so developer mode stayed off and the developer tools were not offered. Type `/dev on` and ask again. `/status` shows whether developer tools are on. See [Developer mode](#developer-mode). |
-| Developer tasks are slow (minutes), with many "Retrying in Ns" lines | Expected on the free tier: every round resends the tool definitions (about 2.8k tokens in developer mode) and the growing conversation, against a limit of 8,000 tokens per minute. The verified bug fix took about 3.5 minutes. To speed it up: `/clear` before a big task, keep requests focused on one project, `/dev off` for everyday questions afterwards, or use a model with a higher limit. If Groq asks for a wait over 60 s, the task stops with a list of the steps already done; ask again to continue from there. |
+| "This change is too large to review in one step" / "A line in this change is N characters long" | The diff had more than 400 lines, or a line over 1,000 characters, so it could not be shown in full. Nothing was asked or written. Ask for the change in smaller steps, or make a large generated change yourself. |
+| "... appeared while waiting for approval; nothing was overwritten" | Something created that file between your approval and the write. JARVIS left it alone. Look at it, then ask again (as an edit, if you want to change it). |
+| "This edit was not shown to the user for approval" / "This new file was not shown ..." | The write was attempted without going through a confirmation, so nothing was written. This should not happen in normal use; ask again, and the change comes with a confirmation. |
+| "... is inside a git directory; JARVIS does not write there" | The path is inside a folder whose name ends in `.git`, such as a bare repository. JARVIS never writes there; make the change yourself if you really mean it. |
+| A reply mentions "Not done: ..." | JARVIS could not prepare the change, so it asked nothing and wrote nothing. The reason follows: `Access denied: ...` (a protected file such as `.env`, or a path outside the workspace), `... already exists; use edit_workspace_file to change it`, `... is not a file; use create_workspace_file for a new one`, `... is larger than 1 MB`, `... looks like a binary file`, `... is not UTF-8 text`, `old_text must not be empty`, `old_text and new_text are identical`, `... is inside a git directory`, `Invalid path.`, `This change is too large to review in one step ...`, or one of the two `old_text` errors above. See [Changing code](#changing-code). |
+| A request about code gets answered without looking at files, or the reply says a tool "is not available right now" | The message contained none of the trigger words, or you typed `/dev off` (which stays off), so the developer tools were not offered. Type `/dev on` and ask again, or `/dev auto` to restore automatic switching. `/status` shows whether developer tools are on. See [Developer mode](#developer-mode). |
+| Developer tasks are slow (minutes), with many "Retrying in Ns" lines | Expected on the free tier: every round resends the tool definitions (about 2.8k tokens in developer mode) and the growing conversation, against a limit of 8,000 tokens per minute. The verified bug fix took about 3.5 minutes. To speed it up: `/clear` before a big task, keep requests focused on one project, `/dev off` for everyday questions afterwards (it stays off until `/dev on` or `/dev auto`), or use a model with a higher limit. If Groq asks for a wait over 60 s, the task stops with a list of the steps already done; ask again to continue from there. |
 | "I heard only silence" | The microphone is muted, or the wrong input is selected. Check Settings > Sound > Input (input level and device). `wpctl status` lists the sources and shows the default one. Test outside JARVIS with `arecord -d 3 /tmp/t.wav && aplay /tmp/t.wav`. |
 | "The microphone could not be opened (... busy ...)" | Another program is using the microphone, for example a video call or a browser tab. Close it and try again. |
 | "No microphone recorder found" / "Speech input unavailable" | Run `sudo apt install alsa-utils` (provides `arecord`). `--check` shows which recorder was found. |
 | "Transcription failed: The speech model ... is unavailable" | Set `JARVIS_STT_MODEL=whisper-large-v3`. `--check` warns when the configured speech model is not offered to your account. |
 | "Transcription failed: Groq is rate-limiting requests" / "...speech quota ... is used up" | Speech models have their own free-tier limits, counted in audio seconds. Wait, switch `JARVIS_STT_MODEL` to another Whisper model, or type instead. See https://console.groq.com/settings/limits. |
-| Hands-free does not wake up | Speak closer to the microphone and say "Hey JARVIS" clearly ("Hello Jarvis" scored only 0.52 in testing). Lower `JARVIS_WAKE_THRESHOLD` to `0.5`. Check the input level and device in Settings > Sound > Input; `wpctl status` shows the default source. |
+| Hands-free does not wake up | First make sure it is on: started without `--wake` (or `/wake on`), the microphone is off and the banner says `Microphone off`. Typing "hey Jarvis" is a text message, not the wake word; a spoken request shows as `You (voice): ...`. Then run `.venv/bin/python jarvis.py --wake-test` and follow its advice. If your voice reaches 0.9-1.0 or the level stays above about 0.05 while you are silent, the gain is too high: see [No response to "Hey JARVIS"](#case-no-response-to-hey-jarvis-2026-10-23) (`amixer -c 0 sset 'Mic Boost' 0`, `amixer -c 0 sset 'Capture' 60%`, `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 70%`), and aim for voice peaks around 0.2-0.6. Otherwise speak closer and say "Hey JARVIS" clearly ("Hello Jarvis" scored only 0.52 in testing), or lower `JARVIS_WAKE_THRESHOLD` to `0.5` for a near miss. `wpctl status` shows the default source. |
+| `--wake-test`: "Your microphone is very quiet" / "No sound reached JARVIS from the microphone" | The input is muted, too low or the wrong device. Check Settings > Sound > Input, run `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 80%`, and test again. |
+| Pressing Enter on an empty line does nothing | The microphone is off. The first time, JARVIS prints a hint. Type `/listen on` (push-to-talk), `/wake on` (hands-free) or `/talk` (one spoken message). |
 | Hands-free wakes up by itself | Raise `JARVIS_WAKE_THRESHOLD`, for example to `0.7` or `0.8`. |
 | JARVIS interrupts itself while speaking | Raise `JARVIS_WAKE_SPEAKING_THRESHOLD` (up to `0.99`), turn the speaker volume down, or use headphones. |
 | Hands-free cuts me off mid-request | Raise `JARVIS_WAKE_END_SILENCE`, for example to `1.5` or `2.0`. The pause is measured from the last sound the microphone heard after the wake word. |
@@ -809,7 +902,7 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **A cancelled tool that was already running may finish**, whether you cancel with Ctrl+C or with the wake word (see the tool-timeout item below).
 - **Hands-free typing uses a plain line reader**, so there is no line-editing history.
 - **The hands-free listener uses `arecord` only.** `pw-record` is not used for streaming.
-- **Recognition quality depends on the laptop microphone** and on room noise. With a real voice, neither push-to-talk transcription nor the wake word has been tested yet (see [Status](#status--verification)).
+- **Recognition quality depends on the laptop microphone**, its gain and room noise. Push-to-talk transcription has not been tested with a real voice yet, and the one recorded real "Hey Jarvis" failed because the gain was far too high (see [Status](#status--verification)). Check yours with `--wake-test`.
 - **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget, and a multi-step fix (look, test, edit, re-test) takes minutes: the verified one took about 3.5 minutes.
 - **Search returns snippets only.** JARVIS does not open or read the result pages.
 - **Memory of conversations is limited.** Context covers only the current session: the last `JARVIS_HISTORY_TURNS` exchanges, plus one-line summaries of older questions. Tool results are not carried between turns. The saved conversation log is a bounded record and is not fed back to the model.
@@ -817,8 +910,10 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **One replacement per edit call.** `edit_workspace_file` replaces one exact, unique piece of text. A change spread over a file takes several calls and several confirmations, and there is no patch tool.
 - **No delete or rename.** JARVIS cannot delete, move or rename files, and cannot commit or push.
 - **Backups are not restored automatically.** Undoing an edit means copying the backup back by hand (see [Backups](#backups)). Only the newest 200 edits have a backup.
-- **The confirmation shows at most 120 lines** of a diff or a new file. For a longer change the rest is not on screen when you approve it; decline and ask for smaller steps if you want to see everything.
-- **Developer mode detection is keyword-based.** A request about code that uses none of the trigger words gets no developer tools until you type `/dev on`. A project name directly followed by a full stop ("look at RPMIS.") is not recognised as a name. `/dev off` lasts only until the next message that looks like code.
+- **A change must fit one review screen.** An edit or new file whose diff has more than 400 lines, or any line over 1,000 characters, is refused ("too large to review in one step; split it"), so nothing you approve is hidden. A large or generated change (a lock file, minified code) has to be split into several edits or made by you.
+- **Creating a file needs hard links.** The exclusive final step links the file into place, so creating a file fails on a filesystem without hard links, such as a FAT or exFAT USB drive (`Could not create ...`). Editing is not affected.
+- **The git hardening needs git 2.31 or newer**, which reads `GIT_CONFIG_COUNT`. Zorin OS 18 ships git 2.43.
+- **Developer mode detection is keyword-based.** A request about code that uses none of the trigger words gets no developer tools until you type `/dev on`. A project name directly followed by a full stop ("look at RPMIS.") is not recognised as a name. After `/dev off`, nothing switches it back on until `/dev on` or `/dev auto`.
 - **Code search skips common build folder names everywhere**, such as `build`, `tmp`, `log`, `vendor` and `storage`, even when one of them holds source code you care about.
 - **Tests of real projects may need services.** A project's test suite may expect a database or another service to be running. JARVIS does not start services, so such tests fail until you start them.
 - **Project commands run your project's code.** Approving a test run is approving whatever that code does, with your user's rights. Only the Groq key and JARVIS's own settings are kept out of its environment.
@@ -844,7 +939,7 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 
 | Path | Purpose |
 | --- | --- |
-| `jarvis.py` | The entry point, run with `python jarvis.py`: the `--check` diagnostics (`run_checks`), command-line options (`parse_args`) and `main`. It also re-exports the main public names, so `import jarvis` still works for scripts and tests. |
+| `jarvis.py` | The entry point, run with `python jarvis.py`: the `--check` diagnostics (`run_checks`), the `--wake-test` microphone and wake-word check (`run_wake_test`), command-line options (`parse_args`) and `main`. It also re-exports the main public names, so `import jarvis` still works for scripts and tests. |
 | `config/settings.py` | Environment variables, `.env` loading, validated settings, and loading the permissions file |
 | `config/permissions.toml` | Approved apps, project commands and project rules (see [Permissions file](#permissions-file)) |
 | `core/audit.py` | Logging, secret redaction and the audit trail |

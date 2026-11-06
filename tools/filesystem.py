@@ -33,6 +33,7 @@ SENSITIVE_FILE_PATTERNS = (
     "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", ".netrc", ".pgpass", ".git-credentials",
     ".npmrc", ".pypirc", "credentials", "credentials.*", "secrets.*", "*.secret", "master.key",
     ".envrc", "*_history", ".htpasswd",
+    "mise.toml", ".mise.toml", "mise.*.toml", ".mise.*.toml",  # run tasks automatically on cd, like .envrc
 )
 
 
@@ -53,7 +54,7 @@ def resolve_safe_path(raw: Any, root: Path) -> Path:
     the result stays inside `root` and does not touch a sensitive file or directory."""
     if not isinstance(raw, str) or not raw.strip():
         raise ToolError("A path is required.")
-    if "\x00" in raw:
+    if "\x00" in raw or "\n" in raw or "\r" in raw:
         raise ToolError("Invalid path.")
     root_resolved = Path(root).expanduser().resolve()
     candidate = Path(raw.strip()).expanduser()

@@ -146,13 +146,13 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
                       "old_text": _string("Exact text to replace; must occur once", 20000),
                       "new_text": _string("Replacement text (may be empty to remove old_text)", 40000, 0)},
                      ["path", "old_text", "new_text"]),
-             tools.edit_workspace_file, S, tools._describe_edit, timeout=30),
+             tools.edit_workspace_file, S, tools._describe_edit, timeout=30, declined=tools._decline_edit),
         Tool("create_workspace_file", "Create a new text file in the workspace (never overwrites). The user sees "
              "the content and must approve it.",
              _object({"path": _string("New file path relative to the workspace", 500),
                       "content": _string("File content", 200000, 0)},
                      ["path", "content"]),
-             tools.create_workspace_file, S, tools._describe_create, timeout=30),
+             tools.create_workspace_file, S, tools._describe_create, timeout=30, declined=tools._decline_create),
         Tool("run_project_tests",
              "Run a project's tests (or linter) with a command approved in the permissions file, and report "
              "the exit code and the end of the output. Approved commands: "

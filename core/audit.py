@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 from typing import TYPE_CHECKING
@@ -57,6 +58,35 @@ def clean_text(text: Any) -> str:
 def safe_display(text: Any) -> str:
     """Text the model wrote, made safe for the terminal: no escape sequences or control codes."""
     return _CONTROL_CHARS.sub("", clean_text(text))
+
+
+def _is_harmless(text: str, index: int) -> bool:
+    """Invisible characters that legitimately appear in text: a byte-order mark opening a line, and
+    the zero-width joiner inside an emoji sequence."""
+    char = text[index]
+    if char == "\ufeff":
+        return index == 0 or text[index - 1] in "\n+ -"
+    if char == "\u200d":
+        neighbours = text[index - 1:index] + text[index + 1:index + 2]
+        return len(neighbours) == 2 and all(unicodedata.category(c) == "So" for c in neighbours)
+    return False
+
+
+def reveal_invisible(text: str) -> tuple[str, int]:
+    """Show invisible, text-direction and control characters (zero-width spaces, bidi overrides,
+    line and paragraph separators, form feeds, escapes) as \\u{...}, so code under review reads
+    exactly as it behaves. Newlines and tabs are kept. Returns the revealed text and how many
+    suspicious characters there were (harmless ones, such as a leading byte-order mark, are shown
+    but not counted)."""
+    out, count = [], 0
+    for index, char in enumerate(text):
+        category = unicodedata.category(char)
+        if category in ("Cf", "Zl", "Zp") or (category == "Cc" and char not in "\n\t"):
+            out.append(f"\\u{{{ord(char):04x}}}")
+            count += not _is_harmless(text, index)
+        else:
+            out.append(char)
+    return "".join(out), count
 
 
 _CARD_NUMBER = re.compile(r"\b(?:\d[ -]?){13,19}\b")

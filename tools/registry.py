@@ -62,6 +62,7 @@ class Tool:
     untrusted_output: bool = False  # results may contain third-party text (prompt-injection risk)
     cancel: Callable[[], Any] | None = None  # stops work still running when the user cancels
     group: str = "core"  # "developer" tools are offered to the model only in developer mode
+    declined: Callable[[dict[str, Any]], Any] | None = None  # told when the user says no to this call
 
     def permission_for(self, args: dict[str, Any]) -> Permission:
         return self.permission(args) if callable(self.permission) else self.permission
@@ -114,6 +115,8 @@ def parse_arguments(raw: Any) -> dict[str, Any]:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ToolValidationError(f"Arguments were not valid JSON ({exc.msg}).") from None
+    except (RecursionError, ValueError):  # absurdly deep nesting, or numbers too large to parse
+        raise ToolValidationError("Arguments were not valid JSON (too deeply nested or too large).") from None
     if value is None:
         return {}
     if not isinstance(value, dict):

@@ -88,4 +88,9 @@ class PermissionPolicy:
             raise KeyboardInterrupt  # cancel the request, not just this one prompt
         if approved:
             return Decision(True, "confirmed by the user", confirmed=True)
+        if getattr(tool, "declined", None) is not None:
+            try:
+                tool.declined(args)  # e.g. forget an approval prepared while describing the change
+            except Exception:  # noqa: BLE001 - a declined call is already safe; never fail on cleanup
+                pass
         return Decision(False, "The user declined this operation.")

@@ -13,6 +13,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 )
 import jarvis  # noqa: E402
 from core.orchestrator import AgentResult  # noqa: E402
+from tools import developer  # noqa: E402
 from ui import terminal  # noqa: E402
 
 
@@ -41,7 +42,8 @@ class PrintDetailsTests(unittest.TestCase):
 
     def test_long_details_are_capped_with_a_note(self):
         lines = self.printed_lines("\n".join(f"+line {i}" for i in range(terminal.MAX_DETAIL_LINES + 7)))
-        self.assertEqual(terminal.MAX_DETAIL_LINES, 120)
+        # Every change that passes the review limit is shown in full.
+        self.assertGreaterEqual(terminal.MAX_DETAIL_LINES, developer.MAX_REVIEW_LINES)
         self.assertEqual(len(lines), terminal.MAX_DETAIL_LINES + 1)
         self.assertEqual(lines[terminal.MAX_DETAIL_LINES - 1], f"   <green>+line {terminal.MAX_DETAIL_LINES - 1}")
         self.assertEqual(lines[-1], "   <dim>... 7 more lines not shown")
@@ -49,10 +51,22 @@ class PrintDetailsTests(unittest.TestCase):
         self.assertEqual(len(exactly), terminal.MAX_DETAIL_LINES)
         self.assertNotIn("not shown", exactly[-1])
 
-    def test_control_characters_from_file_content_are_removed(self):
+    def test_invisible_characters_are_revealed_with_a_warning(self):
+        lines = self.printed_lines("+access = 'user\u202e \u2066// admin'\n+x = 1\u2028y = 2\n same")
+        self.assertEqual(lines, ["   <yellow>!! 3 invisible or text-direction character(s), shown as \\u{...}",
+                                 "   <green>+access = 'user\\u{202e} \\u{2066}// admin'",
+                                 "   <green>+x = 1\\u{2028}y = 2",  # a line separator does not split the line
+                                 "    same"])
+        self.assertTrue(all("<yellow>" not in line for line in self.printed_lines("+plain\n-text\t tab")))
+
+    def test_control_characters_from_file_content_are_shown_not_run(self):
+        # Escape sequences in a diff must never reach the terminal raw, and must not vanish silently
+        # either: they are shown as \u{...} with a warning, so the user sees what will be written.
         lines = self.printed_lines("+print('hi')\x1b[2J\x1b]0;owned\x07\n-x\r")
         self.assertTrue(all("\x1b" not in line and "\x07" not in line and "\r" not in line for line in lines))
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
+        self.assertIn("invisible", lines[0])
+        self.assertIn("\\u{001b}", lines[1])
 
 
 class TerminalConfirmTests(unittest.TestCase):
@@ -158,14 +172,49 @@ class DeveloperModeCLITests(AgentTestCase):
 
     def test_dev_command(self):
         self.assertFalse(self.cli.developer_mode)
-        self.assertIn("Developer tools are off. Use /dev on or /dev off.", self.command("/dev"))
+        self.assertEqual(self.command("/dev").strip(), "Developer tools are off, switching on when you ask about code. "
+                                                       "Use /dev on, /dev off or /dev auto.")
         self.assertEqual(self.command("/dev on").strip(), "Developer tools are on.")
         self.assertTrue(self.cli.developer_mode)
-        self.assertIn("Developer tools are on. Use /dev on or /dev off.", self.command("/dev status"))
+        self.assertEqual(self.command("/dev status").strip(),
+                         "Developer tools are on. Use /dev on, /dev off or /dev auto.")
         self.assertTrue(self.cli.developer_mode)
-        self.assertEqual(self.command("/dev off").strip(), "Developer tools are off.")
+        self.assertEqual(self.command("/dev off").strip(), "Developer tools are off until you type /dev on or /dev auto.")
+        self.assertFalse(self.cli.developer_mode)
+        self.assertEqual(self.command("/dev auto").strip(), "Developer tools are off, switching on when you ask about code.")
         self.assertFalse(self.cli.developer_mode)
         self.assertIn("/dev on|off", jarvis.HELP_TEXT)
+
+    def test_dev_off_stays_off_until_dev_on_or_dev_auto(self):
+        self.command("/dev off")
+        groups, text = self.send("please fix the failing test in my repo")
+        self.assertEqual(groups, {"core"})
+        self.assertFalse(self.cli.developer_mode)
+        self.assertNotIn("developer tools on", text)
+        self.command("/dev auto")  # automatic switching is back
+        self.assertEqual(self.send("please fix the failing test in my repo")[0], {"core", "developer"})
+        self.assertTrue(self.cli.developer_mode)
+        self.command("/dev off")
+        self.assertEqual(self.send("what time is it")[0], {"core"})
+        self.command("/dev on")
+        self.assertEqual(self.send("what time is it")[0], {"core", "developer"})
+
+    def test_status_after_dev_off_does_not_promise_automatic_switching(self):
+        self.command("/dev off")
+        text = self.command("/status")
+        self.assertIn("Developer tools  off", text)
+        self.assertNotIn("on when you ask about code", text)
+        self.command("/dev auto")
+        self.assertIn("Developer tools  off (on when you ask about code)", self.command("/status"))
+
+    def test_incomplete_task_suffix(self):
+        result = AgentResult("I edited app.py but could not run the tests.", "incomplete", [], 3)
+        with mock.patch("ui.terminal.run_agent", return_value=result), mock.patch("builtins.print") as printed:
+            self.cli.handle_message("fix my tests")
+        text = printed_text(printed)
+        self.assertIn("I edited app.py but could not run the tests.\n\n(The task is incomplete.)", text)
+        self.assertNotIn("tool rounds", text)
+        self.assertEqual(self.cli.conversation.turns, [("fix my tests", result.text)])  # the suffix is not stored
 
     def test_everyday_message_offers_core_tools_only(self):
         groups, text = self.send("what time is it")
@@ -209,6 +258,42 @@ class DeveloperModeCLITests(AgentTestCase):
         self.assertIn("Max tool rounds  8 (14 with developer tools)", text)
         self.command("/dev on")
         self.assertIn("Developer tools  on\n", self.command("/status") + "\n")
+
+
+class MicrophoneHintTests(AgentTestCase):
+    """With no voice input on, JARVIS says so instead of silently ignoring an empty Enter."""
+
+    make_cli = DeveloperModeCLITests.make_cli
+
+    def setUp(self):
+        super().setUp()
+        self.voice = jarvis.VoiceEngine(enabled=False, player=["fake-player"])
+        self.addCleanup(self.voice.shutdown)
+        self.cli = self.make_cli()
+
+    def test_banner_says_the_microphone_is_off(self):
+        with mock.patch("builtins.print") as printed:
+            self.cli.banner()
+        output = printed_text(printed)
+        self.assertIn("Microphone off", output)
+        self.assertIn("/wake on", output)
+        self.assertIn("replies in text only", output)
+
+    def test_empty_enter_explains_how_to_talk_once(self):
+        with mock.patch.object(self.cli, "_read_line", side_effect=["", "", ""]), \
+                mock.patch("builtins.print") as printed:
+            for _ in range(3):
+                self.assertFalse(self.cli._step())
+        self.assertEqual(printed_text(printed).count("The microphone is off"), 1)
+
+    def test_no_hint_when_push_to_talk_is_on(self):
+        self.cli.listen_mode = True
+        with mock.patch.object(self.cli, "_read_line", return_value=""), \
+                mock.patch.object(self.cli, "voice_turn", return_value="") as voice_turn, \
+                mock.patch("builtins.print") as printed:
+            self.cli._step()
+        voice_turn.assert_called_once()
+        self.assertNotIn("The microphone is off", printed_text(printed))
 
 
 if __name__ == "__main__":

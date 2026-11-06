@@ -15,7 +15,7 @@ from typing import Callable
 from typing import TYPE_CHECKING
 
 from config.settings import VERSION
-from core.audit import clean_text, log, safe_display
+from core.audit import clean_text, log, reveal_invisible, safe_display
 from core.orchestrator import run_agent
 from core.policy import ConfirmationRequest, Permission
 from core.session import Conversation
@@ -32,12 +32,18 @@ if TYPE_CHECKING:
     from voice.wake import WakeWordListener
 
 
-MAX_DETAIL_LINES = 120
+# Matches the review limit in tools/developer.py, so an approved change is always shown in full.
+MAX_DETAIL_LINES = 400
 
 
 def print_details(details: str) -> None:
-    """Show a confirmation's details (usually a unified diff), coloured and capped in length."""
-    lines = safe_display(details).splitlines()
+    """Show a confirmation's details (usually a unified diff), coloured and capped in length.
+    Invisible and text-direction characters are shown as \\u{...} so nothing is hidden."""
+    # Reveal before anything is stripped, so control characters are shown rather than silently removed.
+    revealed, hidden = reveal_invisible(clean_text(details))
+    if hidden:
+        print("   " + style(f"!! {hidden} invisible or text-direction character(s), shown as \\u{{...}}", "yellow"))
+    lines = revealed.splitlines()
     for line in lines[:MAX_DETAIL_LINES]:
         if line.startswith("+") and not line.startswith("+++"):
             print("   " + style(line, "green"))
@@ -57,9 +63,9 @@ def terminal_confirm(request: ConfirmationRequest) -> bool:
         return False
     label = "SENSITIVE ACTION" if request.permission is Permission.SENSITIVE_ACTION else "ACTION"
     print(f"\n{style('!! Confirmation required', 'yellow')} [{label}: {request.tool_name}]")
-    print(f"   Operation: {safe_display(request.operation)}")
+    print(f"   Operation: {reveal_invisible(clean_text(request.operation))[0]}")
     for path in request.affected_paths:
-        print(f"   Affects:   {safe_display(path)}")
+        print(f"   Affects:   {reveal_invisible(clean_text(path))[0]}")
     if request.reason:
         print(f"   Why asked: {request.reason}")
     if request.details:
@@ -114,7 +120,7 @@ Commands:
   /status            show configuration    exit            leave JARVIS
   /talk              speak one message     /listen on|off  push-to-talk: Enter on an empty line = speak
   /wake on|off       hands-free: say "Hey JARVIS", then your request
-  /dev on|off        developer tools (files, git, edits, tests); they switch on when you ask about code
+  /dev on|off|auto   developer tools (files, git, edits, tests); auto (the default) switches them on when you ask about code
 Saying "Hey JARVIS" while JARVIS is talking or working interrupts it; "Hey JARVIS, stop" just stops it.
 Press Ctrl+C while JARVIS is working to cancel the current request.
 Confirmation prompts must always be typed; a spoken "yes" cannot approve an action."""
@@ -136,8 +142,10 @@ class JarvisCLI:
         self.speech = speech
         self.listen_mode = False
         self._speech_disclosed = False
+        self._mic_hint_shown = False
         self.conversation = Conversation(max_turns=ctx.config.history_turns)
         self.developer_mode = False  # offer the developer tools (files, git, edits, tests) to the model
+        self._dev_auto = True  # switch developer mode on by itself when a message is about code
         self.wake_factory = wake_factory
         self.wake: WakeWordListener | None = None
         self._want_wake = wake
@@ -344,7 +352,7 @@ class JarvisCLI:
     def banner(self) -> None:
         print(style("\nJARVIS MARK 50", "bold") + style(f"  v{VERSION}", "dim"))
         print("Personal AI Assistant")
-        voice = f"voice on ({self.voice.voice})" if self.voice.enabled else "text only"
+        voice = f"spoken replies on ({self.voice.voice})" if self.voice.enabled else "replies in text only"
         print(style(f"Model: {self.ctx.config.model} | {voice} | permissions: {self.ctx.policy.mode} | "
                     "/help for commands", "dim"))
         if self.voice.unavailable_reason:
@@ -354,6 +362,8 @@ class JarvisCLI:
         if self._want_wake:
             self._want_wake = False
             self.start_wake()
+        if not self.listen_mode and not self.hands_free:  # also when --wake was asked for but could not start
+            print(style('Microphone off. To talk: /wake on (say "Hey JARVIS") or /listen on (push-to-talk).', "dim"))
         if self.memory.corruption_error:
             print(style(f"Memory warning: {self.memory.corruption_error} Running without saved memory; "
                         "type /memory reset to back it up and start fresh.", "yellow"))
@@ -378,10 +388,13 @@ class JarvisCLI:
         elif command == "/stop":
             self.voice.stop()
         elif command == "/dev":
-            if rest in ("on", "off"):
+            if rest in ("on", "off", "auto"):
                 self.developer_mode = rest == "on"
-            print(f"  Developer tools are {'on' if self.developer_mode else 'off'}"
-                  + ("." if rest in ("on", "off") else ". Use /dev on or /dev off."))
+                self._dev_auto = rest == "auto"  # /dev off stays off; /dev auto switches on when you mention code
+            state = "on" if self.developer_mode else ("off, switching on when you ask about code" if self._dev_auto
+                                                      else "off until you type /dev on or /dev auto")
+            print(f"  Developer tools are {state}." + ("" if rest in ("on", "off", "auto") else
+                                                         " Use /dev on, /dev off or /dev auto."))
         elif command == "/listen":
             if rest in ("on", "off"):
                 self._set_listen(rest == "on")
@@ -404,7 +417,8 @@ class JarvisCLI:
                                  ("Permission mode", self.ctx.policy.mode), ("Memory file", cfg.memory_path),
                                  ("Workspace", cfg.workspace), ("Notes", cfg.notes_dir), ("Logs", cfg.log_dir),
                                  ("Max tool rounds", f"{cfg.max_tool_rounds} ({cfg.max_dev_tool_rounds} with developer tools)"),
-                                 ("Developer tools", "on" if self.developer_mode else "off (on when you ask about code)"),
+                                 ("Developer tools", "on" if self.developer_mode else
+                                  ("off (on when you ask about code)" if self._dev_auto else "off (until /dev on or /dev auto)")),
                                  ("Speech input", f"{cfg.stt_backend}/{cfg.stt_model}, push-to-talk "
                                                   f"{'on' if self.listen_mode else 'off'}"),
                                  ("Hands-free", f"{'on' if self.hands_free else 'off'} ({cfg.wake_model}, "
@@ -465,8 +479,22 @@ class JarvisCLI:
         else:
             print("  Voice off; text only.")
 
+    def voice_state(self) -> str:
+        """What JARVIS can truthfully say about its own voice input and output right now."""
+        speaking = (f"Your replies are spoken aloud ({self.voice.voice})." if self.voice.enabled
+                    else "Your replies are shown as text only (not spoken).")
+        if self.hands_free:
+            listening = ('Hands-free is on: the user wakes you by saying "Hey JARVIS" out loud; this '
+                         "message may have been spoken. Typing also works.")
+        elif self.listen_mode:
+            listening = "Push-to-talk is on: the user presses Enter on an empty line to speak."
+        else:
+            listening = ('The microphone is off; the user is typing. To talk by voice they type /wake on '
+                         '(then say "Hey JARVIS") or /listen on (push-to-talk), or start with --wake.')
+        return f"{speaking} {listening}"
+
     def _maybe_enter_developer_mode(self, text: str) -> None:
-        if not self.developer_mode and looks_like_developer_request(text, self._project_names()):
+        if not self.developer_mode and self._dev_auto and looks_like_developer_request(text, self._project_names()):
             self.developer_mode = True
             print(style("  (developer tools on for this session; /dev off to hide them)", "dim"))
 
@@ -485,7 +513,8 @@ class JarvisCLI:
             result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
                                on_tool=lambda name: print(style(f"  > {name}", "dim")),
                                on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
-                               tool_groups={"core", "developer"} if self.developer_mode else {"core"})
+                               tool_groups={"core", "developer"} if self.developer_mode else {"core"},
+                               voice_state=self.voice_state())
         except KeyboardInterrupt:
             self._consume_interrupt()  # a wake-word interruption is fully handled here
             print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))
@@ -496,7 +525,7 @@ class JarvisCLI:
             return
         reply = result.text
         if result.status == "incomplete":
-            reply = f"{reply}\n\n(Stopped after {result.rounds} tool rounds; the task is incomplete.)"
+            reply = f"{reply}\n\n(The task is incomplete.)"
         # Record the turn before speaking, so an interruption during say() cannot lose it.
         self.conversation.add(text, result.text)
         if self.ctx.config.save_conversations:
@@ -542,6 +571,11 @@ class JarvisCLI:
             return False
         if (not line and self.listen_mode) or line.lower() == "/talk":
             line = self.voice_turn()
+        elif not line and not self.hands_free and not self._mic_hint_shown:
+            # An empty Enter with no voice mode on does nothing; say how to talk, once per session.
+            self._mic_hint_shown = True
+            print(style('  The microphone is off. Type a message, or turn on voice: /wake on (say "Hey JARVIS"), '
+                        "/listen on (press Enter to talk), or /talk for one spoken message.", "dim"))
         if not line:
             return False
         if line.lower().rstrip(".!") in EXIT_WORDS:

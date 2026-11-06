@@ -17,6 +17,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 import groq  # noqa: E402
 import jarvis  # noqa: E402
 from core import orchestrator  # noqa: E402
+from core.context import OPERATING_RULES, build_system_prompt  # noqa: E402
 from intelligence import groq_client  # noqa: E402
 from tools import catalog  # noqa: E402
 
@@ -216,6 +217,12 @@ class AgentLoopTests(AgentTestCase):
         self.assertIn("flat white", system)
         self.assertIn(str(self.workspace), system)
 
+    def test_voice_state_reaches_the_system_prompt(self):
+        client = FakeGroqClient([response("I'm reading what you type, Sir.")])
+        ctx = jarvis.AgentContext(client, self.config, self.registry, self.policy, self.memory)
+        jarvis.run_agent(ctx, "are you always listening?", voice_state="The microphone is off.")
+        self.assertIn("- Voice: The microphone is off.", client.calls[0]["messages"][0]["content"])
+
     def test_api_error_propagates_from_run_agent(self):
         client = FakeGroqClient([make_status_error(groq.AuthenticationError, 401, "bad key")])
         with self.assertRaises(jarvis.JarvisAPIError) as ctx:
@@ -376,6 +383,26 @@ class HelperTests(unittest.TestCase):
             jarvis.parse_arguments("[1]")
         with self.assertRaises(jarvis.ToolValidationError):
             jarvis.parse_arguments(42)
+
+    def test_absurdly_deep_arguments_are_a_validation_error(self):
+        deep = "[" * 100_000
+        with self.assertRaises(jarvis.ToolValidationError) as ctx:
+            jarvis.parse_arguments(deep)
+        self.assertIn("too deeply nested", str(ctx.exception))
+        registry = jarvis.ToolRegistry()
+        registry.register(jarvis.Tool("t", "d", jarvis._object({}), lambda: {"ran": True}, jarvis.Permission.READ_ONLY))
+        result = jarvis.execute_tool(registry, jarvis.PermissionPolicy("standard"), "t", deep)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Invalid arguments for t", result["error"])
+
+    def test_voice_state_goes_into_the_context(self):
+        config = jarvis.Config(api_key="gsk_" + "a" * 40)
+        prompt = build_system_prompt(config, voice_state="Push-to-talk is on.")
+        context = prompt.split("Context:\n", 1)[1]
+        self.assertIn("- Voice: Push-to-talk is on.", context)
+        self.assertNotIn("- Voice:", build_system_prompt(config))
+        self.assertIn("Never claim to be always listening", OPERATING_RULES)
+        self.assertIn("Never claim to be always listening", prompt)
 
     def test_conversation_trims_and_summarises(self):
         conversation = jarvis.Conversation(max_turns=2)
@@ -548,7 +575,7 @@ class DeveloperModeAgentTests(AgentTestCase):
                                  make_status_error(groq.AuthenticationError, 401, "bad key")])
         result = self.run_groups(client, {"core", "developer"})
         self.assertEqual(result.status, "incomplete")
-        self.assertEqual(result.rounds, 2)
+        self.assertEqual(result.rounds, 1)  # rounds completed: the second call failed
         self.assertTrue(result.text.startswith("I couldn't finish: Groq rejected the API key"))
         self.assertIn("edit_workspace_file on notes.txt: success", result.text)
         self.assertIn("Files were changed", result.text)
@@ -598,6 +625,18 @@ class ToolValidationFlagTests(unittest.TestCase):
         self.assertEqual(ctx.exception.kind, "bad_request")
         self.assertEqual(len(client.calls), 1)
         self.assertTrue(groq_client._tool_validation_flag_supported)
+
+    def test_flag_named_only_beyond_the_shortened_message_is_still_recognised(self):
+        # The user-facing message keeps 200 characters; the option's name comes later in the raw error.
+        message = "Request validation failed: " + "detail " * 40 + "unknown property 'disable_tool_validation'"
+        error = make_status_error(groq.BadRequestError, 400, message, body={"error": {"message": message}})
+        self.assertNotIn("disable_tool_validation", str(jarvis.classify_api_error(error)))
+        client = FakeGroqClient([error, response("ok")])
+        self.assertEqual(jarvis.call_model(client, "m", [], self.TOOLS, sleep=lambda s: None).choices[0].message.content,
+                         "ok")
+        self.assertIn("disable_tool_validation", client.calls[0])
+        self.assertNotIn("disable_tool_validation", client.calls[1])
+        self.assertFalse(groq_client._tool_validation_flag_supported)  # setUp's cleanup restores it
 
     def test_flag_error_without_the_flag_is_raised_not_looped(self):
         groq_client._tool_validation_flag_supported = False

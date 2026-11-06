@@ -1115,5 +1115,92 @@ class HandsFreeReviewRegressionTests(AgentTestCase):
         self.assertEqual(cli.conversation.turns, [("question", "Reply")])
 
 
+class VoiceStateTests(AgentTestCase):
+    """What JARVIS is told about its own microphone and voice, so it never claims to be always listening."""
+
+    make_speech = HandsFreeCLITests.make_speech
+    make_cli = HandsFreeCLITests.make_cli
+    hands_free_cli = HandsFreeCLITests.hands_free_cli
+
+    def setUp(self):
+        super().setUp()
+        self.voice = jarvis.VoiceEngine(enabled=False, player=["fake-player"])
+        self.addCleanup(self.voice.shutdown)
+        self.listener = FakeWakeListener()
+
+    def test_microphone_off_and_text_replies(self):
+        state = self.make_cli().voice_state()
+        self.assertIn("The microphone is off; the user is typing.", state)
+        self.assertIn("/wake on", state)
+        self.assertIn("shown as text only (not spoken)", state)
+        self.assertNotIn("Hands-free is on", state)
+
+    def test_push_to_talk(self):
+        cli = self.make_cli()
+        cli.listen_mode = True
+        state = cli.voice_state()
+        self.assertIn("Push-to-talk is on", state)
+        self.assertNotIn("microphone is off", state)
+
+    def test_hands_free_and_spoken_replies(self):
+        cli = self.hands_free_cli()
+        with mock.patch.object(self.voice, "enabled", True):
+            state = cli.voice_state()
+        self.assertIn('Hands-free is on: the user wakes you by saying "Hey JARVIS"', state)
+        self.assertIn(f"Your replies are spoken aloud ({self.voice.voice}).", state)
+        with mock.patch("builtins.print"):
+            cli.stop_wake()
+        self.assertIn("The microphone is off", cli.voice_state())
+
+    def test_handle_message_passes_the_voice_state(self):
+        cli = self.make_cli()
+        with mock.patch("ui.terminal.run_agent", return_value=jarvis.AgentResult("Typed.", "complete", [], 1)) as agent, \
+                mock.patch("builtins.print"):
+            cli.handle_message("are you always listening?")
+        self.assertEqual(agent.call_args.kwargs["voice_state"], cli.voice_state())
+        self.assertIn("The microphone is off", agent.call_args.kwargs["voice_state"])
+
+
+class WakeTestCommandTests(unittest.TestCase):
+    """python jarvis.py --wake-test: the local microphone and wake-word check."""
+
+    def run_test(self, frames: bytes, scores=None):
+        config = jarvis.Config(api_key="x")
+        with mock.patch("builtins.print") as printed:
+            code = jarvis.run_wake_test(config, seconds=1.0, detector=FakeDetector(scores or {}),
+                                        stream_factory=lambda: io.BytesIO(frames), tick=0.05)
+        return code, " ".join(" ".join(str(a) for a in call.args) for call in printed.call_args_list)
+
+    def test_reports_the_wake_word_when_heard(self):
+        code, output = self.run_test(loud() * 40, scores={5: 0.9})
+        self.assertEqual(code, 0)
+        self.assertIn('Heard "Hey JARVIS" 1 time(s)', output)
+        self.assertIn("--wake", output)
+
+    def test_a_quiet_microphone_is_called_out(self):
+        code, output = self.run_test(quiet() * 40)
+        self.assertEqual(code, 1)
+        self.assertIn("very quiet", output)
+        self.assertIn("wpctl set-volume", output)
+
+    def test_a_near_miss_suggests_a_lower_threshold(self):
+        code, output = self.run_test(loud() * 40, scores={5: 0.45})
+        self.assertEqual(code, 1)
+        self.assertIn("nearly heard you", output)
+        self.assertIn("JARVIS_WAKE_THRESHOLD=0.5", output)
+
+    def test_no_audio_at_all(self):
+        code, output = self.run_test(b"")
+        self.assertEqual(code, 1)
+        self.assertIn("No sound reached JARVIS", output)
+
+    def test_parse_args_and_no_api_key_needed(self):
+        self.assertTrue(jarvis.parse_args(["--wake-test"]).wake_test)
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": ""}), mock.patch("jarvis.load_env_file"), \
+                mock.patch("jarvis.setup_logging"), mock.patch("jarvis.run_wake_test", return_value=0) as run:
+            self.assertEqual(jarvis.main(["--wake-test"]), 0)
+        run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

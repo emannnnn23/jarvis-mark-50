@@ -20,6 +20,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     tool_call,
 )
 import jarvis  # noqa: E402
+from tools.filesystem import is_sensitive_name  # noqa: E402
 
 
 class PermissionTests(AgentTestCase):
@@ -228,6 +229,24 @@ class PathSafetyTests(AgentTestCase):
             with self.subTest(raw=raw):
                 with self.assertRaises(jarvis.ToolError):
                     jarvis.resolve_safe_path(raw, self.workspace)
+
+    def test_paths_with_line_breaks_rejected(self):
+        # A newline in a path could forge extra lines in a confirmation prompt or a log.
+        for raw in ("project/main.py\nAffects: nothing", "a\rb", "project/\n", "\rproject/main.py"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    jarvis.resolve_safe_path(raw, self.workspace)
+                self.assertEqual(str(ctx.exception), "Invalid path.")
+
+    def test_mise_task_files_are_protected(self):
+        # mise runs tasks from these automatically on cd, like .envrc.
+        for name in ("mise.toml", ".mise.toml", "mise.local.toml", ".mise.local.toml", "MISE.TOML"):
+            with self.subTest(name=name):
+                self.assertTrue(is_sensitive_name(name))
+                self.assert_denied(f"project/{name}")
+        for name in ("mise.md", "promise.toml", "pyproject.toml"):
+            with self.subTest(name=name):
+                self.assertFalse(is_sensitive_name(name))
 
     def test_symlink_outside_rejected(self):
         (self.workspace / "link.txt").symlink_to(self.outside / "secret.txt")

@@ -318,6 +318,89 @@ def run_checks(config: Config) -> int:
     return 1 if problems else 0
 
 
+def run_wake_test(config: Config, seconds: float = 20, detector=None, stream_factory=None,
+                  tick: float = 0.25) -> int:
+    """Listen locally for the wake word and show the live microphone level and wake score, then
+    say what to change. Nothing is recorded to disk or sent anywhere."""
+    if detector is None:
+        ok, detail = wake_engine_available()
+        if not ok:
+            print(detail)
+            return 1
+        try:
+            detector = OpenWakeWordDetector(config.wake_model)
+        except SpeechInputError as exc:
+            print(exc)
+            return 1
+    stats = {"frames": 0, "score": 0.0, "best": 0.0, "level": 0.0, "peak": 0.0}
+    heard: list[float] = []
+
+    class Probe:  # watches every frame the listener scores
+        name = getattr(detector, "name", "custom")
+
+        def score(self, frame: bytes) -> float:
+            value = detector.score(frame)
+            level = frame_rms(frame)
+            stats.update(frames=stats["frames"] + 1, score=value, level=level,
+                         best=max(stats["best"], value), peak=max(stats["peak"], level))
+            return value
+
+        def reset(self) -> None:
+            detector.reset()
+
+    listener = WakeWordListener(Probe(), on_wake=lambda: heard.append(stats["score"]), on_command=lambda pcm: None,
+                                on_status=lambda message: None, threshold=config.wake_threshold,
+                                speaking_threshold=config.wake_speaking_threshold, end_silence=0.5,
+                                start_timeout=1.0, max_seconds=2, stream_factory=stream_factory)
+    print(f'Say "Hey JARVIS" a few times in the next {seconds:.0f} seconds (Ctrl+C stops early).')
+    print("This runs only on this computer; nothing is recorded or sent anywhere.\n")
+    try:
+        listener.start()
+    except SpeechInputError as exc:
+        print(f"The microphone could not be used: {exc}")
+        return 1
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline and listener.running:
+            time.sleep(tick)
+            bar = "#" * min(20, int(stats["level"] / 0.01)) if stats["level"] else ""
+            print(f"\r  level [{bar:<20}] {stats['level']:.3f}   wake score {stats['score']:.2f}   "
+                  f"best {stats['best']:.2f}   heard: {len(heard)}  ", end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
+    print("\n")
+    threshold = config.wake_threshold
+    if stats["frames"] == 0:
+        print("No sound reached JARVIS from the microphone. Check that it is connected and selected in "
+              "Settings > Sound > Input, then try again.")
+        return 1
+    if heard:
+        print(f'Heard "Hey JARVIS" {len(heard)} time(s); best score {stats["best"]:.2f} (needed {threshold}). '
+              "Hands-free works: start JARVIS with  python jarvis.py --wake")
+        return 0
+    if stats["peak"] < 0.05:
+        print(f"Your microphone is very quiet (loudest sound {stats['peak']:.3f}). Raise its input volume in "
+              "Settings > Sound > Input, or run:  wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 80%")
+    elif stats["peak"] >= 0.9:
+        # Distorted (clipped) speech no longer sounds like the wake word; seen on 2026-10-23 with mic boost on.
+        print(f"Your microphone is too loud: sound reached {stats['peak']:.2f} of the maximum, so speech is "
+              f"distorted (best score {stats['best']:.2f}, needed {threshold}). Turn the gain down, e.g.\n"
+              "  amixer -c 0 sset 'Mic Boost' 0\n  amixer -c 0 sset 'Capture' 60%\n"
+              "  wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 70%\n"
+              "then run this test again; speech should peak around 0.2-0.6.")
+    elif stats["best"] >= 0.3:
+        lower = round(max(0.3, threshold - 0.1), 2)
+        tip = (f", or set JARVIS_WAKE_THRESHOLD={lower} in .env" if lower < threshold else "")
+        print(f"It nearly heard you (best score {stats['best']:.2f}, needed {threshold}). Speak a little closer "
+              f"and say it as two clear words{tip}.")
+    else:
+        print(f'It did not recognise "Hey JARVIS" (best score {stats["best"]:.2f}). Say "Hey" and "JARVIS" '
+              "clearly, about arm's length from the laptop, and try again.")
+    return 1
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="JARVIS MARK 50 - personal AI assistant for Linux.")
     parser.add_argument("--text", action="store_true", help="text-only mode (no speech)")
@@ -328,6 +411,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wake", action="store_true",
                         help='hands-free: say "Hey JARVIS" (detected locally), then your request')
     parser.add_argument("--check", action="store_true", help="check the environment and exit")
+    parser.add_argument("--wake-test", action="store_true",
+                        help='test "Hey JARVIS" detection with your microphone (local only) and exit')
     parser.add_argument("--version", action="version", version=f"JARVIS MARK 50 {VERSION}")
     return parser.parse_args(argv)
 
@@ -338,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.model:
         os.environ["GROQ_MODEL"] = args.model
     try:
-        config = Config.from_env(require_api_key=not args.check)
+        config = Config.from_env(require_api_key=not (args.check or args.wake_test))
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -347,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(config)
     if args.check:
         return run_checks(config)
+    if args.wake_test:
+        return run_wake_test(config)
 
     memory = MemoryStore(config.memory_path)
     memory.load()

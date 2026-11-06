@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import ProjectCommand, ProjectRule
-from core.audit import redact
+from core.audit import redact, reveal_invisible
 from core.policy import Permission
 from tools.filesystem import is_sensitive_name, resolve_safe_path
 from tools.linux_system import launch_detached, project_env, run_bounded, run_command
@@ -35,19 +37,77 @@ PROJECT_MARKERS = ("package.json", "Gemfile", "pubspec.yaml", "pyproject.toml", 
 MAX_EDIT_FILE_BYTES = 1_000_000
 MAX_NEW_FILE_CHARS = 200_000
 BACKUPS_KEPT = 200
+# A change must fit on one review screen: nothing the user approves may be hidden from them.
+MAX_REVIEW_LINES = 400
+MAX_REVIEW_LINE_CHARS = 1000
+APPROVALS_KEPT = 32
+_BACKUP_STAMP = re.compile(r"\d{8}-\d{6}-\d{6}")
+# Files that build tools, CI or editors run or obey automatically: a change to one deserves a closer look.
+RUN_BY_TOOLS = ("Makefile", "makefile", "GNUmakefile", "Justfile", "justfile", "package.json", "conftest.py",
+                "setup.py", "pyproject.toml", "tox.ini", "noxfile.py", "Gemfile", "Rakefile", "*.gemspec", "Procfile",
+                "Dockerfile", "docker-compose.yml", "compose.yaml", ".yarnrc", ".yarnrc.yml", ".pre-commit-config.yaml",
+                ".gitlab-ci.yml", ".gitattributes", ".gitmodules", "build.gradle", "pubspec.yaml", "*.sh",
+                ".tool-versions")
+RUN_BY_TOOL_DIRS = frozenset({".github", ".vscode", ".husky", ".devcontainer", ".circleci", "bin", "scripts",
+                              ".mise", "mise"})
 _SINCE = re.compile(r"today|yesterday|\d{1,3} (?:minute|hour|day|week|month|year)s? ago|\d{4}-\d{2}-\d{2}")
 
 
+def _lines(text: str) -> list[str]:
+    """Split only on real newlines. str.splitlines() also splits on form feeds, \\x1c, \\x85 and
+    U+2028, which would hide a change that swaps a newline for one of them."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":  # the newline ending the last line does not start another one
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def unified_diff(old: str, new: str, label: str) -> str:
-    return "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), f"a/{label}", f"b/{label}", lineterm=""))
+    diff = "\n".join(difflib.unified_diff(_lines(old), _lines(new), f"a/{label}", f"b/{label}", lineterm=""))
+    if old != new and not diff:
+        # Only line endings or a trailing newline changed: nothing the user could see to approve.
+        raise ToolError("This change only alters line endings or invisible characters, so it cannot be shown "
+                        "for review. JARVIS will not apply it.")
+    return diff
 
 
 def _sha(data: bytes | str) -> str:
     return hashlib.sha256(data.encode("utf-8") if isinstance(data, str) else data).hexdigest()
 
 
+def check_reviewable(diff: str) -> None:
+    """Refuse a change the user could not fully see before approving it."""
+    lines = diff.split("\n")
+    if len(lines) > MAX_REVIEW_LINES:
+        raise ToolError(f"This change is too large to review in one step ({len(lines)} diff lines; the limit is "
+                        f"{MAX_REVIEW_LINES}). Split it into smaller edits.")
+    longest = max((len(line) for line in lines), default=0)
+    if longest > MAX_REVIEW_LINE_CHARS:
+        raise ToolError(f"A line in this change is {longest} characters long, too long to review on screen "
+                        f"(limit {MAX_REVIEW_LINE_CHARS}). Break it into shorter lines.")
+
+
+def runs_on_tooling(relative: str) -> bool:
+    parts = Path(relative).parts
+    return (any(part in RUN_BY_TOOL_DIRS for part in parts[:-1])
+            or any(fnmatch.fnmatch(parts[-1], pattern) for pattern in RUN_BY_TOOLS))
+
+
+def change_warnings(relative: str, diff: str) -> str:
+    """Extra lines for a confirmation: invisible characters, and files that tools run automatically."""
+    notes = []
+    added = "\n".join(line for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
+    hidden = reveal_invisible(added)[1]  # only what the change adds; context lines are not its doing
+    if hidden:
+        notes.append(f"WARNING: the change contains {hidden} invisible or text-direction character(s), shown "
+                     "as \\u{...}; they can make code read differently from what it does.")
+    if runs_on_tooling(relative):
+        notes.append("Note: build tools, CI or your editor run or obey this file automatically; read the change carefully.")
+    return (" " + " ".join(notes)) if notes else ""
+
+
 def _diff_counts(diff: str) -> tuple[int, int]:
-    lines = diff.splitlines()
+    lines = diff.split("\n")
     added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
     removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
     return added, removed
@@ -81,8 +141,9 @@ def replace_once(text: str, old_text: str, new_text: str) -> str:
     return text.replace(old_text, new_text, 1)
 
 
-def write_text_atomically(target: Path, text: str, mode: int | None = None) -> None:
-    """Write via a temporary file in the same folder and a rename: never a half-written file."""
+def write_text_atomically(target: Path, text: str, mode: int | None = None, exclusive: bool = False) -> None:
+    """Write via a temporary file in the same folder and a rename: never a half-written file.
+    With exclusive=True the file is linked into place only if nothing exists there yet."""
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".jarvis-tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
@@ -91,10 +152,42 @@ def write_text_atomically(target: Path, text: str, mode: int | None = None) -> N
             os.fsync(handle.fileno())
         if mode is not None:
             os.chmod(tmp_name, mode)
-        os.replace(tmp_name, target)
+        if exclusive:
+            try:
+                os.link(tmp_name, target)  # raises FileExistsError if something appeared meanwhile
+            except FileExistsError:
+                raise
+            except OSError:  # a file system without hard links (vfat, exFAT, some FUSE mounts)
+                _write_exclusive(target, text, mode)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+        else:
+            os.replace(tmp_name, target)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+
+
+_GIT_VERSION_OK: bool | None = None
+
+
+def _require_git_config_env() -> None:
+    """The hardening is passed through GIT_CONFIG_COUNT, which git before 2.31 silently ignores."""
+    global _GIT_VERSION_OK
+    if _GIT_VERSION_OK is None:
+        found = re.search(r"(\d+)\.(\d+)", run_command(["git", "version"], timeout=10).stdout)
+        _GIT_VERSION_OK = bool(found) and (int(found[1]), int(found[2])) >= (2, 31)
+    if not _GIT_VERSION_OK:
+        raise ToolError("JARVIS needs git 2.31 or newer to inspect repositories safely; please update git.")
+
+
+def _write_exclusive(target: Path, text: str, mode: int | None) -> None:
+    """Create target only if it does not exist yet, writing it directly."""
+    fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode if mode is not None else 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _walk_source_files(root: Path):
@@ -114,8 +207,11 @@ def command_fits(command: ProjectCommand, project: Path) -> bool:
     if command.detect and not any((project / marker).exists() for marker in command.detect):
         return False
     if command.npm_script:
+        package = project / "package.json"
         try:
-            scripts = json.loads((project / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
+            if project.resolve() not in package.resolve().parents:  # a symlink pointing elsewhere
+                return False
+            scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts") or {}
         except (OSError, ValueError, AttributeError):
             return False
         return isinstance(scripts, dict) and command.npm_script in scripts
@@ -158,26 +254,40 @@ class DeveloperTools:
         Inherited GIT_* variables (GIT_DIR, GIT_WORK_TREE...) could point git elsewhere, so they are
         dropped. The ceiling stops git discovering a repository above the workspace (e.g. a dotfiles
         repo in $HOME), and optional locks off means read-only commands never rewrite the index.
-        Command-line -c settings override repository config, so a hostile repo cannot make these
-        commands run fsmonitor, hooks, filter drivers, pagers or external diff programs."""
+        Settings passed through GIT_CONFIG_COUNT override repository config with the highest
+        priority, and take each key literally, so a hostile repo cannot make these commands run
+        fsmonitor, hooks, filter drivers (whatever their name), pagers, signature programs or
+        network transports such as partial-clone fetches."""
         target = resolve_safe_path(path, self.config.workspace)
         if not target.is_dir():
             raise ToolError(f"{path!r} is not a directory inside {self.config.workspace}.")
+        _require_git_config_env()
         workspace = self.config.workspace.expanduser().resolve()
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_CEILING_DIRECTORIES": str(workspace.parent)})
-        overrides = ["core.fsmonitor=false", "core.untrackedCache=false", "core.hooksPath=/dev/null",
-                     "core.pager=cat", "color.ui=false"]
-        listed = run_command(["git", "-C", str(target), "config", "--includes", "--name-only",
+                    "GIT_CEILING_DIRECTORIES": str(workspace.parent), "GIT_NO_LAZY_FETCH": "1"})
+        overrides = {
+            "core.fsmonitor": "false", "core.untrackedCache": "false", "core.hooksPath": "/dev/null",
+            "core.pager": "cat", "color.ui": "false",
+            "log.showSignature": "false",  # verifying signatures runs the repo's gpg.program
+            "protocol.allow": "never",  # no transports: blocks partial-clone fetches and sshCommand
+        }
+        for scheme in ("file", "ssh", "git", "http", "https", "ext"):  # a repo's protocol.<x>.allow would win otherwise
+            overrides[f"protocol.{scheme}.allow"] = "never"
+        listed = run_command(["git", "-C", str(target), "config", "-z", "--includes", "--name-only",
                               "--get-regexp", r"^filter\."], timeout=10, env=env)
-        for filter_name in {key.rsplit(".", 1)[0] for key in listed.stdout.split()}:
-            overrides += [f"{filter_name}.clean=", f"{filter_name}.smudge=", f"{filter_name}.process=",
-                          f"{filter_name}.required=false"]
-        base = ["git", "--no-pager"]
-        for override in overrides:
-            base += ["-c", override]
-        base += ["-C", str(target)]
+        for key in filter(None, listed.stdout.split("\0")):  # NUL-separated: names may contain any space
+            name = key.rsplit(".", 1)[0]
+            overrides.update({f"{name}.clean": "", f"{name}.smudge": "", f"{name}.process": "",
+                              f"{name}.required": "false"})
+        protocols = run_command(["git", "-C", str(target), "config", "-z", "--includes", "--name-only",
+                                 "--get-regexp", r"^protocol\..*\.allow$"], timeout=10, env=env)
+        for key in filter(None, protocols.stdout.split("\0")):
+            overrides[key] = "never"
+        env["GIT_CONFIG_COUNT"] = str(len(overrides))
+        for index, (key, value) in enumerate(overrides.items()):
+            env[f"GIT_CONFIG_KEY_{index}"], env[f"GIT_CONFIG_VALUE_{index}"] = key, value
+        base = ["git", "--no-pager", "-C", str(target)]
         toplevel = run_command([*base, "rev-parse", "--show-toplevel"], timeout=10, env=env)
         if toplevel.returncode != 0:
             raise ToolError(f"{path!r} is not inside a git repository in the workspace.")
@@ -199,21 +309,22 @@ class DeveloperTools:
         """The full diff of a repository (or one file in it), without protected files, redacted."""
         target, base, env = self._git(path)
         args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"] + (["--cached"] if staged else [])
-        if file:  # a file inside the repository; the same protected-name rules as reading files
-            pathspecs = [str(resolve_safe_path(str(Path(path) / file), self.config.workspace))]
-        else:
-            # Exclude every changed path that read_workspace_file would refuse (case-insensitive names,
-            # protected folders such as .kube), by the protected part of its path.
-            names = run_command([*base, *args, "--name-only", "-z", "--", "."], timeout=20, env=env)
-            if names.returncode != 0:
-                raise ToolError(f"git diff failed: {names.stderr.strip()[:300]}")
-            excluded = set()
-            for name in filter(None, names.stdout.split("\0")):
-                parts = Path(name).parts
-                hit = next((i for i, part in enumerate(parts) if is_sensitive_name(part)), None)
-                if hit is not None:
-                    excluded.add("/".join(parts[:hit + 1]))
-            pathspecs = ["."] + [f":(top,exclude,literal){prefix}" for prefix in sorted(excluded)]
+        # A file (or folder) inside the repository, taken literally (no wildcards), under the same
+        # protected-name rules as reading files; or the whole repository.
+        scope = ([":(literal)" + str(resolve_safe_path(str(Path(path) / file), self.config.workspace))]
+                 if file else ["."])
+        # Exclude every changed path that read_workspace_file would refuse (case-insensitive names,
+        # protected folders such as .kube), by the protected part of its path.
+        names = run_command([*base, *args, "--name-only", "-z", "--", *scope], timeout=20, env=env)
+        if names.returncode != 0:
+            raise ToolError(f"git diff failed: {names.stderr.strip()[:300]}")
+        excluded = set()
+        for name in filter(None, names.stdout.split("\0")):
+            parts = Path(name).parts
+            hit = next((i for i, part in enumerate(parts) if is_sensitive_name(part)), None)
+            if hit is not None:
+                excluded.add("/".join(parts[:hit + 1]))
+        pathspecs = scope + [f":(top,exclude,literal){prefix}" for prefix in sorted(excluded)]
         diff = run_command([*base, *args, "--", *pathspecs], timeout=20, env=env)
         if diff.returncode != 0:
             raise ToolError(f"git diff failed: {diff.stderr.strip()[:300]}")
@@ -231,7 +342,7 @@ class DeveloperTools:
     def inspect_git_history(self, path: str, since: str | None = None, limit: int = 10) -> dict[str, Any]:
         """Recent commits with the files each one changed, e.g. "what did I change today"."""
         target, base, env = self._git(path)
-        args = ["log", "--no-color", "--date=iso-local", f"-n{max(1, min(limit, 50))}", "--name-status",
+        args = ["log", "--no-color", "--no-show-signature", "--date=iso-local", f"-n{max(1, min(limit, 50))}", "--name-status",
                 "--pretty=format:commit %h  %ad  %an%n    %s"]
         if since:
             since = since.strip().lower()
@@ -270,7 +381,15 @@ class DeveloperTools:
             "approved_commands": {kind: [n for n, s in self.config.commands.items()
                                          if s.kind == kind and command_fits(s, target)] for kind in ("tests", "lint")},
         }
-        readme = next((target / n for n in ("README.md", "README.rst", "README.txt", "README") if (target / n).is_file()), None)
+        readme = None
+        for name in ("README.md", "README.rst", "README.txt", "README"):
+            try:  # a README symlinked to a file outside the workspace is never read
+                candidate = resolve_safe_path(str(Path(path) / name), self.config.workspace)
+            except ToolError:
+                continue
+            if candidate.is_file():
+                readme = candidate
+                break
         if readme is not None:
             try:
                 with readme.open("r", encoding="utf-8", errors="replace") as handle:
@@ -283,7 +402,7 @@ class DeveloperTools:
             result["git"] = str(exc)
         else:
             branch = run_command([*base, "rev-parse", "--abbrev-ref", "HEAD"], timeout=10, env=env)
-            recent = run_command([*base, "log", "--no-color", "-n5", "--pretty=format:%h %ad %s", "--date=short"],
+            recent = run_command([*base, "log", "--no-color", "--no-show-signature", "-n5", "--pretty=format:%h %ad %s", "--date=short"],
                                  timeout=15, env=env)
             status = run_command([*base, "status", "--short"], timeout=15, env=env)
             result["git"] = {"branch": branch.stdout.strip() or None,
@@ -330,20 +449,21 @@ class DeveloperTools:
     def _relative(self, target: Path) -> str:
         return str(target.relative_to(self.config.workspace.expanduser().resolve()))
 
-    def _file_git_state(self, target: Path) -> str:
+    def _file_git_state(self, target: Path, backed_up: bool = True) -> str:
         """The file's git situation in plain words, for the confirmation prompt and the result."""
+        backup = "; JARVIS keeps a backup" if backed_up else ""
         try:
             _, base, env = self._git(str(target.parent))
         except ToolError:
-            return "not in a git repository; JARVIS keeps a backup"
+            return "not in a git repository" + backup
         state = run_command([*base, "status", "--porcelain", "--ignored", "--", str(target)],
                             timeout=10, env=env).stdout.strip()
         if not state:
             return "tracked by git, no other uncommitted changes" if target.exists() else "new file"
         if state.startswith("!!"):
-            return "ignored by git; JARVIS keeps a backup"
+            return "ignored by git" + backup
         if state.startswith("??"):
-            return "not yet tracked by git; JARVIS keeps a backup"
+            return "not yet tracked by git" + backup
         return "has other uncommitted changes, which are kept"
 
     def _read_editable(self, target: Path) -> tuple[bytes, str]:
@@ -359,8 +479,32 @@ class DeveloperTools:
         except UnicodeDecodeError:
             raise ToolError(f"{self._relative(target)} is not UTF-8 text, so JARVIS will not edit it.") from None
 
+    def _writable(self, raw_path: str) -> Path:
+        """Where a change may be written: inside the workspace, not protected, not inside any git
+        directory (a bare "*.git" repository's hooks would run on its next git command)."""
+        target = resolve_safe_path(raw_path, self.config.workspace)
+        if any(part.lower().endswith(".git") for part in Path(self._relative(target)).parts[:-1]):
+            raise ToolError(f"{self._relative(target)} is inside a git directory; JARVIS does not write there.")
+        return target
+
+    def _remember_approval(self, key: str, value: tuple[str, str]) -> None:
+        approvals = self.__dict__.setdefault("_approved_changes", {})
+        approvals[key] = value
+        while len(approvals) > APPROVALS_KEPT:  # declined prompts must not pile up
+            approvals.pop(next(iter(approvals)))
+
+    def _take_approval(self, key: str) -> tuple[str, str] | None:
+        return self.__dict__.get("_approved_changes", {}).pop(key, None)
+
+    def _decline_edit(self, args: dict[str, Any]) -> None:
+        """The user said no: forget the approval prepared for this exact edit."""
+        self._take_approval(self._change_key("edit", args["path"], args["old_text"], args["new_text"]))
+
+    def _decline_create(self, args: dict[str, Any]) -> None:
+        self._take_approval(self._change_key("create", args["path"], args["content"]))
+
     def _edit_plan(self, args: dict[str, Any]) -> tuple[Path, bytes, str, str]:
-        target = resolve_safe_path(args["path"], self.config.workspace)
+        target = self._writable(args["path"])
         data, text = self._read_editable(target)
         new_text = replace_once(text, args["old_text"], args["new_text"])
         return target, data, new_text, unified_diff(text, new_text, self._relative(target))
@@ -371,33 +515,53 @@ class DeveloperTools:
 
     def _describe_edit(self, args: dict[str, Any]) -> tuple[str, list[str], str]:
         target, data, new_text, diff = self._edit_plan(args)
+        check_reviewable(diff)
         # Bind the approval to the file exactly as shown: if it changes before the write, nothing is written.
-        self.__dict__.setdefault("_approved_changes", {})[
-            self._change_key("edit", args["path"], args["old_text"], args["new_text"])] = (str(target), _sha(data))
+        self._remember_approval(self._change_key("edit", args["path"], args["old_text"], args["new_text"]),
+                                (str(target), _sha(data)))
         added, removed = _diff_counts(diff)
-        return (f"Edit {self._relative(target)}: {added} line(s) added, {removed} removed "
-                f"({self._file_git_state(target)}).", [str(target)], diff)
+        relative = self._relative(target)
+        return (f"Edit {relative}: {added} line(s) added, {removed} removed ({self._file_git_state(target)})."
+                + change_warnings(relative, diff), [str(target)], diff)
 
     def _backup(self, target: Path, data: bytes) -> Path:
         """Keep the previous version outside the project, so any edit can be undone by hand."""
         root = self.config.backup_dir.expanduser()
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        destination = root / stamp / self._relative(target)
-        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(root, 0o700)
+        stamp = root / dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        stamp.mkdir(mode=0o700, exist_ok=True)
+        destination = stamp / self._relative(target)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.write_bytes(data)
         destination.chmod(0o600)
-        for old in sorted(p for p in root.iterdir() if p.is_dir())[:-BACKUPS_KEPT]:
+        # Prune only JARVIS's own timestamped folders, never anything else in that directory.
+        backups = sorted(p for p in root.iterdir() if p.is_dir() and _BACKUP_STAMP.fullmatch(p.name))
+        for old in backups[:-BACKUPS_KEPT]:
             shutil.rmtree(old, ignore_errors=True)
         return destination
 
     def edit_workspace_file(self, path: str, old_text: str, new_text: str) -> dict[str, Any]:
-        target, data, updated, diff = self._edit_plan({"path": path, "old_text": old_text, "new_text": new_text})
-        approved = self.__dict__.get("_approved_changes", {}).pop(
-            self._change_key("edit", path, old_text, new_text), None)
-        if approved is not None and approved != (str(target), _sha(data)):
-            raise ToolError(f"{self._relative(target)} changed after the edit was approved. Nothing was written; "
+        approved = self._take_approval(self._change_key("edit", path, old_text, new_text))
+        if approved is None:  # writes happen only for a change the user was shown and approved
+            raise ToolError("This edit was not shown to the user for approval, so nothing was written.")
+        changed = ToolError(f"{path} changed after the edit was approved. Nothing was written; "
                             "read the file again and propose the edit afresh.")
+        try:
+            target, data, updated, diff = self._edit_plan({"path": path, "old_text": old_text, "new_text": new_text})
+        except ToolError:
+            target = self._writable(path)
+            try:
+                current = target.read_bytes()
+            except OSError:
+                current = b""
+            if approved != (str(target), _sha(current)):
+                raise changed from None  # the edit no longer fits because the file changed
+            raise
+        # Check the very bytes the new content is built from, so what is written follows what was shown.
+        if approved != (str(target), _sha(data)):
+            raise changed
+        check_reviewable(diff)
         git_state = self._file_git_state(target)
         backup = self._backup(target, data)
         try:
@@ -407,7 +571,7 @@ class DeveloperTools:
         verified = target.read_bytes() == updated.encode("utf-8")
         result: dict[str, Any] = {
             "path": self._relative(target), "applied": True, "verified": verified,
-            "diff": diff[:MAX_DIFF_CHARS], "git": git_state, "backup": str(backup),
+            "diff": redact(diff)[:MAX_DIFF_CHARS], "git": git_state, "backup": str(backup),
             "next_step": "Run the project's tests with run_project_tests to check the change.",
         }
         if not verified:
@@ -415,7 +579,7 @@ class DeveloperTools:
         return result
 
     def _create_plan(self, args: dict[str, Any]) -> tuple[Path, str]:
-        target = resolve_safe_path(args["path"], self.config.workspace)
+        target = self._writable(args["path"])
         if target.exists() or target.is_symlink():
             raise ToolError(f"{self._relative(target)} already exists; use edit_workspace_file to change it.")
         content = args["content"]
@@ -425,23 +589,34 @@ class DeveloperTools:
 
     def _describe_create(self, args: dict[str, Any]) -> tuple[str, list[str], str]:
         target, diff = self._create_plan(args)
-        self.__dict__.setdefault("_approved_changes", {})[
-            self._change_key("create", args["path"], args["content"])] = (str(target), "absent")
-        return (f"Create {self._relative(target)} ({len(args['content'].splitlines())} lines).", [str(target)], diff)
+        check_reviewable(diff)
+        self._remember_approval(self._change_key("create", args["path"], args["content"]), (str(target), "absent"))
+        relative = self._relative(target)
+        return (f"Create {relative} ({len(args['content'].splitlines())} lines)." + change_warnings(relative, diff),
+                [str(target)], diff)
 
     def create_workspace_file(self, path: str, content: str) -> dict[str, Any]:
+        approved = self._take_approval(self._change_key("create", path, content))
+        if approved is None:
+            raise ToolError("This new file was not shown to the user for approval, so nothing was written.")
+        existing = self._writable(path)
+        if existing.exists() or existing.is_symlink():  # someone created it while the prompt was open
+            raise ToolError(f"{self._relative(existing)} appeared while waiting for approval; nothing was overwritten.")
         target, diff = self._create_plan({"path": path, "content": content})
-        approved = self.__dict__.get("_approved_changes", {}).pop(self._change_key("create", path, content), None)
-        if approved is not None and approved[0] != str(target):
+        check_reviewable(diff)
+        if approved[0] != str(target):
             raise ToolError("The target changed after the new file was approved. Nothing was written.")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            write_text_atomically(target, content, mode=0o644)
+            write_text_atomically(target, content, mode=0o644, exclusive=True)
+        except FileExistsError:
+            raise ToolError(f"{self._relative(target)} appeared while waiting for approval; nothing was overwritten.") from None
         except OSError as exc:
             raise ToolError(f"Could not create {self._relative(target)}: {exc.strerror or exc}") from None
         verified = target.read_text(encoding="utf-8") == content
         result: dict[str, Any] = {"path": self._relative(target), "created": True, "verified": verified,
-                                  "diff": diff[:MAX_DIFF_CHARS], "git": self._file_git_state(target),
+                                  "diff": redact(diff)[:MAX_DIFF_CHARS],
+                                  "git": self._file_git_state(target, backed_up=False),
                                   "next_step": "Run the project's tests with run_project_tests to check the change."}
         if not verified:
             result.update(status=STATUS_UNVERIFIED, message="The file was written but its contents could not be confirmed.")

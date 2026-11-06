@@ -372,6 +372,19 @@ class CommandFitsTests(TempDirTestCase):
             finally:
                 (self.project / "package.json").chmod(0o644)
 
+    def test_package_json_symlinked_outside_the_project_is_ignored(self):
+        spec = cmd("npm-test", ["npm", "test"], detect=("package.json",), npm_script="test")
+        elsewhere = self.tmp / "elsewhere.json"
+        elsewhere.write_text(json.dumps({"scripts": {"test": "jest"}}), encoding="utf-8")
+        (self.project / "package.json").symlink_to(elsewhere)
+        self.assertFalse(jarvis.command_fits(spec, self.project))
+        # A link to a file inside the project is still read.
+        (self.project / "package.json").unlink()
+        (self.project / "conf").mkdir()
+        (self.project / "conf" / "package.json").write_text(elsewhere.read_text(), encoding="utf-8")
+        (self.project / "package.json").symlink_to(self.project / "conf" / "package.json")
+        self.assertTrue(jarvis.command_fits(spec, self.project))
+
 
 class ResolveArgvTests(TempDirTestCase):
     def setUp(self):
@@ -954,9 +967,22 @@ def commit_all(repo: Path, message: str, date: str | None = None) -> None:
     git(repo, "commit", "-q", "--allow-empty", "-m", message, **dates)
 
 
+def git_stdin(repo: Path, data: str, *args) -> str:
+    """git() with `data` on standard input (e.g. hash-object --stdin)."""
+    full_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    full_env.update(GIT_IDENTITY)
+    return subprocess.run(["git", "-c", "commit.gpgsign=false", "-C", str(repo), *args], check=True, input=data,
+                          capture_output=True, text=True, env=full_env).stdout
+
+
 def git_calls(spy, subcommand: str) -> list[list[str]]:
     """The argv of every run_command call (seen through a wraps= spy) for one git subcommand."""
     return [call.args[0] for call in spy.call_args_list if subcommand in call.args[0]]
+
+
+def config_overrides(env: dict[str, str]) -> dict[str, str]:
+    """The settings _git passes through GIT_CONFIG_COUNT, GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n."""
+    return {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
 
 
 class DeveloperTestCase(AgentTestCase):
@@ -993,26 +1019,35 @@ class DeveloperTestCase(AgentTestCase):
 class GitHelperTests(DeveloperTestCase):
     def test_returns_folder_hardened_argv_and_clean_env(self):
         repo = self.make_repo()
-        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent"}):
+        inherited = {"GIT_DIR": "/nonexistent", "GIT_WORK_TREE": "/nonexistent",
+                     "GIT_CONFIG_PARAMETERS": "'core.pager'='evil'"}
+        with mock.patch.dict(os.environ, inherited):
             target, base, env = self.tools._git("repo")
         self.assertEqual(target, repo)
-        self.assertEqual(base[:2], ["git", "--no-pager"])
-        self.assertEqual(base[-2:], ["-C", str(repo)])
-        for override in ("core.fsmonitor=false", "core.hooksPath=/dev/null", "core.pager=cat", "color.ui=false"):
-            self.assertIn(override, base)
-        self.assertNotIn("GIT_DIR", env)
-        self.assertNotIn("GIT_WORK_TREE", env)
+        # The hardening travels in the environment, not as -c arguments.
+        self.assertEqual(base, ["git", "--no-pager", "-C", str(repo)])
+        self.assertNotIn("-c", base)
+        overrides = config_overrides(env)
+        for key, value in (("core.fsmonitor", "false"), ("core.untrackedCache", "false"),
+                           ("core.hooksPath", "/dev/null"), ("core.pager", "cat"), ("color.ui", "false"),
+                           ("log.showSignature", "false"), ("protocol.allow", "never")):
+            self.assertEqual(overrides.get(key), value, key)
+        for name in inherited:
+            self.assertNotIn(name, env)
         self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(self.workspace.parent))
 
     def test_repository_filter_drivers_are_neutralised(self):
         repo = self.make_repo()
         git(repo, "config", "filter.evil.clean", "touch PWNED && cat")
-        _, base, _ = self.tools._git("repo")
-        for override in ("filter.evil.clean=", "filter.evil.smudge=", "filter.evil.process=",
-                         "filter.evil.required=false"):
-            self.assertIn(override, base)
+        _, base, env = self.tools._git("repo")
+        self.assertNotIn("-c", base)
+        overrides = config_overrides(env)
+        for key, value in (("filter.evil.clean", ""), ("filter.evil.smudge", ""), ("filter.evil.process", ""),
+                           ("filter.evil.required", "false")):
+            self.assertEqual(overrides.get(key), value, key)
 
     def test_refuses_files_folders_outside_and_non_repositories(self):
         self.make_repo()
@@ -1037,6 +1072,72 @@ class GitHelperTests(DeveloperTestCase):
         helper.assert_called_once_with("repo")
         self.assertEqual(result["status"], "success")
         self.assertIn("## main", result["git_status"])
+
+
+@requires_git
+class HostileRepositoryConfigTests(DeveloperTestCase):
+    """A repository's own .git/config must not make the read-only git tools run any program."""
+
+    def setUp(self):
+        super().setUp()
+        self.marker = self.tmp / "PWNED"
+        self.script = write_script(self.tmp / "hostile-bin" / "hostile", f"touch '{self.marker}'; exit 1")
+
+    def assert_setup_is_hostile(self, repo: Path, *args) -> None:
+        """Plain git with this repository's config does run the program (so the test proves something)."""
+        full_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "--no-pager", "-C", str(repo), *args], capture_output=True, env=full_env, timeout=20)
+        self.assertTrue(self.marker.exists(), f"git {' '.join(args)} did not run the hostile program")
+        self.marker.unlink()
+
+    def assert_nothing_ran(self) -> None:
+        self.assertFalse(self.marker.exists(), "a hostile repository setting ran a program")
+
+    def test_signature_program_never_runs(self):
+        repo = self.make_repo()
+        tree, head = git(repo, "rev-parse", "HEAD^{tree}", "HEAD").split()
+        signature = "-----BEGIN PGP SIGNATURE-----\n \n iQEzBAABCAAdFiEEnotarealsignature\n -----END PGP SIGNATURE-----"
+        commit = (f"tree {tree}\nparent {head}\nauthor Test <test@example.com> 1700000000 +0000\n"
+                  f"committer Test <test@example.com> 1700000000 +0000\ngpgsig {signature}\n\nsigned commit\n")
+        signed = git_stdin(repo, commit, "hash-object", "-t", "commit", "-w", "--stdin").strip()
+        git(repo, "update-ref", "refs/heads/main", signed)
+        git(repo, "config", "log.showSignature", "true")
+        git(repo, "config", "gpg.program", str(self.script))
+        self.assert_setup_is_hostile(repo, "log", "-n1")
+        self.assertIn("signed commit", self.tools.inspect_git_history("repo")["commits"])
+        self.assertIn("signed commit", self.tools.describe_project("repo")["git"]["recent_commits"][0])
+        self.assert_nothing_ran()
+
+    def test_filter_whose_name_contains_a_no_break_space_never_runs(self):
+        repo = self.make_repo()
+        name = "x y"
+        git(repo, "config", f"filter.{name}.clean", f"touch '{self.marker}'; cat")
+        (repo / ".gitattributes").write_text(f"* filter={name}\n", encoding="utf-8")
+        (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+        self.assert_setup_is_hostile(repo, "diff")
+        self.assertEqual(self.tools.inspect_git_status("repo")["status"], "success")
+        self.assertIn("+x = 2", self.tools.inspect_git_diff("repo")["diff"])
+        self.assert_nothing_ran()
+
+    def test_partial_clone_cannot_run_a_transport(self):
+        for label, settings in (
+                ("ssh", {"remote.origin.url": "ssh://jarvis.invalid/repo.git", "core.sshCommand": str(self.script)}),
+                ("local", {"remote.origin.url": str(self.tmp / "origin.git"),
+                           "remote.origin.uploadpack": str(self.script)})):
+            with self.subTest(transport=label):
+                repo = self.make_repo(name=f"repo-{label}")
+                blob = git(repo, "rev-parse", "HEAD:app.py").strip()
+                settings = {"core.repositoryformatversion": "1", "extensions.partialClone": "origin",
+                            "remote.origin.promisor": "true", **settings}
+                for key, value in settings.items():
+                    git(repo, "config", key, value)
+                (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()  # a lazy fetch would fetch it
+                (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+                self.assert_setup_is_hostile(repo, "diff")
+                with contextlib.suppress(jarvis.ToolError):  # the missing blob makes git diff fail
+                    self.tools.inspect_git_diff(f"repo-{label}")
+                self.tools.inspect_git_status(f"repo-{label}")
+                self.assert_nothing_ran()
 
 
 @requires_git
@@ -1086,6 +1187,26 @@ class InspectGitDiffTests(DeveloperTestCase):
                 with self.assertRaises(jarvis.ToolError) as ctx:
                     self.tools.inspect_git_diff("repo", file=bad)
                 self.assertIn("Access denied", str(ctx.exception))
+
+    def test_file_wildcards_are_taken_literally(self):
+        self.write_files(self.repo, {"app.py": "x = 2\n", "other.py": "y = 2\n", ".env": "MODE=two\n"})
+        for pattern in ("*", ".e*", "*.py", "[.]env", "?env"):
+            with self.subTest(file=pattern):
+                result = self.tools.inspect_git_diff("repo", file=pattern)
+                self.assertEqual(result["diff"], "")  # no file has that literal name
+                self.assertNotIn("MODE", json.dumps(result))
+        self.assertIn("+x = 2", self.tools.inspect_git_diff("repo", file="app.py")["diff"])
+
+    def test_folder_file_still_excludes_protected_files_inside_it(self):
+        self.write_files(self.repo, {"sub/code.py": "a = 1\n", "sub/.env": "TOKEN_A=one\n",
+                                     "sub/deep/id_rsa": "key one\n"})
+        commit_all(self.repo, "add sub")
+        self.write_files(self.repo, {"sub/code.py": "a = 2\n", "sub/.env": "TOKEN_A=two\n",
+                                     "sub/deep/id_rsa": "key two\n", "app.py": "x = 2\n"})
+        diff = self.tools.inspect_git_diff("repo", file="sub")["diff"]
+        self.assertIn("+a = 2", diff)
+        for leaked in ("TOKEN_A", "key two", ".env", "id_rsa", "x = 2"):
+            self.assertNotIn(leaked, diff)
 
     def test_staged_shows_only_the_index(self):
         self.write_files(self.repo, {"app.py": "x = 2\n"})
@@ -1241,6 +1362,22 @@ class DescribeProjectTests(DeveloperTestCase):
         self.assertIn("[REDACTED]", result["readme_start"])
         self.assertLessEqual(len(result["readme_start"]), 3000)
         self.assertEqual(result["notice"], jarvis.UNTRUSTED_NOTICE)
+
+    def test_readme_symlinked_outside_the_workspace_is_never_read(self):
+        outside = self.tmp / "private.md"
+        outside.write_text("private notes from outside the workspace\n", encoding="utf-8")
+        (self.project / "README.md").unlink()
+        (self.project / "README.md").symlink_to(outside)
+        result = self.tools.describe_project("shop")
+        self.assertNotIn("readme_start", result)
+        self.assertNotIn("private notes", json.dumps(result))
+
+    def test_readme_inside_the_workspace_is_read_even_through_a_link(self):
+        self.assertTrue(self.tools.describe_project("shop")["readme_start"].startswith("# Shop"))
+        self.write_files(self.project, {"docs/intro.md": "# Intro\n"})
+        (self.project / "README.md").unlink()
+        (self.project / "README.md").symlink_to(self.project / "docs" / "intro.md")
+        self.assertEqual(self.tools.describe_project("shop")["readme_start"], "# Intro\n")
 
     def test_outside_a_repository_git_is_the_error_text(self):
         result = self.tools.describe_project("shop")
@@ -1627,12 +1764,14 @@ class CreateWorkspaceFileTests(DeveloperTestCase):
         self.assertEqual(self.confirm.calls, [])
 
     def test_size_and_nul_limits(self):
+        # Refused at the describe step, before anything could be approved.
         with self.assertRaises(jarvis.ToolError):
-            self.tools.create_workspace_file("nul.txt", "a\x00b")
+            self.tools._describe_create({"path": "nul.txt", "content": "a\x00b"})
         with mock.patch.object(developer, "MAX_NEW_FILE_CHARS", 10):
             with self.assertRaises(jarvis.ToolError) as ctx:
-                self.tools.create_workspace_file("big.txt", "x" * 11)
+                self.tools._describe_create({"path": "big.txt", "content": "x" * 11})
             self.assertIn("at most", str(ctx.exception))
+            self.tools._describe_create({"path": "ok.txt", "content": "x" * 10})
             self.assertTrue(self.tools.create_workspace_file("ok.txt", "x" * 10)["verified"])
         self.assertFalse((self.workspace / "nul.txt").exists())
         self.assertFalse((self.workspace / "big.txt").exists())
@@ -1648,8 +1787,244 @@ class CreateWorkspaceFileTests(DeveloperTestCase):
         self.make_repo()
         result = self.create(path="repo/added.py", content="")
         self.assertEqual(result["status"], "success", result)
-        self.assertEqual(result["result"]["git"], "not yet tracked by git; JARVIS keeps a backup")
+        self.assertEqual(result["result"]["git"], "not yet tracked by git")  # a new file has no backup
         self.assertEqual((self.workspace / "repo" / "added.py").read_text(), "")
+
+
+class ReviewLimitTests(DeveloperTestCase):
+    """A change must fit on one review screen: nothing the user approves may be hidden from them."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.workspace / "app.py"
+        self.target.write_text("x = 1\n", encoding="utf-8")
+
+    def test_check_reviewable_accepts_the_boundaries(self):
+        developer.check_reviewable("")
+        developer.check_reviewable("\n".join(["y" * developer.MAX_REVIEW_LINE_CHARS] * developer.MAX_REVIEW_LINES))
+        for diff, message in (("\n".join(["+a"] * (developer.MAX_REVIEW_LINES + 1)), "too large to review"),
+                              ("+" + "y" * developer.MAX_REVIEW_LINE_CHARS, "too long to review")):
+            with self.subTest(message=message):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    developer.check_reviewable(diff)
+                self.assertIn(message, str(ctx.exception))
+
+    def test_describe_refuses_changes_too_big_to_review(self):
+        many = "".join(f"line {i}\n" for i in range(developer.MAX_REVIEW_LINES))
+        wide = "z" * developer.MAX_REVIEW_LINE_CHARS + "\n"
+        for content, message in ((many, "too large to review"), (wide, "too long to review")):
+            with self.subTest(message=message):
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools._describe_edit({"path": "app.py", "old_text": "x = 1\n", "new_text": content})
+                self.assertIn(message, str(ctx.exception))
+                with self.assertRaises(jarvis.ToolError) as ctx:
+                    self.tools._describe_create({"path": "new.py", "content": content})
+                self.assertIn(message, str(ctx.exception))
+        self.assertEqual(self.tools.__dict__.get("_approved_changes", {}), {})  # nothing approvable was recorded
+
+    def test_through_execute_tool_it_is_a_denial_and_nothing_is_written(self):
+        many = "".join(f"line {i}\n" for i in range(developer.MAX_REVIEW_LINES))
+        edit = self.run_dev_tool("edit_workspace_file", path="app.py", old_text="x = 1\n", new_text=many)
+        create = self.run_dev_tool("create_workspace_file", path="new.py", content="w" * 2000)
+        for result in (edit, create):
+            self.assertEqual(result["status"], "denied")
+            self.assertTrue(result["reason"].startswith("Not done:"), result["reason"])
+        self.assertEqual(self.confirm.calls, [])
+        self.assertEqual(self.target.read_text(), "x = 1\n")
+        self.assertFalse((self.workspace / "new.py").exists())
+
+
+class ChangeWarningTests(DeveloperTestCase):
+    TOOLING = ("Makefile", "package.json", ".github/workflows/x.yml", "bin/run", "scripts/a.py", "x.sh",
+               "proj/lib.gemspec", "proj/Makefile")
+
+    def test_runs_on_tooling(self):
+        for path in self.TOOLING:
+            with self.subTest(path=path):
+                self.assertTrue(developer.runs_on_tooling(path))
+        for path in ("src/app.py", "README.md", "binary/x.py"):
+            with self.subTest(path=path):
+                self.assertFalse(developer.runs_on_tooling(path))
+
+    def test_tooling_note_in_the_confirmation(self):
+        for path in self.TOOLING:
+            with self.subTest(path=path):
+                operation = self.tools._describe_create({"path": path, "content": "all:\n"})[0]
+                self.assertIn("Note: build tools, CI or your editor run or obey this file automatically", operation)
+        self.assertEqual(self.tools._describe_create({"path": "src/app.py", "content": "x = 1\n"})[0],
+                         "Create src/app.py (1 lines).")
+        self.assertEqual(developer.change_warnings("src/app.py", "+x = 1"), "")
+
+    def test_invisible_characters_are_warned_about(self):
+        diff = "+if user == 'admin‮ ⁦':  # ​"
+        warning = developer.change_warnings("src/app.py", diff)
+        self.assertIn("WARNING: the change contains 3 invisible or text-direction character(s)", warning)
+        (self.workspace / "auth.py").write_text("ok = False\n", encoding="utf-8")
+        operation = self.tools._describe_edit({"path": "auth.py", "old_text": "ok = False",
+                                               "new_text": "ok = False  # ‮} ⁦"})[0]
+        self.assertIn("WARNING: the change contains 2 invisible", operation)
+        plain = self.tools._describe_edit({"path": "auth.py", "old_text": "ok = False", "new_text": "ok = True"})[0]
+        self.assertNotIn("WARNING", plain)
+
+
+class WritableTests(DeveloperTestCase):
+    def test_nothing_is_written_inside_a_git_directory(self):
+        self.write_files(self.workspace, {"foo.git/hooks/pre-commit": "#!/bin/sh\n", "Bare.GIT/config": "x = 1\n"})
+        for path in ("foo.git/hooks/pre-commit", "Bare.GIT/config"):
+            with self.subTest(path=path):
+                result = self.run_dev_tool("edit_workspace_file", path=path,
+                                           old_text=(self.workspace / path).read_text(), new_text="touch /tmp/owned\n")
+                self.assertEqual(result["status"], "denied")
+                self.assertIn("inside a git directory", result["reason"])
+        for path in ("foo.git/hooks/post-checkout", "other.Git/hooks/pre-push"):
+            with self.subTest(path=path):
+                result = self.run_dev_tool("create_workspace_file", path=path, content="touch /tmp/owned\n")
+                self.assertEqual(result["status"], "denied")
+                self.assertIn("inside a git directory", result["reason"])
+                self.assertFalse((self.workspace / path).exists())
+        self.assertEqual(self.confirm.calls, [])
+        self.assertEqual((self.workspace / "foo.git/hooks/pre-commit").read_text(), "#!/bin/sh\n")
+        # A file merely named like a repository is fine.
+        self.assertEqual(self.run_dev_tool("create_workspace_file", path="docs/notes.git", content="x\n")["status"],
+                         "success")
+
+
+class ApprovalTests(DeveloperTestCase):
+    """The edit and create handlers write only a change the describe step showed to the user."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.workspace / "calc.py"
+        self.target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+
+    def approvals(self) -> dict:
+        return self.tools.__dict__.get("_approved_changes", {})
+
+    def test_handlers_refuse_without_an_approval(self):
+        with self.assertRaises(jarvis.ToolError) as ctx:
+            self.tools.edit_workspace_file("calc.py", "return a - b", "return a + b")
+        self.assertIn("was not shown to the user for approval", str(ctx.exception))
+        with self.assertRaises(jarvis.ToolError) as ctx:
+            self.tools.create_workspace_file("new.py", "x = 1\n")
+        self.assertIn("was not shown to the user for approval", str(ctx.exception))
+        self.assertIn("return a - b", self.target.read_text())
+        self.assertFalse((self.workspace / "new.py").exists())
+
+    def test_an_approval_is_used_once_and_only_for_the_exact_change(self):
+        self.tools._describe_edit({"path": "calc.py", "old_text": "return a - b", "new_text": "return a + b"})
+        with self.assertRaises(jarvis.ToolError):  # a different change than the one shown
+            self.tools.edit_workspace_file("calc.py", "return a - b", "return a * b")
+        self.assertTrue(self.tools.edit_workspace_file("calc.py", "return a - b", "return a + b")["applied"])
+        self.target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+        with self.assertRaises(jarvis.ToolError) as ctx:  # the approval was consumed
+            self.tools.edit_workspace_file("calc.py", "return a - b", "return a + b")
+        self.assertIn("not shown to the user", str(ctx.exception))
+
+    def test_declined_prompts_write_nothing(self):
+        self.confirm.answer = False
+        edit = self.run_dev_tool("edit_workspace_file", path="calc.py", old_text="return a - b", new_text="return a + b")
+        create = self.run_dev_tool("create_workspace_file", path="new.py", content="x = 1\n")
+        self.assertEqual((edit["status"], create["status"]), ("denied", "denied"))
+        self.assertEqual(len(self.confirm.calls), 2)
+        self.assertIn("return a - b", self.target.read_text())
+        self.assertFalse((self.workspace / "new.py").exists())
+
+    def test_approvals_are_capped_oldest_first(self):
+        for number in range(developer.APPROVALS_KEPT + 3):
+            self.tools._describe_create({"path": "new.py", "content": f"n = {number}\n"})
+        self.assertEqual(len(self.approvals()), developer.APPROVALS_KEPT)
+        for number in range(3):
+            with self.assertRaises(jarvis.ToolError):
+                self.tools.create_workspace_file("new.py", f"n = {number}\n")
+        self.assertTrue(self.tools.create_workspace_file("new.py", "n = 3\n")["created"])
+
+    def test_file_changed_after_approval_is_reported_as_such_even_when_old_text_is_gone(self):
+        def approve_then_rewrite(request):
+            self.target.write_text("def add(a, b):\n    return b + a  # the user fixed it meanwhile\n", encoding="utf-8")
+            return True
+
+        self.policy.confirm = approve_then_rewrite
+        result = self.run_dev_tool("edit_workspace_file", path="calc.py", old_text="return a - b", new_text="return a + b")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("changed after the edit was approved", result["error"])
+        self.assertIn("the user fixed it meanwhile", self.target.read_text())
+
+    def test_result_diffs_are_redacted(self):
+        key = "gsk_" + "C" * 40
+        self.target.write_text(f"KEY = '{key}'\ndef add(a, b):\n    return a - b\n", encoding="utf-8")
+        edit = self.run_dev_tool("edit_workspace_file", path="calc.py", old_text="return a - b", new_text="return a + b")
+        create = self.run_dev_tool("create_workspace_file", path="new.py", content=f"KEY = '{key}'\nx = 1\n")
+        for result in (edit, create):
+            self.assertEqual(result["status"], "success", result)
+            self.assertNotIn(key, json.dumps(result))
+            self.assertIn("[REDACTED]", result["result"]["diff"])
+
+    def test_create_never_overwrites_a_file_that_appeared_after_approval(self):
+        new = self.workspace / "new.py"
+
+        def approve_then_create(request):
+            new.write_text("the user's own file\n", encoding="utf-8")
+            return True
+
+        self.policy.confirm = approve_then_create
+        result = self.run_dev_tool("create_workspace_file", path="new.py", content="generated\n")
+        self.assertEqual(new.read_text(), "the user's own file\n")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("appeared", result["error"])
+        self.assertNotIn("use edit_workspace_file", result["error"])
+
+    def test_create_write_is_exclusive(self):
+        # The file appears in the last moment, after every check: the write itself must not replace it.
+        new = self.workspace / "new.py"
+        real_write = developer.write_text_atomically
+
+        def racing_write(target, text, **kwargs):
+            new.write_text("the user's own file\n", encoding="utf-8")
+            return real_write(target, text, **kwargs)
+
+        self.tools._describe_create({"path": "new.py", "content": "generated\n"})
+        with mock.patch.object(developer, "write_text_atomically", side_effect=racing_write):
+            with self.assertRaises(jarvis.ToolError) as ctx:
+                self.tools.create_workspace_file("new.py", "generated\n")
+        self.assertIn("appeared", str(ctx.exception))
+        self.assertEqual(new.read_text(), "the user's own file\n")
+        self.assertEqual(sorted(os.listdir(self.workspace)), ["calc.py", "new.py"])  # no temp file left
+
+
+class BackupTests(DeveloperTestCase):
+    def setUp(self):
+        super().setUp()
+        (self.workspace / "calc.py").write_text("v = 0\n", encoding="utf-8")
+
+    def edit(self, old: str, new: str) -> dict:
+        result = self.run_dev_tool("edit_workspace_file", path="calc.py", old_text=old, new_text=new)
+        self.assertEqual(result["status"], "success", result)
+        return result["result"]
+
+    def test_pruning_removes_only_timestamped_backup_folders(self):
+        root = self.config.backup_dir
+        others = ("my-notes", "2020-01-01", "20200101-000000-0000000", "20200101-000000-00000")
+        for name in others:
+            (root / name).mkdir(parents=True)
+        for number in range(4):
+            (root / f"20200101-00000{number}-000000").mkdir()
+        with mock.patch.object(developer, "BACKUPS_KEPT", 2):
+            self.edit("v = 0", "v = 1")
+        stamps = sorted(p.name for p in root.iterdir() if developer._BACKUP_STAMP.fullmatch(p.name))
+        self.assertEqual(len(stamps), 2)
+        self.assertEqual(stamps[0], "20200101-000003-000000")
+        for name in others:
+            self.assertTrue((root / name).is_dir(), name)
+
+    def test_stamp_folder_is_private(self):
+        previous = os.umask(0o022)
+        try:
+            backup = Path(self.edit("v = 0", "v = 1")["backup"])
+        finally:
+            os.umask(previous)
+        stamp = backup.parent
+        self.assertEqual(stamp.parent, self.config.backup_dir)
+        self.assertEqual(stamp.stat().st_mode & 0o777, 0o700)
 
 
 class DeveloperCatalogTests(DeveloperTestCase):

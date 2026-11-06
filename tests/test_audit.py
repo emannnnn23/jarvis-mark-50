@@ -11,6 +11,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     TempDirTestCase,
 )
 import jarvis  # noqa: E402
+from core.audit import reveal_invisible  # noqa: E402
 
 
 class RedactionTests(unittest.TestCase):
@@ -28,6 +29,18 @@ class RedactionTests(unittest.TestCase):
 
     def test_redact_leaves_normal_text(self):
         self.assertEqual(jarvis.redact("The weather is nice today."), "The weather is nice today.")
+
+
+class RevealInvisibleTests(unittest.TestCase):
+    def test_invisible_and_direction_characters_are_shown_and_counted(self):
+        text = "a\u202eb\u2066c\u200bd\u2028e\ufefff"
+        self.assertEqual(reveal_invisible(text),
+                         ("a\\u{202e}b\\u{2066}c\\u{200b}d\\u{2028}e\\u{feff}f", 5))
+
+    def test_ordinary_text_is_unchanged(self):
+        for text in ("", "plain text", "line one\nline two", "col\tcol", "café ünïcode 日本", "if x == 1:\n\treturn"):
+            with self.subTest(text=text):
+                self.assertEqual(reveal_invisible(text), (text, 0))
 
 
 class AuditLogTests(TempDirTestCase):
