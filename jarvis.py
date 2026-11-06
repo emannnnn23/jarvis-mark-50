@@ -31,6 +31,7 @@ from core.orchestrator import AgentContext
 from core.policy import PermissionPolicy
 from intelligence.groq_client import JarvisAPIError, groq, initialize_client, list_model_ids, verify_model
 from memory.json_store import MemoryStore, MemoryStoreError, load_memory
+from memory.task_store import TaskStore
 from tools.catalog import JarvisTools, build_registry
 from ui.terminal import JarvisCLI, style, terminal_confirm
 from voice.input import GroqTranscriber, RECORDER_INSTALL_HINT, SpeechInput, detect_recorder
@@ -176,6 +177,7 @@ __all__ = [
     "STOP_PHRASES",
     "SpeechInput",
     "SpeechInputError",
+    "TaskStore",
     "Tool",
     "ToolError",
     "ToolRegistry",
@@ -437,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
 
     memory = MemoryStore(config.memory_path)
     memory.load()
+    tasks = TaskStore(config.tasks_path)
+    tasks.load()  # a corrupted task file is reported by the banner, like the memory file
     try:
         client = initialize_client(config)
         verify_model(client, config.model)
@@ -451,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
 
     voice = VoiceEngine(config.voice, enabled=config.tts_enabled and not args.text)
     policy = PermissionPolicy(config.permission_mode, confirm=terminal_confirm)
-    registry = build_registry(JarvisTools(config, memory))
+    registry = build_registry(JarvisTools(config, memory, tasks=tasks))
     speech = SpeechInput(GroqTranscriber(client, config.stt_model, config.stt_language),
                          max_seconds=config.stt_max_seconds)
 
@@ -464,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
             ignore_after_wake=CHIME_IGNORE_SECONDS if config.wake_chime and voice.player else 0.0,
         )
 
-    cli = JarvisCLI(AgentContext(client, config, registry, policy, memory), voice, memory,
+    cli = JarvisCLI(AgentContext(client, config, registry, policy, memory, tasks), voice, memory,
                     speech=speech, listen=config.stt_enabled or args.listen,
                     wake_factory=make_wake_listener, wake=config.wake_enabled or args.wake)
     audit({"event": "session_start", "model": config.model, "permission_mode": config.permission_mode})

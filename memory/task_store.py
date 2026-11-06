@@ -77,6 +77,11 @@ def _normalize_task(item: Any) -> dict[str, Any] | None:
     return task
 
 
+def count_done_steps(task: dict[str, Any]) -> int:
+    """How many of the task's plan steps are finished (done or skipped)."""
+    return sum(1 for step in task["steps"] if step.get("status") in ("done", "skipped"))
+
+
 class TaskStore:
     """JSON-backed task records. Every method returns copies, never the live stored dicts."""
 
@@ -126,8 +131,8 @@ class TaskStore:
         with self._lock:
             if not self.writable:
                 raise TaskStoreError(
-                    f"{self.corruption_error} I won't overwrite it. Repair the file, or reset the "
-                    "task store to back it up and start fresh."
+                    f"{self.corruption_error} I won't overwrite it. Repair the file, or type "
+                    "'/tasks reset' to back it up and start fresh."
                 )
             try:
                 save_memory(self.data, self.path)
@@ -376,20 +381,21 @@ class TaskStore:
                     f"{len(files)} file(s) changed since the last passing run.")
 
     def summary_for_prompt(self, task_id: str) -> str:
-        """A compact description of the task for the model's context, at most MAX_PROMPT_SUMMARY chars."""
+        """A compact description of the task for the model's context, at most MAX_PROMPT_SUMMARY chars.
+
+        What a resume depends on (files changed, last error, last actions) is always kept; the plan
+        is what gets cut when space runs out, unfinished steps first to stay."""
         with self._lock:
             task = self._find(task_id)
             state = task["status"] + (f": {task['paused_reason']}" if task.get("paused_reason") else "")
-            lines = [f"Task {task['id']} ({state}): {task['goal']}"]
-            if task["steps"]:
-                lines.append("Plan:")
-                lines += [f"  {n}. [{s['status']}] {s['text']}" for n, s in enumerate(task["steps"], 1)]
+            head = [f"Task {task['id']} ({state}): {task['goal']}"]
+            tail = []
             if task["files_changed"]:
                 shown = task["files_changed"][:_PROMPT_FILES]
                 more = len(task["files_changed"]) - len(shown)
-                lines.append("Files changed: " + ", ".join(shown) + (f" (+{more} more)" if more else ""))
+                tail.append("Files changed: " + ", ".join(shown) + (f" (+{more} more)" if more else ""))
             if task["last_error"]:
-                lines.append(f"Last error: {task['last_error']}")
+                tail.append(f"Last error: {task['last_error']}")
             if task["actions"]:
                 parts = []
                 for a in task["actions"][-_PROMPT_ACTIONS:]:
@@ -397,8 +403,31 @@ class TaskStore:
                     if "passed" in a:
                         part += " (tests passed)" if a["passed"] else " (tests failed)"
                     parts.append(part)
-                lines.append("Last actions: " + "; ".join(parts))
-            text = "\n".join(lines)
-            if len(text) > MAX_PROMPT_SUMMARY:
+                tail.append("Last actions: " + "; ".join(parts))
+            plan = self._plan_lines(task["steps"], MAX_PROMPT_SUMMARY - len("\n".join(head + tail)) - 1)
+            text = "\n".join(head + plan + tail)
+            if len(text) > MAX_PROMPT_SUMMARY:  # only if the tail alone is too long
                 text = text[:MAX_PROMPT_SUMMARY - 3] + "..."
             return text
+
+    @staticmethod
+    def _plan_lines(steps: list[dict[str, Any]], budget: int) -> list[str]:
+        """The plan as prompt lines within `budget` characters (newlines included); unfinished steps
+        are kept before finished ones, and the steps left out are counted."""
+        if not steps:
+            return []
+        lines = [f"  {n}. [{s['status']}] {s['text']}" for n, s in enumerate(steps, 1)]
+        header = "Plan:"
+        if budget >= len(header) + 1 + sum(len(line) + 1 for line in lines):
+            return [header, *lines]
+        budget -= len(header) + 1 + len("  ... (999 more steps not shown)") + 1  # room for the note
+        order = sorted(range(len(steps)), key=lambda i: steps[i]["status"] in ("done", "skipped"))  # stable
+        keep = set()
+        for i in order:
+            if len(lines[i]) + 1 > budget:
+                break
+            budget -= len(lines[i]) + 1
+            keep.add(i)
+        hidden = len(steps) - len(keep)
+        shown = [lines[i] for i in range(len(steps)) if i in keep]
+        return [header, *shown, f"  ... ({hidden} more step{'s' if hidden != 1 else ''} not shown)"]

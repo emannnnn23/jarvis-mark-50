@@ -123,6 +123,7 @@ class CorruptionTests(TaskStoreTestCase):
         with self.assertRaises(TaskStoreError) as caught:
             store.start("New goal")
         self.assertIn("won't overwrite", str(caught.exception))
+        self.assertIn("/tasks reset", str(caught.exception))
         with self.assertRaises(TaskStoreError):
             store.save()
         self.assertEqual(self.path.read_bytes(), original)
@@ -476,6 +477,31 @@ class PromptSummaryTests(TaskStoreTestCase):
         text = self.store.summary_for_prompt(task["id"])
         self.assertLessEqual(len(text), 1500)
         self.assertTrue(text.startswith(f"Task {task['id']} (active): "))
+
+    def test_resume_facts_survive_the_cap_and_the_plan_is_truncated_first(self):
+        task = self.store.start("g" * 300, steps=[f"{i} " + "s" * 190 for i in range(40)])
+        tid = task["id"]
+        for i in range(12):
+            self.store.record_action(tid, edit(f"{'d' * 60}{i}.py"))
+        self.store.record_error(tid, "e" * 300)
+        text = self.store.summary_for_prompt(tid)
+        self.assertLessEqual(len(text), 1500)
+        self.assertIn("Files changed: ", text)
+        self.assertIn("(+2 more)", text)
+        self.assertIn("Last error: " + "e" * 300, text)
+        self.assertIn("Last actions: ", text)
+        self.assertIn("edit_workspace_file on ", text.splitlines()[-1])
+        self.assertIn("more step", text)  # the omitted plan lines are counted, not silently lost
+
+    def test_unfinished_steps_are_kept_before_done_ones_when_the_plan_is_cut(self):
+        task = self.store.start("Goal", steps=[f"step {i} " + "s" * 150 for i in range(1, 21)])
+        tid = task["id"]
+        for n in range(1, 16):
+            self.store.set_step(tid, n, "done", "ok")
+        text = self.store.summary_for_prompt(tid)
+        self.assertLessEqual(len(text), 1500)
+        self.assertIn("[pending] step 20 ", text)
+        self.assertIn("[pending] step 16 ", text)
 
     def test_many_changed_files_are_abbreviated(self):
         task = self.store.start("Goal")

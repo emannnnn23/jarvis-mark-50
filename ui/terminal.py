@@ -21,12 +21,14 @@ from core.policy import ConfirmationRequest, Permission
 from core.session import Conversation
 from intelligence.groq_client import JarvisAPIError
 from memory.json_store import MemoryStoreError
+from memory.task_store import MAX_TASKS, TaskStoreError, count_done_steps
 from voice.input import SpeechInputError
 from voice.wake import is_stop_phrase
 
 if TYPE_CHECKING:
     from core.orchestrator import AgentContext
     from memory.json_store import MemoryStore
+    from memory.task_store import TaskStore
     from voice.input import SpeechInput
     from voice.output import VoiceEngine
     from voice.wake import WakeWordListener
@@ -87,6 +89,24 @@ def style(text: str, colour: str) -> str:
     return f"\033[{_COLOURS[colour]}m{text}\033[0m"
 
 
+# "continue", "resume" or "carry on", alone, with an optional "Jarvis" before or after.
+_RESUME_PHRASE = re.compile(r"^\W*(?:jarvis\W+)?(?:continue|resume|carry\s+on)(?:\W+jarvis)?\W*$", re.IGNORECASE)
+
+
+def is_resume_phrase(text: str) -> bool:
+    return bool(_RESUME_PHRASE.match(text))
+
+
+def task_topic(task: dict) -> str:
+    """What a task is about, in words: used to tell whether resuming it needs the developer tools."""
+    return " ".join([task["goal"], *(s["text"] for s in task["steps"]), *task["files_changed"]])
+
+
+def resume_prompt(task: dict) -> str:
+    return (f"Continue the unfinished task: {task['goal']}. Check the current state first (files may have "
+            "changed since), then do the remaining steps.")
+
+
 EXIT_WORDS = {"exit", "quit", "/exit", "/quit", "goodbye", "goodbye jarvis", "bye jarvis"}
 
 # Words that mean a request is about code; mentioning a workspace project's name counts too.
@@ -115,6 +135,9 @@ Commands:
   /help              this help             /tools          list tools and permissions
   /memory [query]    show stored memories  /forget <id>    delete a memory (asks first)
   /memory reset      back up a corrupted memory file and start fresh
+  /tasks             list unfinished and recent tasks   /resume [id]    carry on with a task ("continue" works too)
+  /abandon [id]      give a task up        /tasks clear    forget finished and abandoned tasks
+  /tasks reset       back up a corrupted task file and start fresh
   /voice on|off      toggle spoken replies /stop           stop speaking
   /clear             forget this session's conversation context
   /status            show configuration    exit            leave JARVIS
@@ -181,6 +204,10 @@ class JarvisCLI:
         ctx.policy.cancel_requested = lambda: self._interrupt_pending
         if listen:
             self._set_listen(True, quiet=True)
+
+    @property
+    def tasks(self) -> TaskStore | None:
+        return self.ctx.tasks
 
     # -- hands-free ------------------------------------------------------------
     @property
@@ -388,6 +415,25 @@ class JarvisCLI:
             self.last_seen = f"{self._restored_when} ({stamp})" if stamp else self._restored_when
         return restored
 
+    def pause_stale_tasks(self, reason: str = "JARVIS was closed before it finished") -> None:
+        """A task still active outside a request is left over from a session that ended or crashed:
+        pause it, so the model does not act on it until the user says to continue."""
+        if self.tasks is None:
+            return
+        try:
+            for task in self.tasks.unfinished():
+                if task["status"] == "active":
+                    self.tasks.pause(task["id"], reason)
+        except TaskStoreError as exc:
+            log.warning("Could not pause leftover tasks: %s", exc)
+
+    def _describe_task(self, task: dict) -> str:
+        steps = f"{count_done_steps(task)}/{len(task['steps'])} steps done, " if task["steps"] else ""
+        reason = f": {task['paused_reason']}" if task.get("paused_reason") else ""
+        state = f"paused {describe_time_since(task['updated_at'])}{reason}" if task["status"] in ("paused", "active") \
+            else f"{task['status']} {describe_time_since(task['updated_at'])}"
+        return safe_display(f"{task['goal']} ({steps}{state})")
+
     def banner(self) -> None:
         print(style("\nJARVIS MARK 50", "bold") + style(f"  v{VERSION}", "dim"))
         print("Personal AI Assistant")
@@ -405,6 +451,14 @@ class JarvisCLI:
             self.start_wake()
         if not self.listen_mode and not self.hands_free:  # also when --wake was asked for but could not start
             print(style('Microphone off. To talk: /wake on (say "Hey JARVIS") or /listen on (push-to-talk).', "dim"))
+        if self.tasks is not None:
+            if self.tasks.corruption_error:
+                print(style(f"Task warning: {self.tasks.corruption_error} Running without saved tasks; "
+                            "type /tasks reset to back it up and start fresh.", "yellow"))
+            unfinished = self.tasks.unfinished()
+            if unfinished:
+                print(style(f'Unfinished task: {self._describe_task(unfinished[0])}. Say "continue" or type /tasks.',
+                            "yellow"))
         if self.memory.corruption_error:
             print(style(f"Memory warning: {self.memory.corruption_error} Running without saved memory; "
                         "type /memory reset to back it up and start fresh.", "yellow"))
@@ -424,6 +478,16 @@ class JarvisCLI:
             self._show_memory(rest)
         elif command == "/forget":
             self._forget(rest)
+        elif command == "/tasks" and rest == "reset":
+            self._reset_tasks()
+        elif command == "/tasks" and rest == "clear":
+            self._clear_tasks()
+        elif command == "/tasks":
+            self._show_tasks()
+        elif command == "/resume":
+            self._resume_command(rest)
+        elif command == "/abandon":
+            self._abandon(rest)
         elif command == "/voice":
             self._toggle_voice(rest)
         elif command == "/stop":
@@ -456,6 +520,8 @@ class JarvisCLI:
             cfg = self.ctx.config
             for label, value in (("Model", cfg.model), ("Voice", f"{cfg.voice} ({'on' if self.voice.enabled else 'off'})"),
                                  ("Permission mode", self.ctx.policy.mode), ("Memory file", cfg.memory_path),
+                                 ("Task file", f"{cfg.tasks_path} ({len(self.tasks.unfinished()) if self.tasks else 0} "
+                                               "unfinished)"),
                                  ("Workspace", cfg.workspace), ("Notes", cfg.notes_dir), ("Logs", cfg.log_dir),
                                  ("Max tool rounds", f"{cfg.max_tool_rounds} ({cfg.max_dev_tool_rounds} with developer tools)"),
                                  ("Developer tools", "on" if self.developer_mode else
@@ -510,6 +576,114 @@ class JarvisCLI:
         except (OSError, MemoryStoreError) as exc:
             print(f"  Could not reset memory: {exc}")
 
+    # -- tasks -----------------------------------------------------------------
+    def _tasks_available(self) -> bool:
+        if self.tasks is None:
+            print("  Task tracking is not available in this session.")
+        return self.tasks is not None
+
+    def _show_tasks(self) -> None:
+        if not self._tasks_available():
+            return
+        if self.tasks.corruption_error:
+            print(style(f"  {self.tasks.corruption_error} Type /tasks reset to back it up and start fresh.", "yellow"))
+        unfinished = self.tasks.unfinished()
+        finished = [t for t in self.tasks.recent(10) if t["status"] not in ("active", "paused")]
+        if not unfinished and not finished:
+            print("  No tasks yet.")
+            return
+        if unfinished:
+            print("  Unfinished (say \"continue\", or /resume <id>):")
+            for task in unfinished:
+                print(f"    [{task['id']}] {self._describe_task(task)}")
+        if finished:
+            print("  Recent:")
+            for task in finished:
+                print(f"    [{task['id']}] {self._describe_task(task)}")
+
+    def _pick_task(self, task_id: str, verb: str) -> dict | None:
+        """The task named by `task_id`, or the most recent unfinished one when no id was given."""
+        if task_id:
+            task = self.tasks.get(task_id)
+            if task is None:
+                print(f"  No task with id {safe_display(task_id)!r}. /tasks lists them.")
+            return task
+        unfinished = self.tasks.unfinished()
+        if not unfinished:
+            print(f"  There is no unfinished task to {verb}.")
+            return None
+        return unfinished[0]
+
+    def _resume_command(self, task_id: str) -> None:
+        if not self._tasks_available():
+            return
+        task = self._pick_task(task_id, "resume")
+        if task is None:
+            return
+        prompt = self._resume_task(task)
+        if prompt:
+            self._run_message(prompt, topic=task_topic(task))
+
+    def _resume_task(self, task: dict) -> str | None:
+        """Make the task active again. Returns the message to send the model, or None if it cannot resume."""
+        try:
+            task = self.tasks.resume(task["id"])
+        except TaskStoreError as exc:
+            print(f"  {exc}")
+            return None
+        print(style(f"  Resuming: {safe_display(task['goal'])}", "dim"))
+        return resume_prompt(task)
+
+    def _abandon(self, task_id: str) -> None:
+        if not self._tasks_available():
+            return
+        if not task_id:
+            task = self.tasks.active()
+            task = task or next(iter(self.tasks.unfinished()), None)
+            if task is None:
+                print("  There is no unfinished task to abandon.")
+                return
+        else:
+            task = self._pick_task(task_id, "abandon")
+            if task is None:
+                return
+        try:
+            task = self.tasks.abandon(task["id"])
+            print(f"  Abandoned: {safe_display(task['goal'])}")
+        except TaskStoreError as exc:
+            print(f"  {exc}")
+
+    def _clear_tasks(self) -> None:
+        if not self._tasks_available():
+            return
+        try:
+            finished = [t for t in self.tasks.recent(MAX_TASKS) if t["status"] in ("done", "abandoned")]
+            for task in finished:
+                self.tasks.forget(task["id"])
+        except TaskStoreError as exc:
+            print(f"  {exc}")
+            return
+        print(f"  Forgot {len(finished)} finished or abandoned task(s)." if finished
+              else "  No finished or abandoned tasks to forget.")
+
+    def _reset_tasks(self) -> None:
+        if not self._tasks_available():
+            return
+        if self.tasks.writable:
+            print("  The task file is healthy; nothing to reset. Use /tasks clear to forget finished tasks.")
+            return
+        request = ConfirmationRequest("tasks_reset", Permission.SENSITIVE_ACTION,
+                                      "Move the corrupted task file aside and start an empty task list",
+                                      [str(self.tasks.path)])
+        if not terminal_confirm(request):
+            print("  Cancelled.")
+            return
+        try:
+            backup = self.tasks.reset_corrupted()
+            print(f"  Done. The old file was kept at {backup}")
+        except (OSError, TaskStoreError) as exc:
+            print(f"  Could not reset tasks: {exc}")
+
     def _toggle_voice(self, arg: str) -> None:
         if arg not in ("on", "off"):
             print(f"  Voice is {'on' if self.voice.enabled else 'off'}. Use /voice on or /voice off.")
@@ -546,19 +720,29 @@ class JarvisCLI:
         except OSError:
             return set()
 
-    def handle_message(self, text: str) -> None:
+    def handle_message(self, text: str, topic: str | None = None) -> None:
+        """`topic` is what the message is about when `text` does not say so (a resume message)."""
         self.voice.stop()
-        self._maybe_enter_developer_mode(text)
+        if self.tasks is not None and is_resume_phrase(text):
+            unfinished = self.tasks.unfinished()  # with nothing to resume, "continue" is an ordinary message
+            if unfinished:
+                prompt = self._resume_task(unfinished[0])
+                if prompt is None:  # the reason was shown
+                    return
+                text, topic = prompt, task_topic(unfinished[0])
+        self._maybe_enter_developer_mode(topic if topic is not None else text)
         print(style("  ...", "dim"))
         try:
             result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
                                on_tool=lambda name: print(style(f"  > {name}", "dim")),
                                on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
                                tool_groups={"core", "developer"} if self.developer_mode else {"core"},
-                               voice_state=self.voice_state(), last_seen=self.last_seen)
+                               voice_state=self.voice_state(), last_seen=self.last_seen,
+                               on_progress=lambda message: print(style(f"  {safe_display(message)}", "dim")))
         except KeyboardInterrupt:
             self._consume_interrupt()  # a wake-word interruption is fully handled here
             print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))
+            self._pause_active_task("interrupted by the user")
             return
         except JarvisAPIError as exc:
             log.warning("API error (%s): %s", exc.kind, exc)
@@ -573,14 +757,30 @@ class JarvisCLI:
             self.memory.add_conversation(text, result.text)
         self.say(reply)
 
-    def _run_message(self, line: str) -> None:
+    def _pause_active_task(self, reason: str) -> None:
+        if self.tasks is None:
+            return
+        try:
+            task = self.tasks.active()
+            if task is not None:
+                self.tasks.pause(task["id"], reason)
+                print(style(f"  Task paused: {safe_display(task['goal'])}. Say \"continue\" to pick it up again.",
+                            "dim"))
+        except TaskStoreError as exc:
+            log.warning("Could not pause the task: %s", exc)
+
+    def _run_message(self, line: str, topic: str | None = None) -> None:
         """handle_message, marked busy so the wake word can interrupt it."""
         with self._busy_scope():
-            self.handle_message(line)
+            if topic is None:
+                self.handle_message(line)
+            else:
+                self.handle_message(line, topic)
 
     def loop(self) -> int:
         try:
             self.restore_conversation()
+            self.pause_stale_tasks()
             self.banner()
             self.say(greeting())
             while True:
@@ -593,6 +793,7 @@ class JarvisCLI:
                         print(style("\n  Cancelled.", "yellow"))
         finally:
             self.stop_wake()
+            self.pause_stale_tasks("the session ended before it finished")
 
     def _step(self) -> bool:
         """Read and handle one input. Returns True when the user wants to leave."""
