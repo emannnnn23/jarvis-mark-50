@@ -1,6 +1,6 @@
 # JARVIS MARK 50
 
-JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python as a set of small packages (see [Project layout](#project-layout)) and started with `python jarvis.py`. It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 25 tools that JARVIS defines: web search, the clock, system status (including the battery), a small JSON memory, Markdown notes, launching a fixed list of desktop apps, and, inside one workspace folder, reading files, inspecting git (status, diff, history), searching code, changing or creating text files after you approve the exact diff, and running a project's tests or linter with a command you approved in `config/permissions.toml`. The 10 code tools are offered only in [developer mode](#developer-mode), which switches on when you ask about code. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell and never writes a command line: it can only pick an approved command by name. It cannot install software, delete or rename files, or commit or push. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
+JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python as a set of small packages (see [Project layout](#project-layout)) and started with `python jarvis.py`. It sends your requests to a Groq-hosted language model (default `openai/gpt-oss-120b`). The model can call 26 tools that JARVIS defines: web search, the clock, system status (including the battery), a small JSON memory, a saved plan for multi-step jobs, Markdown notes, launching a fixed list of desktop apps, and, inside one workspace folder, reading files, inspecting git (status, diff, history), searching code, changing or creating text files after you approve the exact diff, and running a project's tests or linter with a command you approved in `config/permissions.toml`. The 10 code tools are offered only in [developer mode](#developer-mode), which switches on when you ask about code. Every tool call is checked against a permission policy that the model cannot change. Replies are printed and can also be spoken in a British voice. You type your messages, or speak them with opt-in push-to-talk or an opt-in hands-free mode that wakes on "Hey JARVIS". The model has no shell and never writes a command line: it can only pick an approved command by name. It cannot install software, delete or rename files, or commit or push. Think of it as a careful tool-using chat assistant with a JARVIS-style persona. It is not an autonomous agent.
 
 - Version: 1.0.0 (`python jarvis.py --version`)
 - Target: Zorin OS 18 (Ubuntu 24.04 "noble" base), Python 3.12. Requires Python 3.10 or newer.
@@ -58,6 +58,7 @@ Permission classes: **R** = read-only, **C** = controlled action, **S** = sensit
 | | `update_fact` | S | | Replaces the text of a fact, by id (shows old and new text before asking). |
 | | `forget_fact` | S | | Permanently deletes a fact, by id. |
 | | `set_user_profile` | C | | Stores your name and/or location. |
+| Tasks | `update_task` | R | | Keeps the plan for a multi-step job: start a task with a goal and steps, change the plan, record a step's status (`done` needs evidence), finish or abandon it. Writes only JARVIS's own task file (see [Multi-step tasks and memory across restarts](#multi-step-tasks-and-memory-across-restarts)). |
 | System | `get_system_status` | R | | Hostname, OS, kernel, uptime, CPU load, memory, disk usage for `/` and home, and the battery (see below). |
 | | `list_processes` | R | | Top processes by CPU or memory (1-25 rows). |
 | | `check_network` | R | | DNS and HTTPS (port 443) reachability of `api.groq.com` and `duckduckgo.com`. |
@@ -89,6 +90,7 @@ Built-in app names for `open_application`: `vscode` (`code`, falls back to `codi
 - Every tool result carries a status (`success`, `error`, `denied`, `partial` or `unverified`). The system prompt tells the model to report that status accurately.
 - Web results and file contents are marked as untrusted data, and the model is told not to follow instructions found inside them.
 - A tool result longer than 10,000 characters is cut short before it is sent to the model.
+- For a job with several steps, the model keeps a saved plan with `update_task`, so an interrupted job can be resumed after a restart (see [Multi-step tasks and memory across restarts](#multi-step-tasks-and-memory-across-restarts)).
 
 ### Developer tools
 
@@ -176,6 +178,7 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_VOICE` | `en-GB-RyanNeural` | An edge-tts voice name (`.venv/bin/edge-tts --list-voices`). |
 | `JARVIS_TTS_ENABLED` | `true` | `true/false`, `1/0`, `yes/no`, `on/off` |
 | `JARVIS_MEMORY_PATH` | `<dir of jarvis.py>/jarvis_memory.json` | Path; `~` is expanded. |
+| `JARVIS_TASKS_PATH` | `<dir of jarvis.py>/jarvis_tasks.json` | Path; `~` is expanded. Where multi-step tasks and their checkpoints are kept (see [Multi-step tasks and memory across restarts](#multi-step-tasks-and-memory-across-restarts)). |
 | `JARVIS_WORKSPACE` | `~/Projects` | Root for the file, project and git tools. |
 | `JARVIS_NOTES_DIR` | `~/Documents/JARVIS Notes` | Where notes are written. |
 | `JARVIS_LOG_DIR` | `$XDG_DATA_HOME/jarvis-mark-50/logs` (normally `~/.local/share/jarvis-mark-50/logs`) | Path. |
@@ -185,6 +188,7 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_SEARCH_LIMIT` | `5` | 1-10. Also caps the model's own `max_results`. |
 | `JARVIS_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 | `JARVIS_HISTORY_TURNS` | `10` | 0-50 recent exchanges sent as context. |
+| `JARVIS_RESTORE_TURNS` | `6` | 0-20 saved exchanges reloaded at startup, so JARVIS remembers the last conversation. `0` starts every session empty. Cannot keep more than `JARVIS_HISTORY_TURNS` (see [Remembering the last conversation](#remembering-the-last-conversation)). |
 | `JARVIS_PERMISSION_MODE` | `standard` | `read_only`, `standard`, `confirm_all` |
 | `JARVIS_EDITOR` | `code` | Command used by `open_project`, split like a shell command (for example `codium` or `code --new-window`). |
 | `JARVIS_SAVE_CONVERSATIONS` | `true` | Keep the bounded conversation log in the memory file. |
@@ -208,7 +212,7 @@ An invalid value, such as a number out of range, an unknown mode, a malformed `J
 
 Free-tier limits are small. On the development account (October 2026), `openai/gpt-oss-120b` allowed 8,000 tokens per minute and 1,000 requests per day; a single tool-using question costs roughly 4,000 tokens, so asking several in quick succession triggers a short wait. JARVIS prints `Groq is rate-limiting requests... Retrying in Ns` while it waits. Check your current limits at https://console.groq.com/settings/limits.
 
-- Every model call sends the tool definitions on top of the system prompt, up to 5 memories and the recent history. Everyday requests send the 15 core tools, about 5,700 characters (roughly 1.4k tokens). In [developer mode](#developer-mode) all 25 are sent, about 11,300 characters (roughly 2.8k tokens), plus a little for each approved project command, because their names are listed in the `run_project_tests` description.
+- Every model call sends the tool definitions on top of the system prompt, up to 5 memories and the recent history. Everyday requests send the 16 core tools, about 7,200 characters (roughly 1.8k tokens). In [developer mode](#developer-mode) all 26 are sent, about 12,700 characters (roughly 3.2k tokens), plus a little for each approved project command, because their names are listed in the `run_project_tests` description.
 - A developer task takes many calls, each resending the growing conversation. The verified bug fix (see [Status](#status--verification)) took 10 rounds and about 3.5 minutes, mostly spent waiting for the per-minute limit.
 - A question that uses tools takes at least two model calls: one to choose the tools and one to answer. Multi-step tasks take more. Startup and `--check` also make one call to list models.
 - A tool-heavy session can therefore use up the daily allowance quickly. To stretch it, lower `JARVIS_HISTORY_TURNS`, or switch to another model with `GROQ_MODEL` or `--model`, since each model has its own quota.
@@ -226,6 +230,11 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | `/tools` | Lists the tools and their permission classes (`create_note` and `run_project_tests` show "depends on arguments"). |
 | `/memory [query]` | Shows the profile and up to 50 stored facts, filtered by the optional query. |
 | `/memory reset` | Only when the memory file is corrupted: backs it up and starts a fresh memory (asks first). |
+| `/tasks` | Lists unfinished tasks, then recently finished or abandoned ones, with their ids (see [Multi-step tasks](#multi-step-tasks-and-memory-across-restarts)). |
+| `/tasks clear` | Forgets all finished and abandoned tasks. Does not ask. |
+| `/tasks reset` | Only when the task file is corrupted: backs it up and starts a fresh task list (asks first). |
+| `/resume [id]` | Picks up a paused task: the one with the given id, or the most recently updated unfinished one. Typing `continue`, `resume` or `carry on` alone does the same. |
+| `/abandon [id]` | Gives up a task: the one with the given id, or else the active or most recent unfinished one. |
 | `/forget <id>` | Deletes one memory (asks first). Ids are shown by `/memory`. |
 | `/voice on` / `/voice off` | Turns spoken replies on or off. |
 | `/stop` | Stops speaking. |
@@ -237,15 +246,15 @@ Talk in plain English: for example "search for the latest Python release", "reme
 | `/dev on` / `/dev off` | Turns [developer mode](#developer-mode) on or off: whether the model is offered the developer tools (files, git, code search, edits, tests). `/dev off` stays off: messages about code no longer switch it back on. `/dev` alone shows the current state. |
 | `/dev auto` | Restores automatic switching (the default): developer mode is off and switches on by itself when a message is about code. |
 | `/clear` | Forgets this session's conversation context. Saved memories are unaffected. |
-| `/status` | Shows the model, voice, permission mode, memory file, workspace, notes, logs, the tool-round limits (for example `8 (14 with developer tools)`), whether developer tools are on, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
+| `/status` | Shows the model, voice, permission mode, memory file, task file (with the number of unfinished tasks), workspace, notes, logs, the tool-round limits (for example `8 (14 with developer tools)`), whether developer tools are on, the speech backend and model with the push-to-talk state, and whether hands-free is on, with the wake model and threshold. |
 | `exit`, `quit`, `goodbye`, `bye jarvis`, Ctrl+D | Leaves JARVIS. |
-| Ctrl+C while JARVIS is working | Cancels the current request. Steps that already finished are not undone. A running project command is stopped, together with everything it started. |
+| Ctrl+C while JARVIS is working | Cancels the current request. Steps that already finished are not undone. A running project command is stopped, together with everything it started. An active task is paused with the reason `interrupted by the user`; say `continue` to pick it up. |
 
 ## Permission system
 
 Each tool has one of three permission classes:
 
-- **Read-only**: looks at things and changes nothing.
+- **Read-only**: looks at things and changes nothing of yours. The one exception is `update_task`, which writes only JARVIS's own task file.
 - **Controlled action**: changes something in a limited, low-risk way, such as opening a browser tab, launching an app, saving a memory, creating a new note, or running a project command you marked as trusted (`confirm = false`).
 - **Sensitive action**: destructive, irreversible or able to run third-party code: changing or deleting a memory, overwriting an existing note, changing or creating a file in the workspace, or running a project's tests or linter (the default, because that runs the project's own code).
 
@@ -268,7 +277,7 @@ How confirmation works:
 - If standard input is not an interactive terminal, operations that need confirmation are denied.
 - A denied operation goes back to the model with status `denied`, and the model is told not to describe it as done.
 
-The permission mode only governs tool calls made by the model. The `/forget` and `/memory reset` commands that you type always ask for confirmation, and they work in `read_only` mode too. The conversation log is also still saved in `read_only` mode (turn it off with `JARVIS_SAVE_CONVERSATIONS=false`).
+The permission mode only governs tool calls made by the model. The `/forget`, `/memory reset` and `/tasks reset` commands that you type always ask for confirmation, and they work in `read_only` mode too. The conversation log is also still saved in `read_only` mode (turn it off with `JARVIS_SAVE_CONVERSATIONS=false`).
 
 ## Filesystem boundaries
 
@@ -420,7 +429,7 @@ confirm = false
 
 ## Developer mode
 
-The 10 developer tools (marked **Dev** in the [tools table](#tools-available-to-the-model)) are offered to the model only in developer mode. Otherwise each request carries only the 15 core tools. The reason is tokens: on the free tier every model call resends the tool definitions, and the developer tools double them, from roughly 1.4k to 2.8k tokens per call (see [Groq usage and limits](#groq-usage-and-limits)).
+The 10 developer tools (marked **Dev** in the [tools table](#tools-available-to-the-model)) are offered to the model only in developer mode. Otherwise each request carries only the 16 core tools. The reason is tokens: on the free tier every model call resends the tool definitions, and the developer tools almost double them, from roughly 1.8k to 3.2k tokens per call (see [Groq usage and limits](#groq-usage-and-limits)).
 
 - **It switches on by itself** for the rest of the session when a message looks like it is about code, and JARVIS prints `(developer tools on for this session; /dev off to hide them)`. A message counts when it contains one of these as a whole word, in any case:
   - code words: code, codebase, source, repo(s), repository, git, diff, commit(s), branch, test(s), testing, lint, linter, bug(s), fix(es), refactor, function, method, class, module, file(s), folder, project(s), build, compile, error, exception, stack trace (or stacktrace), traceback, changed, changes, readme, architecture, implement;
@@ -624,8 +633,66 @@ Developer tasks run for minutes and change files, so failures in the middle are 
 - **Deduplication**: a fact that matches an existing one after ignoring case, extra whitespace and trailing `.`/`!` is not stored twice. JARVIS replies "Already remembered".
 - **Secret refusal**: facts and profile values are refused if they look like credentials. That covers known key formats (Groq `gsk_`, `sk-`, GitHub, Slack, AWS, Google, PEM private keys, Bearer tokens), phrases such as "password is ..." or "token: ...", 13-19 digit numbers that may be card numbers, and long random-looking tokens. This is a heuristic, so false positives are possible.
 - **Context per turn**: up to 5 facts are added to the system prompt with each request, ranked by keyword overlap with your message, then high priority, then most recent. Once 5 or more facts exist, five are always sent even if none match. Your name and location are sent too.
-- **Conversation log**: if `JARVIS_SAVE_CONVERSATIONS=true`, the last 50 exchanges are kept, with each side redacted and cut to 500 characters. The log is a record only and is not sent back to the model.
+- **Conversation log**: if `JARVIS_SAVE_CONVERSATIONS=true`, the last 50 exchanges are kept, with each side redacted and cut to 500 characters. The last `JARVIS_RESTORE_TURNS` exchanges are reloaded at startup (see [Remembering the last conversation](#remembering-the-last-conversation)). The rest of the log is a record only and is not sent back to the model.
 - **Corruption handling**: if the file is not valid JSON or not a JSON object, JARVIS never overwrites it. It starts with an empty memory held only in RAM, shows a warning in the banner and tells the model that memories cannot be saved. You can repair the file by hand, or type `/memory reset`. After you confirm, it renames the broken file to `jarvis_memory.corrupt-YYYYMMDD-HHMMSS.json` and starts a fresh memory.
+
+## Multi-step tasks and memory across restarts
+
+JARVIS keeps a written plan for a job with several steps, so an interruption does not lose it. It also reloads your last few exchanges when it starts. Both survive a restart.
+
+### Plans and progress
+
+- **The plan.** For a job with more than two steps, or any file change, the model is told to call `update_task` first, with a goal and a short plan. It then ticks each step as it finishes it. A step can only be marked `done` with evidence of what was done, such as the file changed or the test result.
+- **Progress lines.** Each time a step changes, JARVIS prints a dimmed line such as `[2/3] Run the tests: done`. The status can also be `in progress`, `pending`, `skipped` or `failed`.
+- **Recorded automatically.** While a task is active, every other tool call is logged on it: the tool, its status, its target, and for test runs whether they passed. The model does not have to remember to do this. Edits made earlier in the same request, before the task was started, are counted too.
+- **One active task.** Starting a task pauses any other active one (reason `another task started`). It is never lost.
+- **Read-only mode.** `update_task` is a read-only tool: it edits only JARVIS's own task file, never your files, memory or desktop. It also works with `--read-only`.
+
+### Pausing and resuming
+
+A task is paused, with the reason stored, when:
+
+- you press Ctrl+C, or say "Hey JARVIS, stop" (or any other wake-word request) while JARVIS is working. The reason is `interrupted by the user`.
+- the round limit is reached. The reason is `reached the limit of N tool rounds`.
+- a model call fails after at least one tool call has run, for example a rate limit that does not clear or a network error. The reason is `the model could not be reached: <error>`. If the call fails before any tool ran, nothing was done and the task is not paused by that request.
+- you quit. The reason is `the session ended before it finished`.
+- JARVIS was closed without a clean exit. At the next start a task still marked active is paused with `JARVIS was closed before it finished`.
+
+At the next start:
+
+- If JARVIS reloaded earlier exchanges, the banner says `Picking up where we left off (last talked 3 hours ago).`
+- If a task is unfinished, the banner says `Unfinished task: <goal> (2/3 steps done, paused 3 hours ago: <reason>). Say "continue" or type /tasks.` It names the most recently updated one. `/tasks` lists all of them.
+- A paused task appears in the model's context only as a note, with a line telling it not to act on it until you say to continue.
+
+To pick a task up:
+
+- Type `continue`, `resume` or `carry on` on its own, optionally with "Jarvis" before or after it. This resumes the most recently updated unfinished task. If there is none, the word is sent as an ordinary message.
+- Or type `/resume` for the same task, or `/resume <id>` for a specific one. Ids are shown by `/tasks`.
+- JARVIS prints `Resuming: <goal>` and sends the model a message that says to check the current state first, because files may have changed, and then do the remaining steps.
+- Approvals are always asked again. Nothing you approved before the interruption carries over, and the permission mode applies as usual.
+- `/abandon` gives up the active task, or else the most recent unfinished one. `/abandon <id>` gives up a specific one. An abandoned task is kept in the list until you clear it.
+
+### Finishing a task
+
+- **Tests must pass after the last change.** Once a task has changed a file (`edit_workspace_file` or `create_workspace_file`), `update_task` refuses to finish it until `run_project_tests` has passed after the last change. The refusal reads `Run the project's tests (run_project_tests) after the last change before finishing: N file(s) changed since the last passing run.` Notes made with `create_note` do not count.
+- **A plan written after untrusted content is flagged.** If the model read web results or file content before it wrote or changed the plan, the task is marked. `/tasks` and the startup banner then add `(plan written after reading web or file content: check it before continuing)`, and the model is told to treat the steps as suggestions, not instructions. Read the plan before you continue. The mark never clears.
+
+### What is stored
+
+- **File**: `jarvis_tasks.json` next to `jarvis.py` (or `JARVIS_TASKS_PATH`). It is created when the first task starts. It is gitignored because it holds personal data, and it is written the same way as the memory file: atomically, with file mode `600`.
+- **Per task**: an id, the goal, your request, the plan with each step's status and evidence, the recorded tool actions (tool, status, target, whether tests passed, time), the files changed, the last error, the pause reason, the plan-flag above and a summary once finished.
+- **Redacted and bounded**: text is redacted for secrets (the same patterns as the memory file), cut to one line and limited in length. A task keeps its newest 200 actions. At most 50 tasks are kept. When there are more, the oldest finished or abandoned ones are dropped first. Unfinished tasks are never dropped.
+- **Context per turn**: the model sees a summary of the current task of at most 1,500 characters: goal, state, plan, files changed, last error and the last five actions. If it has to be cut, the plan is cut first and unfinished steps stay.
+- **Task commands**: `/tasks` lists unfinished tasks, then the recently finished or abandoned ones. `/tasks clear` forgets every finished and abandoned task, without asking. `/status` shows the task file and how many tasks are unfinished. See [In-chat commands](#in-chat-commands).
+- **Corruption handling**: if the file is not valid JSON or has no task list, JARVIS never overwrites it. It starts with no tasks, prints `Task warning: ...` in the banner, and cannot save tasks until you act. You can repair the file by hand, or type `/tasks reset`. After you confirm, it renames the broken file to `jarvis_tasks.corrupt-YYYYMMDD-HHMMSS.json` and starts a fresh list. On a healthy file `/tasks reset` does nothing.
+
+### Remembering the last conversation
+
+- At startup JARVIS reloads the last `JARVIS_RESTORE_TURNS` exchanges (default 6, 0-20) from the conversation log in the memory file, so it knows what you were talking about when you come back. Set it to `0` to start every session empty.
+- It also tells the model when you last spoke. The banner shows that as `Picking up where we left off (last talked ...)`.
+- The usual session limits still apply. A value above `JARVIS_HISTORY_TURNS` cannot keep more than that many exchanges, and older ones become one-line summaries. `/clear` forgets the reloaded exchanges too.
+- Reloaded exchanges are not saved a second time. The log only grows when `JARVIS_SAVE_CONVERSATIONS` is `true`, and it keeps the last 50 exchanges, so a long gap with logging off reloads old ones.
+- Only the text of the exchanges comes back, redacted and cut to 500 characters each side. Tool results do not.
 
 ## Voice
 
@@ -838,6 +905,8 @@ The test suite lives in `tests/`, one file per area:
 | `test_permissions.py` | The permission policy, filesystem boundaries and security hardening |
 | `test_tools.py` | Web search and Linux integration tools |
 | `test_developer.py` | Developer tools (being added) |
+| `test_tasks.py` | The task store and the `update_task` tool |
+| `test_task_integration.py` | Tasks in the agent loop and the terminal |
 | `test_voice_output.py` | Spoken output: text cleanup, the voice engine and the chime |
 | `test_speech_input.py` | Push-to-talk recording and transcription |
 | `test_wake.py` | Hands-free mode, voice interruption and `--wake-test` |
@@ -873,7 +942,7 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 | "... is inside a git directory; JARVIS does not write there" | The path is inside a folder whose name ends in `.git`, such as a bare repository. JARVIS never writes there; make the change yourself if you really mean it. |
 | A reply mentions "Not done: ..." | JARVIS could not prepare the change, so it asked nothing and wrote nothing. The reason follows: `Access denied: ...` (a protected file such as `.env`, or a path outside the workspace), `... already exists; use edit_workspace_file to change it`, `... is not a file; use create_workspace_file for a new one`, `... is larger than 1 MB`, `... looks like a binary file`, `... is not UTF-8 text`, `old_text must not be empty`, `old_text and new_text are identical`, `... is inside a git directory`, `Invalid path.`, `This change is too large to review in one step ...`, or one of the two `old_text` errors above. See [Changing code](#changing-code). |
 | A request about code gets answered without looking at files, or the reply says a tool "is not available right now" | The message contained none of the trigger words, or you typed `/dev off` (which stays off), so the developer tools were not offered. Type `/dev on` and ask again, or `/dev auto` to restore automatic switching. `/status` shows whether developer tools are on. See [Developer mode](#developer-mode). |
-| Developer tasks are slow (minutes), with many "Retrying in Ns" lines | Expected on the free tier: every round resends the tool definitions (about 2.8k tokens in developer mode) and the growing conversation, against a limit of 8,000 tokens per minute. The verified bug fix took about 3.5 minutes. To speed it up: `/clear` before a big task, keep requests focused on one project, `/dev off` for everyday questions afterwards (it stays off until `/dev on` or `/dev auto`), or use a model with a higher limit. If Groq asks for a wait over 60 s, the task stops with a list of the steps already done; ask again to continue from there. |
+| Developer tasks are slow (minutes), with many "Retrying in Ns" lines | Expected on the free tier: every round resends the tool definitions (about 3.2k tokens in developer mode) and the growing conversation, against a limit of 8,000 tokens per minute. The verified bug fix took about 3.5 minutes. To speed it up: `/clear` before a big task, keep requests focused on one project, `/dev off` for everyday questions afterwards (it stays off until `/dev on` or `/dev auto`), or use a model with a higher limit. If Groq asks for a wait over 60 s, the task stops with a list of the steps already done; ask again to continue from there. |
 | "I heard only silence" | The microphone is muted, or the wrong input is selected. Check Settings > Sound > Input (input level and device). `wpctl status` lists the sources and shows the default one. Test outside JARVIS with `arecord -d 3 /tmp/t.wav && aplay /tmp/t.wav`. |
 | "The microphone could not be opened (... busy ...)" | Another program is using the microphone, for example a video call or a browser tab. Close it and try again. |
 | "No microphone recorder found" / "Speech input unavailable" | Run `sudo apt install alsa-utils` (provides `arecord`). `--check` shows which recorder was found. |
@@ -905,7 +974,7 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **Recognition quality depends on the laptop microphone**, its gain and room noise. Push-to-talk transcription has not been tested with a real voice yet, and the one recorded real "Hey Jarvis" failed because the gain was far too high (see [Status](#status--verification)). Check yours with `--wake-test`.
 - **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget, and a multi-step fix (look, test, edit, re-test) takes minutes: the verified one took about 3.5 minutes.
 - **Search returns snippets only.** JARVIS does not open or read the result pages.
-- **Memory of conversations is limited.** Context covers only the current session: the last `JARVIS_HISTORY_TURNS` exchanges, plus one-line summaries of older questions. Tool results are not carried between turns. The saved conversation log is a bounded record and is not fed back to the model.
+- **Memory of conversations is limited.** Context covers the last `JARVIS_HISTORY_TURNS` exchanges, plus one-line summaries of older questions. At startup the last `JARVIS_RESTORE_TURNS` saved exchanges are reloaded (see [Remembering the last conversation](#remembering-the-last-conversation)), but nothing older than the 50 logged exchanges survives a restart. Tool results are not carried between turns.
 - **Tool timeouts cannot kill a hung tool.** Tools run in worker threads, and Python cannot stop a thread. A read-only tool that times out is reported as an error. A state-changing tool that times out is reported as `unverified`, because it may still finish. Pressing Ctrl+C has the same effect: the request is abandoned, but a tool already running may complete. `run_project_tests` is the exception: its command and everything it started are stopped on its own time limit and on cancel.
 - **One replacement per edit call.** `edit_workspace_file` replaces one exact, unique piece of text. A change spread over a file takes several calls and several confirmations, and there is no patch tool.
 - **No delete or rename.** JARVIS cannot delete, move or rename files, and cannot commit or push.
@@ -949,6 +1018,7 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `core/session.py` | The conversation session (recent turns) |
 | `intelligence/groq_client.py` | The Groq provider: client setup, model checks, chat calls and error translation |
 | `memory/json_store.py` | The JSON memory store |
+| `memory/task_store.py` | The task store: multi-step tasks, checkpoints and the finish check |
 | `tools/registry.py` | Tool definitions and groups, argument validation, and running a tool behind the permission policy |
 | `tools/catalog.py` | The tool set and its registration: schemas, permission classes and which tools are developer tools |
 | `tools/linux_system.py` | Time, system status and battery, processes, network, applications, and the bounded command runner |
@@ -957,6 +1027,7 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `tools/browser.py` | Opening web pages and YouTube searches |
 | `tools/developer.py` | Opening projects, git status, diff and history, project overview, code search, file edits and new files with backups, and running approved project commands |
 | `tools/memory_tools.py` | The memory tools |
+| `tools/task_tools.py` | The `update_task` tool |
 | `voice/output.py` | Spoken output: edge-tts and local playback |
 | `voice/input.py` | Push-to-talk recording and Groq Whisper transcription |
 | `voice/wake.py` | Hands-free mode: wake word and voice interruption |
@@ -966,3 +1037,4 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `requirements-wake.txt` | Optional runtime dependencies for the wake-word engine (install `openwakeword` itself with `--no-deps`, see [Hands-free mode](#hands-free-mode-wake-word)) |
 | `.env.example` | Configuration template; copy to `.env` |
 | `jarvis_memory.json` | Your memory file (gitignored; recreated if missing) |
+| `jarvis_tasks.json` | Your multi-step tasks and checkpoints (gitignored; created when the first task starts) |
