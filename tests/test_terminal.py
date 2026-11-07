@@ -9,10 +9,16 @@ from unittest import mock
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     AgentTestCase,
+    BusCaptureMixin,
     FakeGroqClient,
+    FakeMicRecorder,
+    FakeWakeListener,
+    PromptFakeTranscriber,
+    pcm_tone,
     printed_text,
 )
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
 from core.orchestrator import AgentResult  # noqa: E402
 from tools import developer  # noqa: E402
 from ui import terminal  # noqa: E402
@@ -446,6 +452,147 @@ class MicrophoneHintTests(AgentTestCase):
             self.cli._step()
         voice_turn.assert_called_once()
         self.assertNotIn("The microphone is off", printed_text(printed))
+
+
+class TerminalEventTests(BusCaptureMixin, AgentTestCase):
+    """The CLI publishes voice input phases, task progress and notices for Mission Control."""
+
+    def setUp(self):
+        super().setUp()
+        self.voice = jarvis.VoiceEngine(enabled=False, player=["fake-player"])
+        self.addCleanup(self.voice.shutdown)
+        self.listener = FakeWakeListener()
+
+    def make_cli(self, text="what time is it", error=None, config=None):
+        speech = jarvis.SpeechInput(PromptFakeTranscriber(text, error), recorder=FakeMicRecorder(),
+                                    wait_for_stop=lambda: None, notify=lambda message: None)
+        self.addCleanup(speech.shutdown)
+        ctx = jarvis.AgentContext(FakeGroqClient(), config or self.config, self.registry, self.policy, self.memory)
+        with mock.patch("builtins.print"):
+            cli = jarvis.JarvisCLI(ctx, self.voice, self.memory, speech=speech,
+                                   wake_factory=lambda owner: self.listener)
+        self.addCleanup(cli.stop_wake)
+        return cli
+
+    @staticmethod
+    def voice_input(events):
+        return [(e["mode"], e["phase"]) for e in events if e["type"] == "voice.input"]
+
+    def test_cli_voice_input_phases(self):
+        cli = self.make_cli()
+        events = self.capture_events()
+        with mock.patch("builtins.print"):
+            self.assertTrue(cli.start_wake())
+        self.assertEqual(self.voice_input(events), [("wake", "armed")])
+
+        del events[:]
+        with mock.patch.object(self.voice, "stop"), mock.patch.object(self.voice, "chime"):
+            cli._on_wake()
+        self.assertEqual(self.voice_input(events), [("wake", "wake_detected"), ("wake", "collecting")])
+
+        del events[:]
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli._voice_command(pcm_tone(1.0)), "what time is it")
+        self.assertEqual(self.voice_input(events), [("wake", "transcribing"), ("wake", "armed")])
+
+        del events[:]
+        cli._on_status("I didn't hear a command. Say \"Hey JARVIS\" to try again.")
+        self.assertEqual(self.voice_input(events), [("wake", "armed")])
+        self.assertIn("didn't hear", events[0]["message"])
+
+        del events[:]
+        cli._on_status("Hands-free listening stopped: the microphone stream ended.")
+        self.assertEqual(self.voice_input(events), [("off", "stopped")])
+
+        del events[:]
+        with mock.patch("builtins.print"):
+            cli.stop_wake()
+        self.assertEqual(self.voice_input(events), [("off", "stopped")])
+        cli.stop_wake()  # nothing left to stop: nothing published
+        self.assertEqual(len(self.voice_input(events)), 1)
+        self.assert_valid(events)
+
+    def test_failed_transcription_still_returns_to_armed(self):
+        cli = self.make_cli(error=jarvis.JarvisAPIError("down", "network"))
+        with mock.patch("builtins.print"):
+            cli.start_wake()
+        events = self.capture_events()
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli._voice_command(pcm_tone(1.0)), "")
+        self.assertEqual(self.voice_input(events), [("wake", "transcribing"), ("wake", "armed")])
+
+    def test_push_to_talk_phases(self):
+        cli = self.make_cli(text="hello")
+        events = self.capture_events()
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli.voice_turn(), "hello")
+        self.assertEqual(self.voice_input(events), [("ptt", "recording"), ("ptt", "idle")])
+
+        del events[:]
+        cli = self.make_cli(error=jarvis.SpeechInputError("no mic"))
+        with mock.patch("builtins.print"):
+            self.assertEqual(cli.voice_turn(), "")
+        self.assertEqual(self.voice_input(events), [("ptt", "recording"), ("ptt", "idle")])
+        self.assert_valid(events)
+
+    def test_task_progress_is_published_from_run_agent_callback(self):
+        cli = self.make_cli()
+        events = self.capture_events()
+
+        def fake_agent(ctx, text, *args, **kwargs):
+            kwargs["on_progress"]("Step 1 of 2 done: inspect")
+            return AgentResult("Done, Sir.", "complete", [], 1)
+
+        with mock.patch("ui.terminal.run_agent", side_effect=fake_agent), mock.patch("builtins.print") as printed:
+            cli.handle_message("hello")
+        self.assertIn("Step 1 of 2 done", printed_text(printed))
+        progress = [e for e in events if e["type"] == "task.progress"]
+        self.assertEqual([e["message"] for e in progress], ["Step 1 of 2 done: inspect"])
+        self.assert_valid(events)
+
+    def test_developer_mode_auto_switch_publishes_a_notice(self):
+        cli = self.make_cli()
+        events = self.capture_events()
+        with mock.patch("ui.terminal.run_agent", return_value=AgentResult("Done.", "complete", [], 1)), \
+                mock.patch("builtins.print"):
+            cli.handle_message("please fix the failing test in my repo")
+        self.assertTrue(cli.developer_mode)
+        notices = [e for e in events if e["type"] == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["level"], "info")
+        self.assertIn("Developer tools", notices[0]["text"])
+        self.assert_valid(events)
+
+    def test_pausing_a_task_publishes_a_notice(self):
+        tasks = jarvis.TaskStore(self.tmp / "tasks.json")
+        tasks.load()
+        tasks.start("Fix the build", ["inspect"])
+        ctx = jarvis.AgentContext(FakeGroqClient(), self.config, self.registry, self.policy, self.memory, tasks)
+        with mock.patch("builtins.print"):
+            cli = jarvis.JarvisCLI(ctx, self.voice, self.memory)
+        events = self.capture_events()
+        with mock.patch("builtins.print"):
+            self.assertIsNotNone(cli._pause_active_task("interrupted by the user"))
+        notices = [e for e in events if e["type"] == "notice"]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Fix the build", notices[0]["text"])
+        updates = [e for e in events if e["type"] == "task.update"]
+        self.assertEqual(updates[-1]["task"]["status"], "paused")
+        self.assert_valid(events)
+
+    def test_no_events_when_bus_disabled(self):
+        cli = self.make_cli()
+        events = self.capture_events()
+        BUS.enabled = False
+        with mock.patch("builtins.print"), mock.patch.object(self.voice, "stop"), \
+                mock.patch.object(self.voice, "chime"):
+            cli.start_wake()
+            cli._on_wake()
+            cli._voice_command(pcm_tone(1.0))
+            cli._on_status("I didn't hear a command.")
+            cli.voice_turn()
+            cli.stop_wake()
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import unittest
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     AgentTestCase,
+    BusCaptureMixin,
     FakeGroqClient,
     _request,
     make_connection_error,
@@ -16,6 +17,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 )
 import groq  # noqa: E402
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
 from core import orchestrator  # noqa: E402
 from core.context import OPERATING_RULES, build_system_prompt  # noqa: E402
 from intelligence import groq_client  # noqa: E402
@@ -718,6 +720,69 @@ class ToolGroupRegistryTests(unittest.TestCase):
         self.assertEqual(names(registry.schemas({"developer"})), ["dev"])
         self.assertEqual(names(registry.schemas({"core", "developer"})), ["plain", "dev"])
         self.assertEqual(registry.schemas(set()), [])
+
+
+class LlmEventTests(BusCaptureMixin, unittest.TestCase):
+    """call_model publishes each attempt for Mission Control: start, end, then retry or error."""
+
+    @staticmethod
+    def llm(events):
+        return [e for e in events if e["type"].startswith("llm.")]
+
+    def test_llm_events_on_success_retry_and_error(self):
+        events = self.capture_events()
+        ok = response("fine")
+        client = FakeGroqClient([make_connection_error(), ok])
+        self.assertIs(jarvis.call_model(client, "m1", [], sleep=lambda delay: None), ok)
+        llm = self.llm(events)
+        self.assertEqual([(e["type"], e.get("phase"), e.get("ok")) for e in llm], [
+            ("llm.call", "start", None), ("llm.call", "end", False), ("llm.retry", None, None),
+            ("llm.call", "start", None), ("llm.call", "end", True)])
+        self.assertEqual([e["attempt"] for e in llm if e["type"] == "llm.call"], [1, 1, 2, 2])
+        self.assertEqual(llm[1]["error_kind"], "network")
+        self.assertEqual(llm[2]["delay"], 1)
+        self.assertIn("Cannot reach Groq", llm[2]["reason"])
+        self.assertTrue(all(e["model"] == "m1" for e in llm if e["type"] == "llm.call"))
+        self.assertIsInstance(llm[4]["duration_ms"], int)
+        self.assertNotIn("error_kind", llm[4])
+
+        del events[:]
+        client = FakeGroqClient([make_status_error(groq.AuthenticationError, 401, "Invalid API Key")])
+        with self.assertRaises(jarvis.JarvisAPIError):
+            jarvis.call_model(client, "m1", [], sleep=lambda delay: None)
+        llm = self.llm(events)
+        self.assertEqual([(e["type"], e.get("phase")) for e in llm],
+                         [("llm.call", "start"), ("llm.call", "end"), ("llm.error", None)])
+        self.assertEqual((llm[1]["ok"], llm[1]["error_kind"]), (False, "auth"))
+        self.assertEqual((llm[2]["kind"], llm[2]["retryable"]), ("auth", False))
+        self.assertIn("401", llm[2]["message"])
+        self.assert_valid(events)
+
+    def test_error_after_the_last_retry_is_published_once(self):
+        events = self.capture_events()
+        client = FakeGroqClient([make_connection_error() for _ in range(5)])
+        with self.assertRaises(jarvis.JarvisAPIError):
+            jarvis.call_model(client, "m", [], max_retries=1, sleep=lambda delay: None)
+        types = [e["type"] for e in self.llm(events)]
+        self.assertEqual(types.count("llm.error"), 1)
+        self.assertEqual(types.count("llm.retry"), 1)
+        self.assertEqual(types[-1], "llm.error")
+        self.assert_valid(events)
+
+    def test_long_rate_limit_wait_publishes_error_not_retry(self):
+        events = self.capture_events()
+        client = FakeGroqClient([make_status_error(groq.RateLimitError, 429, "slow", headers={"retry-after": "500"})])
+        with self.assertRaises(jarvis.JarvisAPIError):
+            jarvis.call_model(client, "m", [], sleep=lambda delay: None)
+        types = [e["type"] for e in self.llm(events)]
+        self.assertNotIn("llm.retry", types)
+        self.assertEqual(types[-1], "llm.error")
+
+    def test_no_llm_events_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        jarvis.call_model(FakeGroqClient([response("fine")]), "m", [])
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

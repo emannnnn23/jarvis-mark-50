@@ -16,6 +16,7 @@ from unittest import mock
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     AgentTestCase,
+    BusCaptureMixin,
     FAKE_KEY,
     FakeDetector,
     FakeGroqClient,
@@ -32,6 +33,8 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     quiet,
 )
 import jarvis  # noqa: E402
+import time  # noqa: E402
+from core.events import BUS  # noqa: E402
 
 
 class WakeConfigTests(unittest.TestCase):
@@ -1200,6 +1203,83 @@ class WakeTestCommandTests(unittest.TestCase):
                 mock.patch("jarvis.setup_logging"), mock.patch("jarvis.run_wake_test", return_value=0) as run:
             self.assertEqual(jarvis.main(["--wake-test"]), 0)
         run.assert_called_once()
+
+
+class WakeLevelTests(BusCaptureMixin, TempDirTestCase):
+    """The listener hands its microphone level to on_level, and publish_voice_level throttles it for the bus."""
+
+    make_listener = WakeWordListenerTests.make_listener
+    run_to_end = WakeWordListenerTests.run_to_end
+    kinds = WakeWordListenerTests.kinds
+
+    def make_level_listener(self, frames, detector=None, on_level=None, **kwargs):
+        self.levels: list[tuple[str, float]] = []
+        return self.make_listener(
+            frames, detector, on_level=on_level or (lambda phase, rms: self.levels.append((phase, rms))), **kwargs)
+
+    def test_on_level_reports_armed_and_collecting_frames(self):
+        frames = [quiet(1), loud(2), loud(3), quiet(4), quiet(5), quiet(6), quiet(7)]
+        listener = self.make_level_listener(frames, FakeDetector({1: 0.9}))
+        self.run_to_end(listener)
+        phases = [phase for phase, _ in self.levels]
+        # two scored frames (the second wakes), four collected, then the cooldown frame is armed again
+        self.assertEqual(phases, ["armed", "armed"] + ["collecting"] * 4 + ["armed"])
+        self.assertTrue(all(0.0 <= rms <= 1.0 for _, rms in self.levels))
+        self.assertGreater(self.levels[1][1], 0.1)  # the loud wake frame
+        self.assertLess(self.levels[0][1], 0.01)  # the quiet one
+
+    def test_broken_on_level_never_stops_the_listener(self):
+        def broken(phase, rms):
+            raise RuntimeError("meter exploded")
+
+        frames = [quiet(1), loud(99), loud(1), loud(2), quiet(5), quiet(6), quiet(7), quiet(8)]
+        listener = self.make_level_listener(frames, FakeDetector({1: 0.9}), on_level=broken)
+        self.run_to_end(listener)
+        self.assertEqual(self.kinds()[:2], ["wake", "command"])
+
+    def test_without_on_level_nothing_changes(self):
+        listener = self.make_listener([quiet(1), quiet(2)])
+        self.assertIsNone(listener.on_level)
+        self.run_to_end(listener)
+
+    def test_collector_last_rms_follows_the_latest_frame(self):
+        collector = jarvis.UtteranceCollector(0.003)
+        self.assertEqual(collector.last_rms, 0.0)
+        collector.feed(loud(1))
+        self.assertGreater(collector.last_rms, 0.1)
+        collector.feed(quiet(1))
+        self.assertLess(collector.last_rms, 0.01)
+
+    def test_wake_on_level_throttled(self):
+        events = self.capture_events()
+        clock = {"now": 100.0}
+        BUS._clock = lambda: clock["now"]
+        self.addCleanup(setattr, BUS, "_clock", time.time)
+        for _ in range(10):  # 10 armed frames inside 0.1 s: one event
+            jarvis.publish_voice_level("armed", 0.02)
+            clock["now"] += 0.01
+        armed = [e for e in events if e["type"] == "voice.level"]
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0]["phase"], "armed")
+        clock["now"] += 0.2  # 5 Hz: the next one is let through
+        jarvis.publish_voice_level("armed", 0.02)
+        self.assertEqual(len([e for e in events if e["type"] == "voice.level"]), 2)
+        del events[:]
+        BUS._last_emit.clear()
+        for _ in range(10):  # collecting is 10 Hz: 40 ms apart, so every third frame (120 ms) passes
+            jarvis.publish_voice_level("collecting", 0.4)
+            clock["now"] += 0.04
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(e["phase"] == "collecting" and e["rms"] == 0.4 for e in events))
+        self.assert_valid(events)
+
+    def test_voice_level_is_clamped_and_silent_when_bus_is_off(self):
+        events = self.capture_events()
+        jarvis.publish_voice_level("collecting", 7.0)
+        self.assertEqual(events[0]["rms"], 1.0)
+        BUS.enabled = False
+        jarvis.publish_voice_level("armed", 0.5)
+        self.assertEqual(len(events), 1)
 
 
 if __name__ == "__main__":

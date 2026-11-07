@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import wave
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Callable
 
 from config.settings import DEFAULT_VOICE
 from core.audit import log
+from core.events import BUS, emit
 
 
 AUDIO_PLAYERS = (
@@ -207,7 +209,10 @@ class VoiceEngine:
             self._lock = asyncio.Lock()
         async with self._lock:
             paths = [self._tmpdir / f"{uuid.uuid4().hex}.mp3" for _ in chunks]
+            started = time.monotonic()
+            emit("voice.output", phase="start", timing="none")
             pending = asyncio.ensure_future(self._synthesize(chunks[0], paths[0]))
+            outcome = "end"
             try:
                 for index in range(len(chunks)):
                     await pending
@@ -215,11 +220,19 @@ class VoiceEngine:
                         pending = asyncio.ensure_future(self._synthesize(chunks[index + 1], paths[index + 1]))
                     await self._play(paths[index])
                     paths[index].unlink(missing_ok=True)
+            except asyncio.CancelledError:
+                raise  # an interruption (barge-in, /voice off) still ends the speech below
+            except BaseException:
+                outcome = "error"
+                raise
             finally:
                 if not pending.done():
                     pending.cancel()
                 for path in paths:
                     path.unlink(missing_ok=True)
+                if BUS.enabled:  # always closes the start above, or the browser would show JARVIS speaking forever
+                    emit("voice.output", phase=outcome, timing="none",
+                         duration_ms=round((time.monotonic() - started) * 1000))
 
     async def _speak_safely(self, text: str) -> None:
         try:

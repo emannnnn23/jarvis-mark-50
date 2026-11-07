@@ -94,6 +94,7 @@ class UtteranceCollector:
         self.frames = [pre_roll] if pre_roll else []
         self.heard_speech = False
         self.peak_rms = 0.0
+        self.last_rms = 0.0  # level of the latest frame, for the live meter
         self.elapsed = 0.0
         self.silence = 0.0
 
@@ -101,7 +102,7 @@ class UtteranceCollector:
         """Returns None to keep listening, "done" when a command is complete, or "no_speech"."""
         self.frames.append(frame)
         self.elapsed += len(frame) / 2 / 16000
-        rms = frame_rms(frame)
+        rms = self.last_rms = frame_rms(frame)
         # Relative to the speaker's own level too, so a steady background (a fan, other voices)
         # between the floor and normal speech still counts as the pause that ends the request.
         speaking = rms >= max(self.threshold, SPEECH_PEAK_FRACTION * self.peak_rms)
@@ -188,12 +189,14 @@ class WakeWordListener:
                  threshold: float = 0.6, speaking_threshold: float = 0.75, end_silence: float = 1.0,
                  start_timeout: float = 5.0, max_seconds: float = 20.0, pre_roll_seconds: float = 1.0,
                  cooldown_seconds: float = 1.5, recorder_argv: list[str] | None = None,
-                 stream_factory: Callable[[], Any] | None = None, ignore_after_wake: float = 0.0):
+                 stream_factory: Callable[[], Any] | None = None, ignore_after_wake: float = 0.0,
+                 on_level: Callable[[str, float], None] | None = None):
         self.detector = detector
         self.ignore_after_wake = ignore_after_wake
         self.on_wake = on_wake
         self.on_command = on_command
         self.on_status = on_status or (lambda message: None)
+        self.on_level = on_level  # (phase, rms) per frame, for the live level meter; may be slow or broken
         self.is_speaking = is_speaking
         self.threshold = threshold
         self.speaking_threshold = speaking_threshold
@@ -289,6 +292,15 @@ class WakeWordListener:
             if process is not None and process.poll() is None:
                 process.terminate()
 
+    def _report_level(self, phase: str, rms: float) -> None:
+        """Hand the level to the meter. A broken callback must never stop the listener hearing the wake word."""
+        if self.on_level is None:
+            return
+        try:
+            self.on_level(phase, rms)
+        except Exception:  # noqa: BLE001
+            log.debug("level callback failed", exc_info=True)
+
     def _listen(self) -> None:
         ring: collections.deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
         collector: UtteranceCollector | None = None
@@ -306,6 +318,7 @@ class WakeWordListener:
                 continue
             if collector is not None:
                 outcome = collector.feed(frame)
+                self._report_level("collecting", collector.last_rms)
                 if outcome == "done":
                     self.on_command(collector.audio())
                 elif outcome == "no_speech":
@@ -317,6 +330,7 @@ class WakeWordListener:
             score = self.detector.score(frame)
             ring.append(frame)
             rms = frame_rms(frame)
+            self._report_level("armed", rms)
             if score < 0.1 and rms < max(self.noise_rms * 3, MIN_SPEECH_RMS) and not self.is_speaking():
                 # Track the room's background level (never JARVIS's own voice), within a cap.
                 self.noise_rms = min(MAX_NOISE_RMS, 0.95 * self.noise_rms + 0.05 * rms)

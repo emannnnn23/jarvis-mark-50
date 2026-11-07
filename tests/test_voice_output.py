@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
+from helpers import BusCaptureMixin  # noqa: E402
 from voice import output  # noqa: E402
 
 
@@ -405,6 +407,82 @@ class ShutdownCancelsPendingTasksTests(unittest.TestCase):
         finally:
             loop.close()
         self.assertTrue(sleeper.cancelled())
+
+
+class VoiceOutputEventTests(BusCaptureMixin, unittest.TestCase):
+    def setUp(self):
+        self.voices: list[jarvis.VoiceEngine] = []
+
+    def tearDown(self):
+        for voice in self.voices:
+            voice.shutdown()
+
+    def make_voice(self, **kwargs) -> jarvis.VoiceEngine:
+        kwargs.setdefault("player", ["fake-player"])
+        kwargs.setdefault("notify", lambda message: None)
+        voice = jarvis.VoiceEngine(**kwargs)
+        self.voices.append(voice)
+        return voice
+
+    @staticmethod
+    def phases(events):
+        return [e["phase"] for e in events if e["type"] == "voice.output"]
+
+    def test_voice_output_start_end_events(self):
+        events = self.capture_events()
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def fake_play(path):
+            pass
+
+        voice._play = fake_play
+        voice.say("First sentence. Second sentence.").result(timeout=5)
+        outputs = [e for e in events if e["type"] == "voice.output"]
+        self.assertEqual([e["phase"] for e in outputs], ["start", "end"])  # one spoken reply, not one per chunk
+        self.assertTrue(all(e["timing"] == "none" for e in outputs))
+        self.assertIsInstance(outputs[1]["duration_ms"], int)
+        self.assert_valid(events)
+
+    def test_voice_output_error_event_when_synthesis_fails(self):
+        events = self.capture_events()
+
+        def failing(text, name, path):
+            raise RuntimeError("tts service down")
+
+        voice = self.make_voice(enabled=True, synthesize=failing)
+        voice.say("Hello there.").result(timeout=5)
+        self.assertEqual(self.phases(events), ["start", "error"])
+        self.assert_valid(events)
+
+    def test_interrupted_speech_still_ends(self):
+        events = self.capture_events()
+        playing = threading.Event()
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def endless_play(path):
+            playing.set()
+            await asyncio.sleep(30)
+
+        voice._play = endless_play
+        voice.say("Hello there.")
+        self.assertTrue(playing.wait(5))
+        voice.stop()
+        deadline = time.monotonic() + 5
+        while "end" not in self.phases(events) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.phases(events), ["start", "end"])
+
+    def test_no_events_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def fake_play(path):
+            pass
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

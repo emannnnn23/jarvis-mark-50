@@ -250,12 +250,14 @@ class JarvisCLI:
                     "before it) is sent to Groq for transcription. "
                     "/wake off to stop.", "dim"))
         self._speech_disclosed = True
+        emit("voice.input", mode="wake", phase="armed")
         return True
 
     def stop_wake(self) -> None:
         if self.wake is not None:
             self.wake.stop()
             self.wake = None
+            emit("voice.input", mode="ptt" if self.listen_mode else "off", phase="stopped")
         # Drop anything the listener captured before it stopped: "the microphone is closed" must
         # also mean nothing recorded earlier is uploaded afterwards.
         while True:
@@ -273,14 +275,21 @@ class JarvisCLI:
                 self._interrupt_pending = True
                 interrupted = True
                 os.kill(os.getpid(), signal.SIGINT)
+        emit("voice.input", mode="wake", phase="wake_detected")
         if self.ctx.config.wake_chime:
             self.voice.chime()
+        emit("voice.input", mode="wake", phase="collecting")  # the listener starts collecting as this returns
         self._wake_events.put(("status", "[wake] Interrupted. Listening..." if interrupted else "[wake] Listening..."))
 
     def _on_command(self, pcm: bytes) -> None:
         self._wake_events.put(("command", pcm))
 
     def _on_status(self, message: str) -> None:
+        if BUS.enabled:
+            # Either the listener gave up, or a heard-nothing timeout put it back to waiting for the wake word.
+            ended = message.startswith("Hands-free listening stopped")
+            emit("voice.input", mode="off" if ended else "wake", phase="stopped" if ended else "armed",
+                 message=message)
         self._wake_events.put(("status", message))
 
     def _consume_interrupt(self) -> bool:
@@ -290,6 +299,14 @@ class JarvisCLI:
 
     def _voice_command(self, pcm: bytes) -> str:
         """Transcribe a hands-free command. Returns "" when there is nothing to send."""
+        emit("voice.input", mode="wake", phase="transcribing")
+        try:
+            return self._transcribe_command(pcm)
+        finally:
+            if BUS.enabled and self.hands_free:  # back to waiting for the wake word
+                emit("voice.input", mode="wake", phase="armed")
+
+    def _transcribe_command(self, pcm: bytes) -> str:
         print(style("  Transcribing...", "dim"))
         try:
             text = safe_display(self.speech.transcribe_pcm(pcm)).strip()
@@ -387,6 +404,7 @@ class JarvisCLI:
         self.voice.stop()  # never record JARVIS's own voice
         if self.wake is not None:
             self.wake.paused = True  # one microphone user at a time
+        emit("voice.input", mode="ptt", phase="recording")
         try:
             text = self.speech.listen()
         except SpeechInputError as exc:
@@ -402,6 +420,7 @@ class JarvisCLI:
         finally:
             if self.wake is not None:
                 self.wake.paused = False
+            emit("voice.input", mode="ptt", phase="idle")
         if text is None:  # cancelled
             return ""
         text = safe_display(text).strip()
@@ -735,6 +754,7 @@ class JarvisCLI:
         if not self.developer_mode and self._dev_auto and looks_like_developer_request(text, self._project_names()):
             self.developer_mode = True
             print(style("  (developer tools on for this session; /dev off to hide them)", "dim"))
+            emit("notice", level="info", text="Developer tools switched on for this session.")
 
     def _project_names(self) -> set[str]:
         try:
@@ -777,7 +797,7 @@ class JarvisCLI:
                                    on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
                                    tool_groups={"core", "developer"} if self.developer_mode else {"core"},
                                    voice_state=self.voice_state(), last_seen=self.last_seen,
-                                   on_progress=lambda message: print(style(f"  {safe_display(message)}", "dim")))
+                                   on_progress=self._show_progress)
             except KeyboardInterrupt:
                 outcome["status"] = "cancelled"
                 self._consume_interrupt()  # a wake-word interruption is fully handled here
@@ -802,6 +822,11 @@ class JarvisCLI:
             if self.ctx.config.save_conversations:  # the log keeps the user's own words, not a resume message
                 self.memory.add_conversation(said, result.text)
             self.say(reply)
+
+    def _show_progress(self, message: str) -> None:
+        """A task step changed: show it in the terminal and send it to Mission Control."""
+        print(style(f"  {safe_display(message)}", "dim"))
+        emit("task.progress", message=message)
 
     @contextlib.contextmanager
     def _request_events(self, source: str, said: str):
@@ -844,6 +869,7 @@ class JarvisCLI:
                 self.tasks.pause(task["id"], reason)
                 print(style(f"  Task paused: {safe_display(task['goal'])}. Say \"continue\" to pick it up again.",
                             "dim"))
+                emit("notice", level="info", text=f"Task paused: {task['goal']}")
                 return task["id"]
         except TaskStoreError as exc:
             log.warning("Could not pause the task: %s", exc)

@@ -32,6 +32,7 @@ TRANSCRIBING_PHASE = "transcribing"
 MEMORY_STATUS = {"ok": "online", "corrupted": "degraded", "disabled": "unavailable"}
 
 # llm kinds that mean Groq could not be reached at all (everything else is a degraded service).
+# Used for both llm.error and a failed llm.call end, so the two can never disagree about the same failure.
 LLM_OFFLINE_KINDS = frozenset({"network"})
 
 
@@ -191,7 +192,9 @@ class StateTracker:
         if ev["ok"]:
             llm.update(status="online", last_status="success", last_error_kind=None)
         else:
-            llm.update(status="degraded", last_status="error", last_error_kind=ev.get("error_kind") or None)
+            kind = ev.get("error_kind") or None
+            status = "offline" if kind in LLM_OFFLINE_KINDS else "degraded"
+            llm.update(status=status, last_status="error", last_error_kind=kind)
 
     def _on_llm_retry(self, ev: dict[str, Any]) -> None:
         self._subsystems["llm"].update(status="degraded", last_status="retry")

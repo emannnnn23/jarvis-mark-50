@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from config.settings import ConfigError
 from core.audit import log, redact
+from core.events import BUS, emit
 
 if TYPE_CHECKING:
     from config.settings import Config
@@ -120,6 +121,12 @@ def _flag_unsupported() -> None:
 MAX_RETRY_WAIT = 60
 
 
+def _emit_llm_error(error: JarvisAPIError) -> None:
+    """Tell Mission Control the call is about to fail for good (the end event already carried the kind)."""
+    if BUS.enabled:
+        emit("llm.error", kind=error.kind, message=str(error), retryable=error.retryable)
+
+
 def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *,
                tool_choice: str = "auto", max_retries: int = 3, sleep: Callable[[float], None] = time.sleep,
                on_retry: Callable[[str, float], None] | None = None, reasoning_effort: str = ""):
@@ -136,27 +143,42 @@ def call_model(client, model: str, messages: list[dict[str, Any]], tools: list[d
             kwargs["disable_tool_validation"] = True
     attempt = 0
     while True:
+        started = time.monotonic()
+        if BUS.enabled:
+            emit("llm.call", phase="start", model=model, attempt=attempt + 1)
         try:
-            return client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
+            if BUS.enabled:
+                emit("llm.call", phase="end", model=model, attempt=attempt + 1, ok=True,
+                     duration_ms=round((time.monotonic() - started) * 1000))
+            return response
         except Exception as exc:  # noqa: BLE001
             error = classify_api_error(exc, model)
+            if BUS.enabled:
+                emit("llm.call", phase="end", model=model, attempt=attempt + 1, ok=False, error_kind=error.kind,
+                     duration_ms=round((time.monotonic() - started) * 1000))
             # Look in the full error, not the shortened user-facing message, for the option's name.
             if error.kind == "bad_request" and "disable_tool_validation" in f"{exc} {error}" \
                     and kwargs.pop("disable_tool_validation", None):
                 _flag_unsupported()  # this model or account does not take the option: carry on without it
                 continue
             if not error.retryable or attempt >= max_retries:
+                _emit_llm_error(error)
                 raise error from exc
             if error.kind == "tool_use_failed":
                 if attempt >= 1:  # one retry at a lower temperature is enough
+                    _emit_llm_error(error)
                     raise error from exc
                 kwargs["temperature"] = 0.1
                 delay = 0.0
             else:
                 delay = error.retry_after if error.retry_after is not None else min(2 ** attempt, 8)
                 if delay > MAX_RETRY_WAIT:
+                    _emit_llm_error(error)
                     raise error from exc
             log.info("Retrying Groq call after %s (attempt %d)", error.kind, attempt + 1)
+            if BUS.enabled:
+                emit("llm.retry", reason=str(error), delay=delay)
             if on_retry and delay:
                 on_retry(str(error), delay)
             attempt += 1

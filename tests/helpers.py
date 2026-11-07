@@ -29,6 +29,8 @@ import groq  # noqa: E402
 import httpx  # noqa: E402
 
 import jarvis  # noqa: E402,F401
+from core.events import BUS  # noqa: E402
+from mission_control.protocol import validate_event  # noqa: E402
 
 try:
     # numpy's C core can only be loaded once per process. Import it before any test patches
@@ -72,6 +74,33 @@ class TempDirTestCase(unittest.TestCase):
         store = jarvis.MemoryStore(self.memory_path, **kwargs)
         store.load()
         return store
+
+
+class BusCaptureMixin:
+    """Turns the shared event bus on for one test, records what is published, and restores the bus after.
+
+    Mix in before a TestCase: `events = self.capture_events()`. `assert_valid` checks every recorded
+    event against the Mission Control protocol, so a payload that drifts from the contract fails here."""
+
+    def capture_events(self) -> list[dict]:
+        saved_enabled, saved_subscribers = BUS.enabled, list(BUS._subscribers)
+        saved_throttle = dict(BUS._last_emit)
+
+        def restore() -> None:
+            BUS.enabled = saved_enabled
+            BUS._subscribers = saved_subscribers
+            BUS._last_emit = saved_throttle
+
+        self.addCleanup(restore)
+        BUS._last_emit = {}
+        BUS.enabled = True
+        events: list[dict] = []
+        BUS.subscribe(events.append)
+        return events
+
+    def assert_valid(self, events: list[dict]) -> None:
+        for event in events:
+            self.assertEqual(validate_event(event), [], event)
 
 
 class Recorder:

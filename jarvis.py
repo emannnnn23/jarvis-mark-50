@@ -29,7 +29,7 @@ import sys
 
 from config.settings import Config, ConfigError, SCRIPT_DIR, VERSION, load_env_file, validate_api_key
 from core.audit import audit, setup_logging
-from core.events import BUS, emit
+from core.events import BUS, emit, emit_throttled
 from core.orchestrator import AgentContext
 from core.policy import PermissionPolicy
 from intelligence.groq_client import JarvisAPIError, groq, initialize_client, list_model_ids, verify_model
@@ -449,6 +449,16 @@ def session_start_payload(config: Config, cli: JarvisCLI, voice: VoiceEngine) ->
     }
 
 
+# Seconds between voice.level events per phase: 5 Hz while armed, 10 Hz while collecting a command.
+VOICE_LEVEL_INTERVAL = {"armed": 0.2, "collecting": 0.1}
+
+
+def publish_voice_level(phase: str, rms: float) -> None:
+    """Wake-listener level callback: a throttled voice.level for the live meter (a no-op when Mission Control is off)."""
+    emit_throttled(f"voice.level.{phase}", VOICE_LEVEL_INTERVAL.get(phase, 0.2), "voice.level",
+                   rms=min(1.0, max(0.0, float(rms))), phase=phase)
+
+
 def start_mission_control(config: Config, cli: JarvisCLI, voice: VoiceEngine):
     """Start the Mission Control server and turn the event bus on. Returns the server, or None.
 
@@ -470,6 +480,8 @@ def start_mission_control(config: Config, cli: JarvisCLI, voice: VoiceEngine):
         return None
     BUS.enabled = True
     emit("session.start", **session_start_payload(config, cli, voice))
+    if cli.tasks is not None:  # a task left unfinished from last time is shown from the first frame
+        cli.tasks.publish_current()
     link = f"{url}/#token={server.token}"
     print(f"Mission Control: {link}")
     audit({"event": "mission_control_start", "port": server.port})
@@ -549,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
             threshold=config.wake_threshold, speaking_threshold=config.wake_speaking_threshold,
             end_silence=config.wake_end_silence, max_seconds=min(config.stt_max_seconds, WAKE_MAX_SECONDS),
             ignore_after_wake=CHIME_IGNORE_SECONDS if config.wake_chime and voice.player else 0.0,
+            on_level=publish_voice_level,
         )
 
     cli = JarvisCLI(AgentContext(client, config, registry, policy, memory, tasks), voice, memory,

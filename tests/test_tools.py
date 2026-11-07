@@ -13,12 +13,14 @@ from unittest import mock
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
     AgentTestCase,
+    BusCaptureMixin,
     FakeBrowser,
     Recorder,
     TempDirTestCase,
     make_ddgs_factory,
 )
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
 
 
 class WebSearchTests(TempDirTestCase):
@@ -355,6 +357,96 @@ class LinuxIntegrationTests(AgentTestCase):
         popen.assert_called_once()
         self.assertEqual(popen.call_args[0][0], ["/usr/bin/code", str(self.workspace / "proj")])
         self.assertIs(popen.call_args.kwargs["shell"], False)
+
+
+class ToolEventTests(BusCaptureMixin, AgentTestCase):
+    """execute_tool publishes the tool's lifecycle for Mission Control, and nothing when it is off."""
+
+    def run_tool(self, name, args, policy=None):
+        return jarvis.execute_tool(self.registry, policy or self.policy, name, json.dumps(args))
+
+    def tool_events(self, events):
+        return [(e["tool"], e["status"]) for e in events if e["type"] == "tool.execution"]
+
+    def test_tool_events_cover_lifecycle(self):
+        events = self.capture_events()
+        self.assertEqual(self.run_tool("get_time", {})["status"], "success")
+        self.assertEqual(self.tool_events(events),
+                         [("get_time", "requested"), ("get_time", "running"), ("get_time", "success")])
+        final = events[-1]
+        self.assertIsInstance(final["duration_ms"], int)
+        self.assertEqual(final["permission"], "read_only")
+        self.assertNotIn("permission", events[0])  # not known until the policy has looked at the call
+
+        del events[:]
+        denied = jarvis.PermissionPolicy("read_only")
+        self.assertEqual(self.run_tool("remember_fact", {"fact": "I like tea"}, denied)["status"], "denied")
+        self.assertEqual(self.tool_events(events), [("remember_fact", "requested"), ("remember_fact", "denied")])
+
+        del events[:]
+        self.assertEqual(self.run_tool("no_such_tool", {})["status"], "error")
+        self.assertEqual(self.tool_events(events), [("no_such_tool", "requested"), ("no_such_tool", "error")])
+
+        del events[:]
+        self.assertEqual(self.run_tool("remember_fact", {})["status"], "error")  # missing argument
+        self.assertEqual(self.tool_events(events), [("remember_fact", "requested"), ("remember_fact", "error")])
+        self.assert_valid(events)
+
+    def test_tool_events_are_valid_protocol_events(self):
+        events = self.capture_events()
+        self.run_tool("get_time", {})
+        self.run_tool("remember_fact", {"fact": "I like tea"})
+        self.assertTrue(events)
+        self.assert_valid(events)
+
+    def test_awaiting_confirmation_is_published_when_the_policy_asks(self):
+        events = self.capture_events()
+        asked = []
+        policy = jarvis.PermissionPolicy("confirm_all", confirm=lambda request: asked.append(request) or True)
+        self.assertEqual(self.run_tool("remember_fact", {"fact": "I like tea"}, policy)["status"], "success")
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(self.tool_events(events), [
+            ("remember_fact", "requested"), ("remember_fact", "awaiting_confirmation"),
+            ("remember_fact", "running"), ("remember_fact", "success")])
+        self.assertEqual(events[1]["permission"], "controlled_action")
+        self.assert_valid(events)
+
+    def test_no_awaiting_confirmation_when_nothing_is_asked(self):
+        events = self.capture_events()
+        self.run_tool("get_time", {})
+        self.assertNotIn("awaiting_confirmation", [status for _, status in self.tool_events(events)])
+
+    def test_declined_confirmation_ends_denied(self):
+        events = self.capture_events()
+        policy = jarvis.PermissionPolicy("confirm_all", confirm=Recorder(False))
+        self.assertEqual(self.run_tool("remember_fact", {"fact": "I like tea"}, policy)["status"], "denied")
+        self.assertEqual([status for _, status in self.tool_events(events)],
+                         ["requested", "awaiting_confirmation", "denied"])
+
+    def test_tool_target_url_secret_is_redacted(self):
+        events = self.capture_events()
+        key = "gsk_" + "b" * 40
+        self.run_tool("open_url", {"url": f"https://example.com/search?api_key={key}&q=tea"})
+        targets = [e["target"] for e in events if e["type"] == "tool.execution"]
+        self.assertEqual(len(targets), 3)  # requested, running, success
+        for target in targets:
+            self.assertNotIn(key, target)
+            self.assertNotIn("b" * 20, target)
+            self.assertLessEqual(len(target), 120)
+        self.assertIn("example.com", targets[0])
+
+    def test_tool_target_is_cut_to_120_characters(self):
+        events = self.capture_events()
+        self.run_tool("open_url", {"url": "https://example.com/" + "a" * 400})
+        self.assertTrue(all(len(e["target"]) <= 120 for e in events if e["type"] == "tool.execution"))
+
+    def test_no_events_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        with mock.patch("tools.registry._event_target", side_effect=AssertionError("built while off")):
+            self.assertEqual(self.run_tool("get_time", {})["status"], "success")
+            self.assertEqual(self.run_tool("no_such_tool", {})["status"], "error")
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

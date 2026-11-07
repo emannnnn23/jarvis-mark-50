@@ -525,5 +525,24 @@ class SubsystemTests(unittest.TestCase):
             self.assertIn(block["status"], self.STATUSES, name)
 
 
+class LlmFailedCallOfflineTests(unittest.TestCase):
+    def test_failed_call_end_for_network_is_offline_like_llm_error(self) -> None:
+        # call_model publishes the failed end first and llm.error just before it raises: they must agree.
+        tracker = StateTracker(clock=FakeClock())
+        tracker.apply(ev("llm.call", phase="end", model="m", attempt=1, duration_ms=50, ok=False,
+                         error_kind="network"))
+        llm = tracker.snapshot()["subsystems"]["llm"]
+        self.assertEqual((llm["status"], llm["last_error_kind"]), ("offline", "network"))
+        tracker.apply(ev("llm.error", kind="network", message="Cannot reach Groq", retryable=True))
+        self.assertEqual(tracker.snapshot()["subsystems"]["llm"]["status"], "offline")
+        tracker.apply(ev("llm.call", phase="end", model="m", attempt=2, duration_ms=50, ok=True))
+        self.assertEqual(tracker.snapshot()["subsystems"]["llm"]["status"], "online")
+
+    def test_failed_call_end_for_other_kinds_stays_degraded(self) -> None:
+        tracker = StateTracker(clock=FakeClock())
+        tracker.apply(ev("llm.call", phase="end", model="m", attempt=1, ok=False, error_kind="rate_limit"))
+        self.assertEqual(tracker.snapshot()["subsystems"]["llm"]["status"], "degraded")
+
+
 if __name__ == "__main__":
     unittest.main()
