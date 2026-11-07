@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -252,18 +253,22 @@ class ConfirmationViewTests(unittest.TestCase):
         self.assertEqual(empty.label, "ACTION")
         self.assertEqual(empty.affected_paths[1:], ("/home/u/My Docs/a\\u{202e}b.txt", "/w/lone?surrogate"))
 
-    def test_digest_is_stable_and_binds_every_field(self):
+    def test_digest_is_keyed_stable_and_binds_every_field(self):
+        key, other_key = b"k" * 32, b"o" * 32
         view = terminal.build_confirmation_view(parity_cases()["headers"])
         again = terminal.build_confirmation_view(parity_cases()["headers"])
-        self.assertEqual(view.digest(), again.digest())
-        self.assertRegex(view.digest(), r"^[0-9a-f]{64}$")
+        self.assertEqual(view.digest(key), again.digest(key))
+        self.assertRegex(view.digest(key), r"^[0-9a-f]{64}$")
         canonical = json.dumps(dataclasses.asdict(view), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        self.assertEqual(view.digest(), hashlib.sha256(canonical.encode("ascii")).hexdigest())
+        self.assertEqual(view.canonical(), canonical.encode("ascii"))
+        self.assertEqual(view.digest(key), hmac.new(key, view.canonical(), hashlib.sha256).hexdigest())
+        self.assertNotEqual(view.digest(key), hashlib.sha256(view.canonical()).hexdigest())
+        self.assertNotEqual(view.digest(key), view.digest(other_key))
         changes = {"label": "ACTION", "tool": "other", "operation": "x", "affected_paths": ("/other",),
                    "reason": "r", "hidden": 1, "omitted": 1, "lines": view.lines[:-1] + (("add", "+changed"),)}
-        digests = {dataclasses.replace(view, **{field: value}).digest() for field, value in changes.items()}
+        digests = {dataclasses.replace(view, **{field: value}).digest(key) for field, value in changes.items()}
         self.assertEqual(len(digests), len(changes))
-        self.assertNotIn(view.digest(), digests)
+        self.assertNotIn(view.digest(key), digests)
 
     def test_payload_form(self):
         view = terminal.build_confirmation_view(TerminalConfirmTests.REQUEST)

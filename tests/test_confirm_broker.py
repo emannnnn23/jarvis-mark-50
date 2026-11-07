@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -155,7 +157,7 @@ class TerminalAnswerTests(BrokerTestCase):
         [(type_, transient, data)] = [e for e in self.events if e[0] == "confirm.request"]
         self.assertTrue(transient)
         view = terminal.build_confirmation_view(EDIT)
-        self.assertEqual(data["digest"], view.digest())
+        self.assertEqual(data["digest"], view.digest(broker._key))
         self.assertEqual(data["tool"], "edit_workspace_file")
         self.assertEqual(data["label"], "SENSITIVE ACTION")
         self.assertEqual(data["affected_paths"], ["/w/app.py"])
@@ -232,10 +234,63 @@ class TerminalAnswerTests(BrokerTestCase):
         inner: list[bool] = []
         reader = FakeReader([None, "yes\n"])
         broker = self.broker(reader)
-        reader.hooks = {1: lambda: inner.append(broker.confirm(EDIT))}
+
+        def ask_from_another_thread():
+            thread = threading.Thread(target=lambda: inner.append(broker.confirm(EDIT)))
+            thread.start()
+            thread.join(5)
+
+        reader.hooks = {1: ask_from_another_thread}
         self.assertIs(self.ask(broker), True)
         self.assertEqual(inner, [False])  # a second request while one is open is declined, unpublished
         self.assertEqual(len(self.of_type("confirm.request")), 1)
+        self.assertEqual(len(self.of_type("confirm.resolved")), 1)
+
+
+class StuckBrokerTests(BrokerTestCase):
+    """However an interrupt lands, the broker never stays stuck with a confirmation nobody is asking."""
+
+    def test_interrupt_right_after_registering_clears_pending(self):
+        interrupts = [KeyboardInterrupt]
+
+        def interrupted_publish(type_, _transient=False, **data):
+            self.publish(type_, _transient, **data)
+            if type_ == "confirm.request" and interrupts:
+                raise interrupts.pop()  # the first statement after the confirmation is registered
+
+        broker = confirm.ConfirmationBroker(reader=FakeReader(["yes\n"]), isatty=lambda: True,
+                                            publish=interrupted_publish)
+        with self.assertRaises(KeyboardInterrupt):
+            self.ask(broker)
+        self.assertIsNone(broker.pending_payload())
+        self.assertIsNone(broker._pending)
+        self.assertEqual(self.resolved()["channel"], "cancelled")
+        self.events.clear()
+        broker.reader = FakeReader(["yes\n"])
+        self.assertIs(self.ask(broker), True)  # the next prompt works
+
+    def test_interrupt_while_resolving_still_clears_pending(self):
+        broker = self.broker(FakeReader(["yes\n"]))
+        with mock.patch("mission_control.confirm.audit", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.ask(broker)
+        self.assertIsNone(broker._pending)
+        self.assertEqual(len(self.of_type("confirm.resolved")), 1)
+
+    def test_leftover_from_this_thread_is_closed_by_the_next_prompt(self):
+        # Simulates an interrupt that landed in `finally` before the confirmation was unregistered.
+        broker = self.broker(FakeReader(["yes\n"]))
+        leftover = confirm._Pending("old-id", "d" * 64, {"tool": "open_url"}, True, None,
+                                    threading.get_ident())
+        broker._pending = leftover
+        self.assertIs(self.ask(broker), True)
+        resolved = self.of_type("confirm.resolved")
+        self.assertEqual(resolved[0], {"id": "old-id", "approved": False, "channel": "cancelled"})
+        self.assertEqual(resolved[1]["channel"], "terminal")
+        self.assertIsNone(broker._pending)
+        self.assertEqual(broker.answer_from_browser("old-id", "d" * 64, True), "already_answered")
+        self.assertEqual(self.audits[0], {"event": "confirmation", "tool": "open_url", "approved": False,
+                                          "channel": "cancelled"})
 
 
 class BrowserAnswerTests(BrokerTestCase):
@@ -351,7 +406,7 @@ class BrowserAnswerTests(BrokerTestCase):
         shown = {key: published[key] for key in ("tool", "label", "operation", "affected_paths", "reason",
                                                  "hidden", "lines", "omitted")}
         self.assertEqual(shown, view.as_payload())
-        self.assertEqual(published["digest"], view.digest())
+        self.assertEqual(published["digest"], view.digest(broker._key))
 
     def test_pending_payload_is_a_copy(self):
         reader = FakeReader([None, "no\n"])
@@ -367,7 +422,101 @@ class BrowserAnswerTests(BrokerTestCase):
         self.ask(broker)
 
 
+class DigestTests(BrokerTestCase):
+    def test_published_digest_is_keyed_so_a_redacted_secret_cannot_be_checked_offline(self):
+        request = ConfirmationRequest("edit_workspace_file", Permission.SENSITIVE_ACTION, "Edit settings.py",
+                                      ["/w/settings.py"], "",
+                                      "@@ -1 +1 @@\n-DB_PASSWORD = 'x'\n+DB_PASSWORD = 'summer2024'")
+        broker = self.broker(FakeReader(["no\n"]))
+        self.ask(broker, request)
+        published = self.request_event()
+        self.assertIs(published["browser_approvable"], False)
+        self.assertNotIn("summer2024", json.dumps(published))
+        view = terminal.build_confirmation_view(request)
+        self.assertNotEqual(published["digest"], hashlib.sha256(view.canonical()).hexdigest())
+        self.assertEqual(published["digest"], hmac.new(broker._key, view.canonical(), hashlib.sha256).hexdigest())
+        self.assertNotIn(broker._key.hex(), json.dumps(self.events) + json.dumps(self.audits))
+
+    def test_each_broker_has_its_own_key(self):
+        first, second = confirm.ConfirmationBroker(), confirm.ConfirmationBroker()
+        self.assertEqual(len(first._key), 32)
+        self.assertNotEqual(first._key, second._key)
+
+
+class MalformedBrowserAnswerTests(BrokerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.setup_results()
+
+    def test_any_input_is_refused_without_raising(self):
+        reader = FakeReader([None, "no\n"])
+        broker = self.broker(reader)
+        outcomes: list[tuple] = []
+
+        def hammer():
+            payload = broker.pending_payload()
+            good_id, good_digest = payload["id"], payload["digest"]
+            lone = json.loads('"\\ud800"')
+            for confirm_id, digest, expected in (
+                (lone, good_digest, "stale"),
+                (good_id + lone, good_digest, "stale"),
+                (None, good_digest, "stale"),
+                (123, good_digest, "stale"),
+                ([good_id], good_digest, "stale"),
+                ({"id": good_id}, good_digest, "stale"),
+                (b"bytes", good_digest, "stale"),
+                ("x" * 1_000_000, good_digest, "stale"),
+                (good_id, json.loads('"\\udfff"'), "digest_mismatch"),
+                (good_id, None, "digest_mismatch"),
+                (good_id, 7, "digest_mismatch"),
+                (good_id, ["a"], "digest_mismatch"),
+                (good_id, "f" * 1_000_000, "digest_mismatch"),
+                (good_id, good_digest + lone, "digest_mismatch"),
+                (good_id, "é" * 64, "digest_mismatch"),
+            ):
+                outcomes.append((repr(confirm_id)[:30], repr(digest)[:30],
+                                 broker.answer_from_browser(confirm_id, digest, True), expected))
+
+        reader.hooks = {1: hammer}
+        self.assertIs(self.ask(broker), False)
+        for confirm_id, digest, got, expected in outcomes:
+            self.assertEqual(got, expected, (confirm_id, digest))
+        self.assertEqual(self.resolved()["channel"], "terminal")  # none of it answered the prompt
+        self.assertEqual(broker.answer_from_browser(json.loads('"\\ud800"'), None, None), "stale")
+
+    def test_an_internal_fault_is_refused_not_raised(self):
+        broker = self.broker(FakeReader(["no\n"]))
+        with mock.patch.object(broker, "_answer", side_effect=RuntimeError("boom")):
+            self.assertEqual(broker.answer_from_browser("a", "b", True), "stale")
+
+
 class TimeoutTests(BrokerTestCase):
+    def test_browser_answer_after_the_deadline_is_stale(self):
+        self.setup_results()
+        clock = FakeClock()
+        reader = FakeReader([None, None], clock=clock)
+        broker = self.broker(reader, clock=clock, timeout=5.0)
+
+        def late():
+            clock.now += 5.0  # the deadline passes before the terminal loop looks again
+            self.browser(approved=True)()
+
+        reader.hooks = {2: late}
+        self.assertIs(self.ask(broker), False)
+        self.assertEqual(self.browser_results, ["stale"])
+        self.assertEqual(self.resolved()["channel"], "timeout")
+
+    def test_deadline_and_expiry_are_taken_together_before_publishing(self):
+        clock = FakeClock(now=50.0)
+        walls = iter([1_700_000_000.0, 1_800_000_000.0])
+        seen: list = []
+        reader = FakeReader(["yes\n"])
+        broker = self.broker(reader, clock=clock, timeout=30.0, wall_clock=lambda: next(walls))
+        reader.hooks = {1: lambda: seen.append(broker._pending.deadline)}
+        self.ask(broker)
+        self.assertEqual(seen, [80.0])
+        self.assertEqual(self.request_event()["expires_at"], (1_700_000_000 + 30) * 1000)
+
     def test_timeout_declines(self):
         clock = FakeClock()
         reader = FakeReader(clock=clock)

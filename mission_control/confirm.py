@@ -5,8 +5,9 @@ runs, unchanged). It keeps every guarantee of the terminal prompt and adds the b
 channel under these rules:
 
 - Nothing is asked without a real terminal (as before): the browser alone can never approve.
-- The browser answers one specific prompt: a single-use id plus the sha256 digest of exactly what was
-  shown. A wrong id, a used id or a different digest changes nothing.
+- The browser answers one specific prompt: a single-use id plus a digest of exactly what was shown
+  (HMAC-SHA256 under a per-broker secret key, so the digest reveals nothing about redacted text).
+  A wrong, used or expired id, or a different digest, changes nothing.
 - The browser sees the scrubbed view. When scrubbing changed anything (a secret was redacted, a line
   was too long for the wire), the browser could not see what it would approve, so it may only decline;
   approving then needs the terminal.
@@ -46,6 +47,9 @@ POLL_INTERVAL = 0.1
 # Recently resolved ids, so a late browser answer gets "already_answered" rather than "stale".
 RESOLVED_KEPT = 32
 
+# Longest id or digest looked at from the browser (real ones are 32 and 64 hex characters).
+MAX_ANSWER_FIELD = 128
+
 
 class StdinAnswerReader:
     """Reads one typed line without blocking past `timeout`, so the broker can also watch the browser."""
@@ -83,6 +87,8 @@ class _Pending:
     digest: str
     payload: dict[str, Any]
     approvable: bool
+    deadline: float | None  # on the broker's monotonic clock; None = never expires
+    owner: int  # thread that asked
     outcome: tuple[str, bool] | None = None  # (channel, approved), set once by whoever answers first
 
 
@@ -113,6 +119,9 @@ class ConfirmationBroker:
         self._lock = threading.Lock()
         self._pending: _Pending | None = None
         self._resolved: deque[str] = deque(maxlen=RESOLVED_KEPT)
+        # Keys the published digest. Never logged or published: without it, nobody can check a guess
+        # for redacted text against the digest that travels with the redacted view.
+        self._key = secrets.token_bytes(32)
 
     # --- the policy side --------------------------------------------------------------------------
 
@@ -123,39 +132,70 @@ class ConfirmationBroker:
         view = build_confirmation_view(request)
         shown, approvable = self._browser_view(view)
         confirm_id = secrets.token_hex(16)
-        payload = {"id": confirm_id, "digest": view.digest(), **shown, "browser_approvable": approvable,
-                   "expires_at": self._expires_at()}
-        pending = _Pending(confirm_id, payload["digest"], payload, approvable)
+        deadline, expires_at = self._deadline()  # one deadline for the terminal, the browser and the page
+        payload = {"id": confirm_id, "digest": view.digest(self._key), **shown, "browser_approvable": approvable,
+                   "expires_at": expires_at}
+        pending = _Pending(confirm_id, payload["digest"], payload, approvable, deadline, threading.get_ident())
+        try:
+            # Registering inside the try: however early an interrupt lands, `finally` unregisters it.
+            if not self._register(pending):
+                return False
+            self._publish("confirm.request", _transient=True, **copy.deepcopy(payload))
+            print_confirmation(view, prompt_hint=MISSION_PROMPT)
+            return self._wait(pending)[1]
+        except KeyboardInterrupt:
+            self._settle(pending, ("cancelled", False), force=True)
+            print()
+            raise
+        finally:
+            # Unregistering comes first, so a failure while publishing or auditing cannot skip it.
+            outcome = self._unregister(pending)
+            if outcome is not None:
+                self._resolve(confirm_id, view.tool, outcome)
+
+    def _register(self, pending: _Pending) -> bool:
+        """Make `pending` the open confirmation. False if another thread's confirmation is open."""
         with self._lock:
-            if self._pending is not None:
+            current = self._pending
+            if current is not None and current.owner != pending.owner:
                 # Only the main thread asks; a second prompt at once is a bug, and declining is safe.
                 log.warning("a confirmation was requested while another was open; declined")
                 return False
             self._pending = pending
-        outcome: tuple[str, bool] = ("cancelled", False)
-        try:
-            self._publish("confirm.request", _transient=True, **copy.deepcopy(payload))
-            print_confirmation(view, prompt_hint=MISSION_PROMPT)
-            outcome = self._wait(pending)
-            return outcome[1]
-        except KeyboardInterrupt:
-            outcome = self._settle(pending, ("cancelled", False), force=True)
-            print()
-            raise
-        finally:
-            with self._lock:
-                if self._pending is pending:
-                    self._pending = None
-                self._resolved.append(confirm_id)
-            self._resolve(confirm_id, view.tool, outcome)
+            if current is not None:
+                # Left by an interrupt that landed in the earlier prompt's `finally`: one thread cannot
+                # be inside two prompts, so that one is over. Its interrupt declined it.
+                current.outcome = ("cancelled", False)
+                self._resolved.append(current.id)
+        if current is not None:
+            self._resolve(current.id, current.payload["tool"], current.outcome)
+        return True
+
+    def _unregister(self, pending: _Pending) -> tuple[str, bool] | None:
+        """Close `pending` if it is still the open confirmation; its final outcome, or None if not ours."""
+        with self._lock:
+            if self._pending is not pending:
+                return None
+            self._pending = None
+            self._resolved.append(pending.id)
+            if pending.outcome is None:  # failed before anyone answered: declined
+                pending.outcome = ("cancelled", False)
+            return pending.outcome
+
+    def _deadline(self) -> tuple[float | None, int | None]:
+        """(monotonic deadline, epoch-ms expires_at for the page), taken together; (None, None) = never."""
+        if self.timeout <= 0:
+            return None, None
+        return self._clock() + self.timeout, int((self._wall_clock() + self.timeout) * 1000)
 
     def _wait(self, pending: _Pending) -> tuple[str, bool]:
-        deadline = self._clock() + self.timeout if self.timeout > 0 else None
+        deadline = pending.deadline
         while True:
             with self._lock:
                 outcome = pending.outcome
-            if outcome is not None:  # the browser answered
-                self._after_browser(outcome[1])
+            if outcome is not None:  # the browser answered (or a newer prompt on this thread took over)
+                if outcome[0] == "browser":
+                    self._after_browser(outcome[1])
                 return outcome
             wait = POLL_INTERVAL
             if deadline is not None:
@@ -216,24 +256,33 @@ class ConfirmationBroker:
         redacted = any(redact(text) != text for text in _strings(exact))
         return shown, shown == exact and not redacted
 
-    def _expires_at(self) -> int | None:
-        if self.timeout <= 0:
-            return None
-        return int((self._wall_clock() + self.timeout) * 1000)
-
     # --- the browser side -------------------------------------------------------------------------
 
-    def answer_from_browser(self, confirm_id: str, digest: str, approved: bool) -> str:
+    def answer_from_browser(self, confirm_id: Any, digest: Any, approved: Any) -> str:
         """Answer the open confirmation: "ok" | "stale" | "already_answered" | "digest_mismatch" |
-        "terminal_only". Only `approved is True` approves; anything else declines."""
-        confirm_id, digest = str(confirm_id), str(digest)
+        "terminal_only". Only `approved is True` approves; anything else declines. Never raises: the
+        arguments come straight from the browser."""
+        try:
+            return self._answer(confirm_id, digest, approved)
+        except Exception:  # noqa: BLE001 - a malformed answer is refused, never fatal
+            log.debug("browser answer refused", exc_info=True)
+            return "stale"
+
+    def _answer(self, confirm_id: Any, digest: Any, approved: Any) -> str:
+        if not isinstance(confirm_id, str) or len(confirm_id) > MAX_ANSWER_FIELD:
+            return "stale"
+        given_id = confirm_id.encode("utf-8", "surrogatepass")
+        given_digest = (digest.encode("utf-8", "surrogatepass")
+                        if isinstance(digest, str) and len(digest) <= MAX_ANSWER_FIELD else None)
         with self._lock:
             pending = self._pending
-            if pending is None or not hmac.compare_digest(pending.id.encode(), confirm_id.encode()):
+            if pending is None or not hmac.compare_digest(pending.id.encode("ascii"), given_id):
                 return "already_answered" if confirm_id in self._resolved else "stale"
             if pending.outcome is not None:
                 return "already_answered"
-            if not hmac.compare_digest(pending.digest.encode(), digest.encode()):
+            if pending.deadline is not None and self._clock() >= pending.deadline:
+                return "stale"  # expired: the terminal declines it at its next look
+            if given_digest is None or not hmac.compare_digest(pending.digest.encode("ascii"), given_digest):
                 return "digest_mismatch"
             approve = approved is True
             if approve and not pending.approvable:

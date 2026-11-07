@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -64,10 +65,16 @@ class ConfirmationView:
     lines: tuple[tuple[str, str], ...]  # (kind, text): kind is add | del | hunk | ctx
     omitted: int
 
-    def digest(self) -> str:
-        """sha256 of the canonical JSON of every field: any change to what is shown changes it."""
-        canonical = json.dumps(dataclasses.asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+    def canonical(self) -> bytes:
+        """Canonical JSON of every field: any change to what is shown changes these bytes."""
+        return json.dumps(dataclasses.asdict(self), sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True).encode("ascii")
+
+    def digest(self, key: bytes) -> str:
+        """HMAC-SHA256 of `canonical()` under a secret key. Keyed, because the digest is published next to
+        a redacted copy of the view: a plain hash would let anyone holding that copy test guesses for
+        the redacted text offline."""
+        return hmac.new(key, self.canonical(), hashlib.sha256).hexdigest()
 
     def as_payload(self) -> dict:
         """The view as JSON types, in the shape of the confirm.request event (before scrubbing)."""
