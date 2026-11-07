@@ -1,8 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { NARROW_MAX_WIDTH, cameraDistance, cameraFov, sidePanelInset } from "../components/scene/cameraFit";
+import {
+  DOCK_HEIGHT,
+  NARROW_MAX_WIDTH,
+  cameraFov,
+  dockRect,
+  fitView,
+  focusPose,
+  homePose,
+  panelRects,
+  projectNodes,
+  sidePanelInset,
+} from "../components/scene/cameraFit";
+import type { ScreenRect } from "../components/scene/cameraFit";
+import { NODE_LAYOUT } from "../components/nodes/layout";
 import { particleCount } from "../components/scene/quality";
-import { DEMAND_FPS, EVENT_ACTIVE_MS, demandFps, frameloopFor } from "../hooks/useAdaptiveFrameloop";
+import { DEMAND_FPS, EVENT_ACTIVE_MS, demandFps, frameloopFor, needsWake } from "../hooks/useAdaptiveFrameloop";
 import type { FrameloopInput } from "../hooks/useAdaptiveFrameloop";
 import { QUALITY_STORAGE_KEY, effectiveQuality, readStoredQuality, writeStoredQuality } from "../hooks/usePerformanceMode";
 
@@ -108,14 +121,90 @@ describe("responsive budget", () => {
     expect(sidePanelInset(2560)).toBeLessThanOrEqual(400 + 24);
   });
 
-  it("backs the camera off on narrow aspects so the node ring fits between the panels", () => {
-    const wide = cameraDistance(1366, 768);
-    const square = cameraDistance(1200, 1100);
-    const phone = cameraDistance(390, 844);
-    expect(wide).toBeGreaterThanOrEqual(9);
-    expect(wide).toBeLessThan(11);
-    expect(square).toBeGreaterThan(wide);
-    expect(phone).toBeGreaterThan(wide);
+  it("widens the field of view on portrait screens", () => {
     expect(cameraFov(390 / 844)).toBeGreaterThan(cameraFov(1366 / 768));
+  });
+});
+
+const overlaps = (a: ScreenRect, b: ScreenRect) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+
+describe("camera framing", () => {
+  const VIEWPORTS: [number, number][] = [[1366, 768], [1920, 1080], [1280, 800], [1440, 900], [1200, 1100], [2560, 1080], [820, 760], [390, 844]];
+
+  it("reserves a real dock for the command bar", () => {
+    expect(DOCK_HEIGHT).toBeGreaterThanOrEqual(64);
+    const dock = dockRect(1366, 768);
+    expect(dock.bottom - dock.top).toBe(DOCK_HEIGHT);
+    expect(dock.bottom).toBeLessThanOrEqual(768 - 12);
+  });
+
+  it("keeps the lowest node label above the dock at 1366x768", () => {
+    const view = fitView(1366, 768);
+    const nodes = projectNodes(homePose(view.distance), 1366, 768, view);
+    const lowest = Math.max(...nodes.map((node) => node.label.bottom));
+    expect(lowest).toBeLessThanOrEqual(dockRect(1366, 768).top);
+  });
+
+  for (const [width, height] of VIEWPORTS) {
+    it(`frames every node and label clear of the panels, top bar and dock at ${width}x${height}`, () => {
+      const view = fitView(width, height);
+      const nodes = projectNodes(homePose(view.distance), width, height, view);
+      expect(nodes).toHaveLength(6);
+      const blocked = [...panelRects(width, height), dockRect(width, height)];
+      for (const node of nodes) {
+        for (const rect of blocked) {
+          expect(overlaps(node.marker, rect), `${node.id} marker vs ${JSON.stringify(rect)}`).toBe(false);
+          expect(overlaps(node.label, rect), `${node.id} label vs ${JSON.stringify(rect)}`).toBe(false);
+        }
+        expect(node.marker.top, `${node.id} under the top bar`).toBeGreaterThanOrEqual(view.free.top);
+        expect(node.marker.left).toBeGreaterThanOrEqual(0);
+        expect(node.label.right).toBeLessThanOrEqual(width);
+      }
+      // The core sits in the middle of the free space, horizontally centred.
+      const core = projectNodes(homePose(view.distance), width, height, view, [{ id: "core", position: [0, 0, 0] }])[0]!;
+      expect(Math.abs((core.marker.left + core.marker.right) / 2 - width / 2)).toBeLessThan(2);
+    });
+  }
+
+  it("keeps the 16:9 core about as large as before (no needless zoom-out)", () => {
+    const view = fitView(1366, 768);
+    expect(view.distance).toBeGreaterThan(9);
+    expect(view.distance).toBeLessThan(11.5);
+  });
+
+  for (const [width, height] of [[1366, 768], [1920, 1080], [1280, 800]] as const) {
+    it(`keeps all six nodes and labels visible and clickable with any node focused at ${width}x${height}`, () => {
+      const view = fitView(width, height);
+      const blocked = [...panelRects(width, height), dockRect(width, height)];
+      for (const { id } of NODE_LAYOUT) {
+        const pose = focusPose(view, width, height, id);
+        const nodes = projectNodes(pose, width, height, view);
+        for (const node of nodes) {
+          for (const rect of blocked) {
+            expect(overlaps(node.marker, rect), `focus ${id}: ${node.id} marker`).toBe(false);
+            expect(overlaps(node.label, rect), `focus ${id}: ${node.id} label`).toBe(false);
+          }
+          expect(node.marker.top, `focus ${id}: ${node.id} under the top bar`).toBeGreaterThanOrEqual(view.free.top);
+        }
+      }
+    });
+  }
+
+  it("focus really moves the camera for a side node at 1366x768", () => {
+    const view = fitView(1366, 768);
+    const home = homePose(view.distance);
+    const focused = focusPose(view, 1366, 768, "tools");
+    expect(focused.position.distanceTo(home.position)).toBeGreaterThan(0.2);
+    expect(focused.target.toArray()).toEqual(home.target.toArray()); // the core stays the centre of attention
+  });
+});
+
+describe("needsWake", () => {
+  it("wakes the frameloop when the shown state changes or the tab becomes visible again", () => {
+    const before = { state: "idle" as const, visible: true };
+    expect(needsWake(before, { state: "offline", visible: true })).toBe(true);
+    expect(needsWake({ state: "idle", visible: false }, { state: "idle", visible: true })).toBe(true);
+    expect(needsWake(before, { state: "idle", visible: true })).toBe(false);
+    expect(needsWake(before, { state: "idle", visible: false })).toBe(false);
   });
 });

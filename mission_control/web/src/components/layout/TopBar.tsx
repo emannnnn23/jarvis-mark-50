@@ -65,14 +65,17 @@ function ViewMenu({ performance }: { performance: PerformanceMode }) {
     const onPointer = (event: PointerEvent) => {
       if (root.current !== null && !root.current.contains(event.target as Node)) setOpen(false);
     };
+    // Capture phase, and mark the key handled: Escape closes this menu only, not the node details too.
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
     };
     document.addEventListener("pointerdown", onPointer);
-    document.addEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("pointerdown", onPointer);
-      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
   return (

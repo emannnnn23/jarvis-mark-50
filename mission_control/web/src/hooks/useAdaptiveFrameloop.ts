@@ -8,7 +8,7 @@
  * - "demand" otherwise, with the idle core breathing at 15 fps (not at all in Low quality).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useDocumentVisible } from "./useDocumentVisible";
 import { displayState } from "../store/reducer";
@@ -33,6 +33,20 @@ export interface FrameloopInput {
   lastEventAt: number | null;
   now: number;
   quality: QualityLevel;
+}
+
+/**
+ * Changes that are not log events but still change the picture: the shown state (going offline is
+ * decided in the browser, with no event) and the tab becoming visible again (whatever changed while it
+ * was hidden was never drawn). Each opens the same short window as an event, so Low quality, which does
+ * not breathe on demand, still draws them.
+ */
+export function needsWake(
+  previous: { state: JarvisState; visible: boolean },
+  next: { state: JarvisState; visible: boolean },
+): boolean {
+  if (!next.visible) return false;
+  return next.state !== previous.state || !previous.visible;
 }
 
 export function frameloopFor({ hidden, state, interacting, lastEventAt, now }: FrameloopInput): Frameloop {
@@ -65,6 +79,18 @@ export function useAdaptiveFrameloop(quality: QualityLevel): { frameloop: Framel
       }),
     [],
   );
+
+  // Not events, but they change what must be drawn: wake for them like for an event.
+  const seen = useRef({ state, visible });
+  useEffect(() => {
+    const next = { state, visible };
+    if (needsWake(seen.current, next)) {
+      const at = performance.now();
+      setLastEventAt(at);
+      setNow(at);
+    }
+    seen.current = next;
+  }, [state, visible]);
 
   const interacting = cameraActivity.isActive(now);
   const decided = frameloopFor({ hidden: !visible, state, interacting, lastEventAt, now, quality });

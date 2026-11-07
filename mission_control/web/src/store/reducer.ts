@@ -328,9 +328,14 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       subsystems = patch(subsystems, "llm", { in_flight: false });
       break;
     case "request.start":
-    case "request.end":
-      // A request that started or ended cannot still be running a tool.
+      // A new request cannot still be running a tool from the last one.
       subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
+      break;
+    case "request.end":
+      // Nor can an ended one still be calling the model: a call cut short (Ctrl-C, cancel) sends no
+      // llm.call end, so the request's end is the last word on it.
+      subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
+      subsystems = patch(subsystems, "llm", { in_flight: false });
       break;
     case "llm.call":
       subsystems = patch(subsystems, "llm", { model: event.model, attempt: event.attempt, in_flight: event.phase === "start" });

@@ -12,13 +12,11 @@ import { displayState } from "../../store/reducer";
 import { useMission } from "../../store/store";
 import { useUi } from "../../store/ui";
 import type { SubsystemId } from "../../types/events";
+import { LABEL_DROP } from "../scene/cameraFit";
 import { DataLinks } from "./DataLink";
 import { SubsystemNode } from "./SubsystemNode";
 import { NODE_LAYOUT } from "./layout";
 import { labelElements } from "./labelRegistry";
-
-/** Label offset below the marker, in CSS pixels. */
-const LABEL_DROP = 30;
 
 /**
  * Moves each DOM label under its node's projected position. It sits inside the same parallax group as

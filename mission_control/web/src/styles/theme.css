@@ -121,9 +121,10 @@ body {
   display: none;
 }
 
+/* Top left of the scene's middle: clear of LLM CORE above the core and of MEMORY to the left. */
 .hud-center {
   grid-area: center;
-  justify-self: center;
+  justify-self: start;
   align-self: start;
 }
 
@@ -153,10 +154,16 @@ body {
   overflow: hidden;
 }
 
+/* The command bar's place (Task 10), reserved at every size: 64 px tall (cameraFit.ts DOCK_HEIGHT keeps
+   the node ring above it). Until the bar arrives it is an empty, barely visible cradle. */
 .hud-dock {
   grid-area: dock;
   justify-self: center;
   width: min(640px, 100%);
+  min-height: 64px;
+  border: 1px solid rgba(111, 231, 245, 0.07);
+  border-radius: 2px;
+  background: linear-gradient(to top, rgba(111, 231, 245, 0.035), transparent);
 }
 
 .scene-fallback {
@@ -467,7 +474,7 @@ body {
 }
 
 .reset-view {
-  margin-top: 6px;
+  margin-top: 2px;
 }
 
 /* --- panels ------------------------------------------------------------------------------------ */

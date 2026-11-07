@@ -321,5 +321,13 @@ describe("reduce", () => {
     expect(after.voiceLevel).toBeNull();
     expect(after.subsystems.llm.in_flight).toBe(false);
   });
+
+  it("stops showing a model call in flight when the request ends (a cancelled call sends no llm.call end)", () => {
+    const calling = run([snapshot(), ev("request.start", 51, { source: "terminal", text: "hi" }),
+      ev("llm.call", 52, { phase: "start", model: "m", attempt: 1 })]);
+    expect(calling.subsystems.llm.in_flight).toBe(true);
+    const cancelled = reduce(calling, ev("request.end", 53, { status: "cancelled", duration_ms: 900 }));
+    expect(cancelled.subsystems.llm.in_flight).toBe(false);
+  });
 });
 
