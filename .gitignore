@@ -20,9 +20,15 @@ htmlcov/
 # Personal data: the memory file stores your name, location, remembered facts and a
 # log of recent conversations. It is created automatically when missing.
 jarvis_memory.json
+# Multi-step tasks and checkpoints (personal data, like the memory file)
+jarvis_tasks.json
+jarvis_tasks.corrupt-*.json
 # Backups made by "/memory reset" when the memory file was corrupted
 jarvis_memory.corrupt-*.json
 
 # Temporary text-to-speech audio
 *.mp3
 jarvis-tts-*/
+
+# Superpowers plan workspaces (scratch: ledgers, briefs, review packages)
+.superpowers/

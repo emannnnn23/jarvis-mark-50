@@ -310,6 +310,7 @@ class Config:
     voice: str = DEFAULT_VOICE
     tts_enabled: bool = True
     memory_path: Path = SCRIPT_DIR / "jarvis_memory.json"
+    tasks_path: Path = SCRIPT_DIR / "jarvis_tasks.json"  # multi-step tasks and their checkpoints
     workspace: Path = Path.home() / "Projects"
     notes_dir: Path = Path.home() / "Documents" / "JARVIS Notes"
     log_dir: Path = _xdg_dir("XDG_DATA_HOME", ".local/share") / APP_NAME / "logs"
@@ -319,6 +320,7 @@ class Config:
     search_limit: int = 5
     log_level: str = "INFO"
     history_turns: int = 10
+    restore_turns: int = 6  # recent exchanges reloaded at startup, so JARVIS remembers when you come back
     permission_mode: str = "standard"
     editor: str = "code"
     save_conversations: bool = True
@@ -380,6 +382,7 @@ class Config:
             voice=(env.get("JARVIS_VOICE") or DEFAULT_VOICE).strip(),
             tts_enabled=_env_bool(env, "JARVIS_TTS_ENABLED", True),
             memory_path=path_setting("JARVIS_MEMORY_PATH", SCRIPT_DIR / "jarvis_memory.json"),
+            tasks_path=path_setting("JARVIS_TASKS_PATH", SCRIPT_DIR / "jarvis_tasks.json"),
             workspace=path_setting("JARVIS_WORKSPACE", Path.home() / "Projects"),
             notes_dir=path_setting("JARVIS_NOTES_DIR", Path.home() / "Documents" / "JARVIS Notes"),
             log_dir=path_setting("JARVIS_LOG_DIR", data_home / APP_NAME / "logs"),
@@ -389,6 +392,7 @@ class Config:
             search_limit=_env_int(env, "JARVIS_SEARCH_LIMIT", 5, 1, 10),
             log_level=log_level,
             history_turns=_env_int(env, "JARVIS_HISTORY_TURNS", 10, 0, 50),
+            restore_turns=_env_int(env, "JARVIS_RESTORE_TURNS", 6, 0, 20),
             permission_mode=mode,
             editor=(env.get("JARVIS_EDITOR") or "code").strip(),
             save_conversations=_env_bool(env, "JARVIS_SAVE_CONVERSATIONS", True),

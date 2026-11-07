@@ -322,6 +322,13 @@ class MemoryStore:
                 raise
             return self.profile()
 
+    def recent_conversations(self, limit: int) -> list[dict[str, Any]]:
+        """Copies of the last `limit` logged exchanges, oldest first. Already redacted and bounded."""
+        if limit <= 0:
+            return []
+        with self._lock:
+            return [dict(item) for item in self.data["conversations"][-limit:] if isinstance(item, dict)]
+
     def add_conversation(self, user_text: str, assistant_text: str) -> None:
         """Keep a short, redacted, bounded log of exchanges. Silently skipped if read-only."""
         with self._lock:

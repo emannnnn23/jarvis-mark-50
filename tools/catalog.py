@@ -9,27 +9,31 @@ from typing import TYPE_CHECKING
 
 from core.policy import Permission
 from memory.json_store import MAX_FACT_LENGTH
+from memory.task_store import STEP_STATUSES
 from tools.browser import BrowserTools
 from tools.developer import DeveloperTools
 from tools.filesystem import FileTools
 from tools.linux_system import SystemTools, cancel_running_commands
 from tools.memory_tools import MemoryTools
 from tools.registry import Tool, ToolRegistry
+from tools.task_tools import TaskTools, UPDATE_TASK_ACTIONS
 from tools.web_search import WebSearchTools
 
 if TYPE_CHECKING:
     from config.settings import Config
     from memory.json_store import MemoryStore
+    from memory.task_store import TaskStore
 
 
-class JarvisTools(WebSearchTools, BrowserTools, MemoryTools, SystemTools, FileTools, DeveloperTools):
+class JarvisTools(WebSearchTools, BrowserTools, MemoryTools, TaskTools, SystemTools, FileTools, DeveloperTools):
     """The concrete tool handlers. Each returns JSON-friendly data or raises ToolError."""
 
     def __init__(self, config: Config, memory: MemoryStore,
                  browser_open: Callable[[str], bool] = webbrowser.open,
-                 ddgs_factory: Callable[..., Any] | None = None):
+                 ddgs_factory: Callable[..., Any] | None = None, tasks: TaskStore | None = None):
         self.config = config
         self.memory = memory
+        self.tasks = tasks
         self.browser_open = browser_open
         self.ddgs_factory = ddgs_factory
 
@@ -84,6 +88,24 @@ def build_registry(tools: JarvisTools) -> ToolRegistry:
         Tool("set_user_profile", "Store the user's name and/or location, only when the user states them.",
              _object({"user_name": _string("User's name", 100), "location": _string("User's location", 200)}),
              tools.set_user_profile, C, timeout=10),
+        # READ_ONLY on purpose: it edits only JARVIS's own task notes (the plan and its checkpoints), never
+        # the user's files, memory or desktop, and a plan has to be kept even in read-only mode.
+        Tool("update_task", "Keep the plan for a multi-step job so it survives interruptions and restarts. Call it "
+             "in the same response as your other tool calls, never as a response of its own. action start: begin a "
+             "task with a goal and a short plan (steps, one per line). plan: replace the plan. step: record a "
+             "step's status; done needs evidence of what was done, skipped the reason. finish: close the task once "
+             "every step is done or skipped, with a summary, only with evidence that the goal is met. abandon: give "
+             "the task up. It acts on the active task.",
+             _object({"action": {"type": "string", "enum": list(UPDATE_TASK_ACTIONS)},
+                      "goal": _string("What the task is for, in one line (start)", 1000),
+                      "steps": _string("The plan, one step per line (start, plan)", 3000),
+                      "step": {"type": "integer", "minimum": 1, "description": "Step number from 1 (step)"},
+                      "status": {"type": "string", "enum": list(STEP_STATUSES), "description": "New step status (step)"},
+                      "evidence": _string("What was done, e.g. the file changed or the test result (step; required "
+                                          "for done and skipped)", 1000),
+                      "summary": _string("What was achieved (finish)", 1000)},
+                     ["action"]),
+             tools.update_task, R, timeout=10),
         Tool("get_system_status", "Report hostname, OS, uptime, CPU load, memory, disk usage and battery.", _object(),
              tools.get_system_status, R, timeout=15),
         Tool("list_processes", "List the top running processes by CPU or memory.",

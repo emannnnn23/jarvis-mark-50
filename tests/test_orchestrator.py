@@ -404,12 +404,50 @@ class HelperTests(unittest.TestCase):
         self.assertIn("Never claim to be always listening", OPERATING_RULES)
         self.assertIn("Never claim to be always listening", prompt)
 
+    def test_last_seen_goes_into_the_context(self):
+        config = jarvis.Config(api_key="gsk_" + "a" * 40)
+        stamp = "2 hours ago (2026-11-06T09:00:00+00:00)"
+        prompt = build_system_prompt(config, last_seen=stamp)
+        context = prompt.split("Context:\n", 1)[1]
+        self.assertIn(f"- Previous conversation (before this session): {stamp}", context)
+        self.assertNotIn("Previous conversation", build_system_prompt(config))
+
+    def test_conversation_restore_appends_complete_turns_and_respects_the_limits(self):
+        conversation = jarvis.Conversation(max_turns=3)
+        entries = [{"timestamp": "t", "user": f"q{i}", "assistant": f"a{i}"} for i in range(5)]
+        entries.insert(2, {"timestamp": "t", "user": "no answer", "assistant": ""})
+        entries.insert(3, {"timestamp": "t", "user": "   ", "assistant": "orphan"})
+        entries.insert(4, {"timestamp": "t", "user": 7, "assistant": None})
+        entries.insert(5, "not a dict")
+        self.assertEqual(conversation.restore(entries), 3)
+        self.assertEqual(conversation.turns, [("q2", "a2"), ("q3", "a3"), ("q4", "a4")])
+        self.assertEqual(conversation.summary_lines, ["- The user asked: q0", "- The user asked: q1"])
+        small = jarvis.Conversation(max_chars=10)
+        self.assertEqual(small.restore([{"user": "abcd", "assistant": "efgh"}, {"user": "ij", "assistant": "kl"}]), 1)
+        self.assertEqual(small.turns, [("ij", "kl")])
+        self.assertEqual(jarvis.Conversation().restore([]), 0)
+
     def test_conversation_trims_and_summarises(self):
         conversation = jarvis.Conversation(max_turns=2)
         for i in range(4):
             conversation.add(f"q{i}", f"a{i}")
         self.assertEqual([m["content"] for m in conversation.messages()], ["q2", "a2", "q3", "a3"])
         self.assertIn("q0", conversation.summary)
+
+
+class LastSeenAgentTests(AgentTestCase):
+    def system_prompt(self, **kwargs) -> str:
+        client = FakeGroqClient([response("Welcome back, Sir.")])
+        ctx = jarvis.AgentContext(client, self.config, self.registry, self.policy, self.memory)
+        jarvis.run_agent(ctx, "hello", **kwargs)
+        return client.calls[0]["messages"][0]["content"]
+
+    def test_run_agent_passes_last_seen_into_the_system_message(self):
+        stamp = "yesterday (2026-11-05T21:30:00+00:00)"
+        self.assertIn(f"- Previous conversation (before this session): {stamp}", self.system_prompt(last_seen=stamp))
+
+    def test_run_agent_without_last_seen_has_no_such_line(self):
+        self.assertNotIn("Previous conversation", self.system_prompt())
 
 
 class DeveloperModeAgentTests(AgentTestCase):
@@ -544,7 +582,8 @@ class DeveloperModeAgentTests(AgentTestCase):
                          {"tool": "edit_workspace_file", "status": "success", "target": "a/b.py"})
         self.assertEqual(event("run_project_tests", {"project": "shop"},
                                {"status": "success", "result": {"passed": False, "exit_code": 1}}),
-                         {"tool": "run_project_tests", "status": "success", "target": "shop", "passed": False})
+                         {"tool": "run_project_tests", "status": "success", "target": "shop", "passed": False,
+                          "check": "tests", "project": "shop"})
         self.assertEqual(event("open_url", {"url": "https://x.example/" + "p" * 300}, {"status": "denied"})["target"],
                          ("https://x.example/" + "p" * 300)[:120])
         self.assertEqual(event("remember", {"name": "Ann"}, {"status": "success", "result": "ok"})["target"], "Ann")
