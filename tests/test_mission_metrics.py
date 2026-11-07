@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -36,6 +37,10 @@ class FakePsutil:
     def boot_time(self):
         return 1000.0
 
+    class Process:
+        def create_time(self):
+            return 2000.0
+
 
 class MetricsSamplerTests(unittest.TestCase):
     def make(self, fake: FakePsutil | None = None, **kwargs) -> tuple[MetricsSampler, FakePsutil]:
@@ -57,9 +62,8 @@ class MetricsSamplerTests(unittest.TestCase):
         self.assertEqual(payload["disk_total"], 500_000_000_000)
         self.assertEqual(payload["disk_used"], 100_000_000_000)
         self.assertEqual(payload["uptime_s"], 3600)
+        self.assertEqual(payload["process_uptime_s"], 2600)  # now 4600 - process start 2000
         self.assertEqual(payload["load_avg"], [0.5, 1.0, 1.5])
-        self.assertIsInstance(payload["process_uptime_s"], int)
-        self.assertGreaterEqual(payload["process_uptime_s"], 0)
         self.assertIsInstance(payload["os"], str)
         self.assertEqual(fake.disk_paths, ["/some/where"])
         for key in ("memory_total", "memory_available", "memory_used", "disk_total", "disk_used", "uptime_s"):
@@ -96,10 +100,27 @@ class MetricsSamplerTests(unittest.TestCase):
         sampler = MetricsSampler(psutil_module=fake)
         self.assertIsNone(sampler.sample())
 
-    def test_load_average_unavailable_falls_back_to_zeros(self) -> None:
+    def test_load_average_unavailable_returns_none(self) -> None:
         sampler, _ = self.make()
-        with mock.patch.object(metrics.os, "getloadavg", side_effect=OSError):
-            self.assertEqual(sampler.sample()["load_avg"], [0.0, 0.0, 0.0])
+        with mock.patch.object(metrics.os, "getloadavg", side_effect=OSError), \
+                self.assertLogs("jarvis.mission_control.metrics", level="DEBUG"):
+            self.assertIsNone(sampler.sample())
+
+    def test_first_sample_from_a_new_thread_primes_then_returns_none(self) -> None:
+        sampler, fake = self.make()  # primed on this (test) thread
+        results: list = []
+
+        def run() -> None:
+            results.extend([sampler.sample(), sampler.sample()])
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join()
+        self.assertIsNone(results[0])
+        self.assertIsInstance(results[1], dict)
+        self.assertEqual(results[1]["cpu_percent"], 12.5)
+        # priming in __init__, the discard read on the worker, then the real read
+        self.assertEqual(len(fake.cpu_calls), 3)
 
     def test_os_name_comes_from_pretty_name_and_is_cached(self) -> None:
         sampler, _ = self.make()

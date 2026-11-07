@@ -2,13 +2,18 @@
 
 The server calls `MetricsSampler.sample()` every 2 s, and only while a browser is connected, on its event
 loop. So `sample()` must neither block nor raise: CPU use is read with `interval=None` (the percentage since
-the previous call, primed once at construction) and any unexpected psutil failure becomes `None`, which
-the server shows as an "unavailable" SYSTEM node rather than as zeros."""
+the previous call, primed at construction) and any unexpected psutil failure becomes `None`, which
+the server shows as an "unavailable" SYSTEM node rather than as zeros.
+
+psutil keeps its non-blocking CPU baseline per thread, so a read from a thread other than the one that
+primed it returns a fake 0.0. The sampler therefore remembers which thread primed it; the first `sample()`
+from a different thread primes again and returns None (no number is better than a made-up one)."""
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -24,7 +29,6 @@ except ImportError:  # psutil is optional; the SYSTEM node then reports "unavail
 log = logging.getLogger("jarvis.mission_control.metrics")
 
 GROQ_HOST = "api.groq.com"
-_PROCESS_START = time.time()  # imported when JARVIS starts, so this is the process's uptime origin
 _UNSET: Any = object()
 
 
@@ -48,16 +52,25 @@ class MetricsSampler:
         self._psutil = psutil if psutil_module is _UNSET else psutil_module
         self._disk_path = Path.home() if disk_path is None else disk_path
         self._os_name: str | None = None
+        self._primed_thread: int | None = None
         self.available = self._psutil is not None
         if self.available:
-            try:
-                self._psutil.cpu_percent(interval=None)  # the first call always returns 0.0; discard it
-            except Exception as exc:  # noqa: BLE001 - priming must never stop JARVIS from starting
-                log.debug("cpu_percent priming failed: %s", exc)
+            self._prime_cpu()
+
+    def _prime_cpu(self) -> None:
+        """Discard the first (always 0.0) non-blocking CPU read, on the calling thread."""
+        try:
+            self._psutil.cpu_percent(interval=None)
+            self._primed_thread = threading.get_ident()
+        except Exception as exc:  # noqa: BLE001 - priming must never stop JARVIS from starting
+            log.debug("cpu_percent priming failed: %s", exc)
 
     def sample(self) -> dict[str, Any] | None:
         """A `system.metrics` payload, or None when psutil is missing or fails."""
         if self._psutil is None:
+            return None
+        if self._primed_thread != threading.get_ident():
+            self._prime_cpu()  # baseline is per thread; the next sample from this thread is real
             return None
         try:
             cpu = float(self._psutil.cpu_percent(interval=None))
@@ -74,7 +87,7 @@ class MetricsSampler:
                 "disk_total": int(disk.total),
                 "disk_used": int(disk.used),
                 "uptime_s": max(0, int(now - self._psutil.boot_time())),
-                "process_uptime_s": max(0, int(now - _PROCESS_START)),
+                "process_uptime_s": max(0, int(now - self._psutil.Process().create_time())),
                 "load_avg": self._load_avg(),
                 "os": self._os(),
             }
@@ -84,10 +97,8 @@ class MetricsSampler:
 
     @staticmethod
     def _load_avg() -> list[float]:
-        try:
-            return [round(v, 2) for v in os.getloadavg()]
-        except (OSError, AttributeError):
-            return [0.0, 0.0, 0.0]
+        # An OSError here propagates to sample(), which reports "no metrics" instead of fake zeros.
+        return [round(v, 2) for v in os.getloadavg()]
 
     def _os(self) -> str:
         if self._os_name is None:
@@ -96,7 +107,10 @@ class MetricsSampler:
 
 
 def probe_groq(timeout: float = 3.0) -> dict[str, Any]:
-    """A `network.status` payload from a TCP probe of api.groq.com:443 (no request, so no key is involved)."""
+    """A `network.status` payload from a TCP probe of api.groq.com:443 (no request, so no key is involved).
+
+    BLOCKS for up to `timeout` seconds (DNS resolution has no timeout of its own and can take longer), so
+    async callers must run it in an executor, never directly on the event loop."""
     try:
         result = probe_https(GROQ_HOST, 443, timeout)
     except Exception as exc:  # noqa: BLE001 - probe_https handles OSError; anything else still means "down"

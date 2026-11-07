@@ -247,7 +247,10 @@ def probe_https(host: str, port: int = 443, timeout: float = 4.0) -> dict[str, A
 
     Shared by the `check_network` tool and Mission Control's Groq probe so both agree on what "reachable"
     means. `latency_ms` (connect time) is present only when the connection succeeded. When DNS fails,
-    `https_port` is absent, exactly as `check_network` has always reported it."""
+    `https_port` is absent, exactly as `check_network` has always reported it.
+
+    BLOCKS (DNS resolution plus up to `timeout` seconds of connecting): async callers must run it in an
+    executor, never directly on the event loop."""
     check: dict[str, Any] = {"host": host}
     try:
         socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
