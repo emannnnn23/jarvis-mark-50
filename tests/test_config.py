@@ -480,5 +480,108 @@ class PermissionsFileCheckTests(TempDirTestCase):
         self.assertIn("[warn] permissions file", lines[0])
         self.assertIn(f"{path} not found; no project commands are allowed", lines[0])
 
+
+class MissionControlSettingsTests(unittest.TestCase):
+    def config(self, **extra):
+        return jarvis.Config.from_env(env={"GROQ_API_KEY": FAKE_KEY, **extra})
+
+    def test_defaults(self):
+        config = self.config()
+        self.assertFalse(config.ui_enabled)
+        self.assertEqual(config.ui_port, 8765)
+        self.assertTrue(config.ui_open_browser)
+        self.assertEqual(config.ui_dev_origin, "")
+        self.assertEqual(config.confirm_timeout, 600)
+        plain = jarvis.Config(api_key=FAKE_KEY)
+        self.assertEqual((plain.ui_enabled, plain.ui_port, plain.ui_open_browser, plain.ui_dev_origin,
+                          plain.confirm_timeout), (False, 8765, True, "", 600))
+
+    def test_values_from_env(self):
+        config = self.config(JARVIS_UI_ENABLED="true", JARVIS_UI_PORT="9000", JARVIS_UI_OPEN_BROWSER="no",
+                             JARVIS_UI_DEV_ORIGIN="http://localhost:5173", JARVIS_CONFIRM_TIMEOUT="0")
+        self.assertEqual((config.ui_enabled, config.ui_port, config.ui_open_browser, config.ui_dev_origin,
+                          config.confirm_timeout), (True, 9000, False, "http://localhost:5173", 0))
+        self.assertEqual(self.config(JARVIS_UI_DEV_ORIGIN=" http://127.0.0.1:4173 ").ui_dev_origin,
+                         "http://127.0.0.1:4173")
+
+    def test_port_range(self):
+        self.assertEqual(self.config(JARVIS_UI_PORT="1024").ui_port, 1024)
+        self.assertEqual(self.config(JARVIS_UI_PORT="65535").ui_port, 65535)
+        for value in ("1023", "0", "65536", "-1", "abc", "80.5"):
+            with self.subTest(value=value):
+                with self.assertRaises(jarvis.ConfigError) as ctx:
+                    self.config(JARVIS_UI_PORT=value)
+                self.assertIn("JARVIS_UI_PORT", str(ctx.exception))
+
+    def test_confirm_timeout_range(self):
+        self.assertEqual(self.config(JARVIS_CONFIRM_TIMEOUT="3600").confirm_timeout, 3600)
+        for value in ("-1", "3601", "ten"):
+            with self.subTest(value=value):
+                with self.assertRaises(jarvis.ConfigError) as ctx:
+                    self.config(JARVIS_CONFIRM_TIMEOUT=value)
+                self.assertIn("JARVIS_CONFIRM_TIMEOUT", str(ctx.exception))
+
+    def test_bools_validated(self):
+        for name in ("JARVIS_UI_ENABLED", "JARVIS_UI_OPEN_BROWSER"):
+            with self.subTest(name=name):
+                with self.assertRaises(jarvis.ConfigError):
+                    self.config(**{name: "maybe"})
+
+    def test_bad_dev_origin(self):
+        for value in ("https://localhost:5173", "http://evil.example:5173", "http://localhost",
+                      "http://localhost:5173/", "http://localhost:5173\nx", "http://localhost:5173:80",
+                      "http://LOCALHOST:5173", "http://127.0.0.2:5173", "http://localhost:51a3",
+                      "ws://localhost:5173", "http://user@localhost:5173", "*", "null",
+                      "http://localhost:\u0665\u0661\u0667\u0663"):  # Arabic-Indic digits
+            with self.subTest(value=value):
+                with self.assertRaises(jarvis.ConfigError) as ctx:
+                    self.config(JARVIS_UI_DEV_ORIGIN=value)
+                self.assertIn("JARVIS_UI_DEV_ORIGIN", str(ctx.exception))
+
+
+class MissionControlCheckTests(TempDirTestCase):
+    def check_lines(self, config=None, dist=None) -> list[str]:
+        dist = dist if dist is not None else self.tmp / "dist"
+        real_import = __import__
+        imported = []
+
+        def spy(name, globals=None, *args, **kwargs):
+            if name.startswith("aiohttp") and (globals or {}).get("__name__") in ("jarvis", "__main__"):
+                imported.append(name)
+            return real_import(name, globals, *args, **kwargs)
+
+        with mock.patch("jarvis.initialize_client", side_effect=AssertionError("no network allowed")), \
+                mock.patch("jarvis.MISSION_DIST_DIR", dist), mock.patch("builtins.__import__", side_effect=spy), \
+                mock.patch("builtins.print") as printed:
+            jarvis.run_checks(config or self.make_config(api_key="not-a-key"))
+        self.assertEqual(imported, [])
+        return [line for line in printed_text(printed).splitlines() if "Mission Control" in line]
+
+    def test_server_line_reports_aiohttp_version_without_importing_it(self):
+        with mock.patch("jarvis.importlib.metadata.version", return_value="3.14.5") as version:
+            lines = self.check_lines()
+        version.assert_called_with("aiohttp")
+        self.assertIn("[ok  ] Mission Control server: aiohttp 3.14.5", lines[0])
+
+    def test_server_line_warns_when_aiohttp_is_missing(self):
+        real_find_spec = jarvis.importlib.util.find_spec
+        with mock.patch("jarvis.importlib.util.find_spec",
+                        side_effect=lambda name, *a: None if name == "aiohttp" else real_find_spec(name, *a)):
+            lines = self.check_lines()
+        self.assertIn("[warn] Mission Control server", lines[0])
+        self.assertIn("aiohttp is not installed", lines[0])
+
+    def test_ui_line_not_built_then_built(self):
+        lines = self.check_lines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("[warn] Mission Control UI: not built: cd mission_control/web && npm ci && npm run build",
+                      lines[1])
+        dist = self.tmp / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+        lines = self.check_lines(dist=dist)
+        self.assertIn("[ok  ] Mission Control UI: built", lines[1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,11 +12,13 @@ import select
 import signal
 import sys
 import threading
+import time
 from typing import Callable
 from typing import TYPE_CHECKING
 
 from config.settings import VERSION
 from core.audit import clean_text, log, reveal_invisible, safe_display
+from core.events import BUS, emit, scrub
 from core.orchestrator import run_agent
 from core.policy import ConfirmationRequest, Permission
 from core.session import Conversation
@@ -210,6 +212,8 @@ class JarvisCLI:
         self._busy = False
         self._interrupt_pending = False
         self._interrupt_lock = threading.Lock()
+        # Where the line being handled came from, for Mission Control (set by the voice paths, reset per step).
+        self._request_source = "terminal"
         # A wake word heard at a confirmation prompt cancels the whole request, not just the prompt.
         ctx.policy.cancel_requested = lambda: self._interrupt_pending
         if listen:
@@ -341,7 +345,10 @@ class JarvisCLI:
             if kind == "command":  # (stop_wake drains the queue, so nothing captured before /wake off gets here)
                 print()
                 with self._busy_scope():
-                    return self._voice_command(payload) or None
+                    text = self._voice_command(payload)
+                    if text:
+                        self._request_source = "voice"
+                    return text or None
             if not self.hands_free:  # the listener stopped (error or /wake off)
                 print()
                 return None
@@ -407,6 +414,8 @@ class JarvisCLI:
     def say(self, text: str, speak: bool = True) -> None:
         text = safe_display(text)
         print(f"\n{style('JARVIS:', 'cyan')} {text}\n")
+        if BUS.enabled:  # scrubbed before the cut, so a secret split at 4000 characters cannot leak
+            emit("assistant.message", text=scrub(text, max_str=4000))
         if speak:
             self.voice.say(text)
 
@@ -749,6 +758,7 @@ class JarvisCLI:
         `said` is what the user actually typed or spoke when `text` is a message written for them."""
         self.voice.stop()
         said = text if said is None else said
+        source, self._request_source = self._request_source, "terminal"
         if self.tasks is not None and is_resume_phrase(text):
             task = self._shortcut_task()  # otherwise "continue" is an ordinary message
             if task is not None:
@@ -760,34 +770,67 @@ class JarvisCLI:
         self._paused_by_last_request = None
         self._maybe_enter_developer_mode(topic if topic is not None else text)
         print(style("  ...", "dim"))
+        with BUS.request_scope(source), self._request_events(source, said) as outcome:
+            try:
+                result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
+                                   on_tool=lambda name: print(style(f"  > {name}", "dim")),
+                                   on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
+                                   tool_groups={"core", "developer"} if self.developer_mode else {"core"},
+                                   voice_state=self.voice_state(), last_seen=self.last_seen,
+                                   on_progress=lambda message: print(style(f"  {safe_display(message)}", "dim")))
+            except KeyboardInterrupt:
+                outcome["status"] = "cancelled"
+                self._consume_interrupt()  # a wake-word interruption is fully handled here
+                print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))
+                self._paused_by_last_request = self._pause_active_task("interrupted by the user")
+                return
+            except JarvisAPIError as exc:
+                outcome.update(status="error", error_kind=exc.kind)
+                log.warning("API error (%s): %s", exc.kind, exc)
+                self.say(f"I'm afraid I couldn't complete that. {exc}", speak=False)
+                # No tool ran, but a resumed task would otherwise stay active with no word of why it stopped.
+                self._paused_by_last_request = self._pause_active_task(f"the model could not be reached: {exc}",
+                                                                       record_error=True)
+                return
+            outcome.update(status=result.status, rounds=result.rounds)
+            self._paused_by_last_request = result.paused_task
+            reply = result.text
+            if result.status == "incomplete":
+                reply = f"{reply}\n\n(The task is incomplete.)"
+            # Record the turn before speaking, so an interruption during say() cannot lose it.
+            self.conversation.add(text, result.text)
+            if self.ctx.config.save_conversations:  # the log keeps the user's own words, not a resume message
+                self.memory.add_conversation(said, result.text)
+            self.say(reply)
+
+    @contextlib.contextmanager
+    def _request_events(self, source: str, said: str):
+        """Publish request.start, then request.end on every way out of the request (Mission Control only).
+
+        The body records how it ended in the yielded dict; anything that escapes still ends the request,
+        so the browser never shows JARVIS "processing" forever."""
+        started = time.monotonic()
+        outcome: dict = {}
+        if BUS.enabled:  # scrub before the cut: a key split at 500 characters must not leak its head
+            emit("request.start", source=source, text=scrub(said, max_str=500))
         try:
-            result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
-                               on_tool=lambda name: print(style(f"  > {name}", "dim")),
-                               on_retry=lambda reason, delay: print(style(f"  {reason} Retrying in {delay:.0f}s...", "dim")),
-                               tool_groups={"core", "developer"} if self.developer_mode else {"core"},
-                               voice_state=self.voice_state(), last_seen=self.last_seen,
-                               on_progress=lambda message: print(style(f"  {safe_display(message)}", "dim")))
+            yield outcome
         except KeyboardInterrupt:
-            self._consume_interrupt()  # a wake-word interruption is fully handled here
-            print(style("\n  Request cancelled. Any step that had already finished is not undone.", "yellow"))
-            self._paused_by_last_request = self._pause_active_task("interrupted by the user")
-            return
-        except JarvisAPIError as exc:
-            log.warning("API error (%s): %s", exc.kind, exc)
-            self.say(f"I'm afraid I couldn't complete that. {exc}", speak=False)
-            # No tool ran, but a resumed task would otherwise stay active with no word of why it stopped.
-            self._paused_by_last_request = self._pause_active_task(f"the model could not be reached: {exc}",
-                                                                   record_error=True)
-            return
-        self._paused_by_last_request = result.paused_task
-        reply = result.text
-        if result.status == "incomplete":
-            reply = f"{reply}\n\n(The task is incomplete.)"
-        # Record the turn before speaking, so an interruption during say() cannot lose it.
-        self.conversation.add(text, result.text)
-        if self.ctx.config.save_conversations:  # the log keeps the user's own words, not a resume message
-            self.memory.add_conversation(said, result.text)
-        self.say(reply)
+            outcome.setdefault("status", "cancelled")
+            raise
+        except BaseException:
+            outcome.setdefault("status", "error")
+            outcome.setdefault("error_kind", "internal")
+            raise
+        finally:
+            if BUS.enabled:
+                fields = {"status": outcome.get("status", "error"),
+                          "duration_ms": max(0, int((time.monotonic() - started) * 1000))}
+                if isinstance(outcome.get("rounds"), int):
+                    fields["rounds"] = outcome["rounds"]
+                if outcome.get("error_kind"):
+                    fields["error_kind"] = str(outcome["error_kind"])
+                emit("request.end", **fields)
 
     def _pause_active_task(self, reason: str, record_error: bool = False) -> str | None:
         """Pause the active task, if any, and say so. Returns the id of the task paused."""
@@ -832,6 +875,7 @@ class JarvisCLI:
 
     def _step(self) -> bool:
         """Read and handle one input. Returns True when the user wants to leave."""
+        self._request_source = "terminal"  # the voice paths below say otherwise
         try:
             line = self._read_line()
         except KeyboardInterrupt:
@@ -849,6 +893,8 @@ class JarvisCLI:
             return False
         if (not line and self.listen_mode) or line.lower() == "/talk":
             line = self.voice_turn()
+            if line:
+                self._request_source = "voice"
         elif not line and not self.hands_free and not self._mic_hint_shown:
             # An empty Enter with no voice mode on does nothing; say how to talk, once per session.
             self._mic_hint_shown = True

@@ -44,6 +44,13 @@ STT_BACKENDS = ("groq",)
 REASONING_EFFORTS = ("", "low", "medium", "high")  # "" = the model's own default
 
 
+DEFAULT_UI_PORT = 8765  # Mission Control listens on 127.0.0.1 only
+
+
+# The one extra origin Mission Control may accept: a local Vite dev server (exactly scheme, host and port).
+UI_DEV_ORIGIN_PATTERN = re.compile(r"http://(localhost|127\.0\.0\.1):\d+", re.ASCII)  # ASCII: no other digits
+
+
 # Executable candidates per application; the first one found on PATH is used.
 DEFAULT_APPS: dict[str, list[list[str]]] = {
     "vscode": [["code"], ["codium"]],
@@ -339,6 +346,12 @@ class Config:
     permissions_file: Path = DEFAULT_PERMISSIONS_FILE
     commands: dict[str, ProjectCommand] = dataclasses.field(default_factory=dict)
     projects: dict[str, ProjectRule] = dataclasses.field(default_factory=dict)
+    # Mission Control, the live browser view (off unless --mission-control or JARVIS_UI_ENABLED).
+    ui_enabled: bool = False
+    ui_port: int = DEFAULT_UI_PORT
+    ui_open_browser: bool = True
+    ui_dev_origin: str = ""  # a Vite dev server allowed to connect, e.g. http://localhost:5173
+    confirm_timeout: int = 600  # seconds an approval waits while Mission Control is on; 0 = forever
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None, require_api_key: bool = True) -> "Config":
@@ -360,6 +373,11 @@ class Config:
         stt_backend = (env.get("JARVIS_STT_BACKEND") or "groq").strip().lower()
         if stt_backend not in STT_BACKENDS:
             raise ConfigError(f"JARVIS_STT_BACKEND must be one of {', '.join(STT_BACKENDS)}.")
+        ui_dev_origin = (env.get("JARVIS_UI_DEV_ORIGIN") or "").strip()
+        if ui_dev_origin and not UI_DEV_ORIGIN_PATTERN.fullmatch(ui_dev_origin):
+            # Only a local dev server may be allowed in: any other origin could drive JARVIS from a web page.
+            raise ConfigError("JARVIS_UI_DEV_ORIGIN must look like http://localhost:5173 or http://127.0.0.1:5173 "
+                              "(or be empty).")
         stt_language = (env.get("JARVIS_STT_LANGUAGE") if "JARVIS_STT_LANGUAGE" in env else "en").strip().lower()
         if stt_language and not re.fullmatch(r"[a-z]{2,3}", stt_language):
             raise ConfigError("JARVIS_STT_LANGUAGE must be a language code such as en or tl, or empty to auto-detect.")
@@ -411,4 +429,9 @@ class Config:
             permissions_file=permissions_file,
             commands=permissions.commands,
             projects=permissions.projects,
+            ui_enabled=_env_bool(env, "JARVIS_UI_ENABLED", False),
+            ui_port=_env_int(env, "JARVIS_UI_PORT", DEFAULT_UI_PORT, 1024, 65535),
+            ui_open_browser=_env_bool(env, "JARVIS_UI_OPEN_BROWSER", True),
+            ui_dev_origin=ui_dev_origin,
+            confirm_timeout=_env_int(env, "JARVIS_CONFIRM_TIMEOUT", 600, 0, 3600),
         )
