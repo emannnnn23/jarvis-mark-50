@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import datetime as dt
+import hashlib
+import io
+import json
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
@@ -122,6 +128,163 @@ class TerminalConfirmTests(unittest.TestCase):
         with mock.patch("sys.stdin", stdin), mock.patch("builtins.input", side_effect=EOFError), \
                 mock.patch("builtins.print"):
             self.assertFalse(terminal.terminal_confirm(self.REQUEST))
+
+
+# --- terminal output parity ---------------------------------------------------------------------
+# The fixture was generated from the code as it was before print_details and terminal_confirm were
+# rebuilt on ConfirmationView, so these tests prove the refactor printed exactly the same bytes.
+
+PARITY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "terminal_confirm_parity.json"
+
+
+def parity_cases() -> dict[str, jarvis.ConfirmationRequest]:
+    """Requests covering every branch of the confirmation printout."""
+    sensitive, controlled = jarvis.Permission.SENSITIVE_ACTION, jarvis.Permission.CONTROLLED_ACTION
+    bidi = ("--- a/auth.py\n+++ b/auth.py\n@@ -1,4 +1,4 @@\n"
+            "-access = 'user'\n+access = 'user‮ ⁦// admin⁩'\n"
+            "+zero​width‌join‍\n+x = 1 y = 2 z\n"
+            "﻿+bom at line start\n+﻿bom after plus\n context\twith tab\n"
+            "+family \U0001F468‍\U0001F469‍\U0001F467\n"
+            "+print('hi')\x1b[2J\x1b]0;owned\x07\n-x\r\n+form\x0cfeed\n+del\x7f and c1\x85\n")
+    long_diff = "\n".join(
+        ("+" if i % 3 == 0 else "-" if i % 3 == 1 else " ") + f"line {i}" for i in range(457))
+    exactly = "\n".join(f"@@ hunk {i}" if i % 50 == 0 else f"+line {i}" for i in range(400))
+    headers = ("--- a/x.py\n+++ b/x.py\n---\n+++\n--\n++\n-- two\n++ two\n@@\n@ one\n@@@ three\n"
+               "+\n-\n\n   indented\n+++ trailing\n--- trailing\n")
+    return {
+        "bidi_zero_width": jarvis.ConfirmationRequest(
+            "edit_workspace_file", sensitive, "Edit auth.py: 6 line(s) added, 2 removed.",
+            ["/w/auth.py"], "", bidi),
+        "over_400_lines": jarvis.ConfirmationRequest(
+            "edit_workspace_file", sensitive, "Edit big.py", ["/w/big.py"], "", long_diff),
+        "exactly_400_lines": jarvis.ConfirmationRequest(
+            "edit_workspace_file", sensitive, "Edit exact.py", ["/w/exact.py"], "", exactly),
+        "headers": jarvis.ConfirmationRequest(
+            "edit_workspace_file", sensitive, "Edit x.py", ["/w/x.py"], "", headers),
+        "empty_details_paths_reason": jarvis.ConfirmationRequest(
+            "open_application", controlled, "Open the app Firefox",
+            ["/usr/bin/firefox", "/home/u/My Docs/a‮b.txt", "/w/lone\ud800surrogate"],
+            "Requested after reading web or file content, which could contain injected instructions."),
+        "no_paths_no_reason": jarvis.ConfirmationRequest(
+            "open_url", controlled, "Open https://example.com/​path\x1b[31m", []),
+        "newline_only_details": jarvis.ConfirmationRequest(
+            "write_note", controlled, "Write note", ["/n/a.md"], "", "\n"),
+        "trailing_newlines": jarvis.ConfirmationRequest(
+            "edit_workspace_file", sensitive, "Edit t.py", ["/w/t.py"], "why", "+a\n\n\n-b\n\n"),
+    }
+
+
+class _TTYBuffer(io.StringIO):
+    def __init__(self, tty: bool):
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def capture_terminal_output(fn, arg, colour: bool) -> dict:
+    """Everything a confirmation writes to stdout (and the prompts input() shows), as one string."""
+    out = _TTYBuffer(tty=colour)
+    prompts: list[str] = []
+    stdin = mock.Mock(isatty=mock.Mock(return_value=True))
+
+    def fake_input(prompt=""):
+        prompts.append(prompt)
+        out.write(prompt)
+        return "yes"
+
+    with mock.patch.dict(os.environ), mock.patch("sys.stdin", stdin), \
+            mock.patch("builtins.input", side_effect=fake_input), contextlib.redirect_stdout(out):
+        os.environ.pop("NO_COLOR", None)
+        result = fn(arg)
+    return {"stdout": out.getvalue(), "prompts": prompts, "result": result}
+
+
+def parity_outputs() -> dict[str, dict]:
+    outputs = {}
+    for name, request in parity_cases().items():
+        for colour in (True, False):
+            mode = "colour" if colour else "plain"
+            outputs[f"{name}/confirm/{mode}"] = capture_terminal_output(terminal.terminal_confirm, request, colour)
+            outputs[f"{name}/details/{mode}"] = capture_terminal_output(terminal.print_details,
+                                                                        request.details, colour)
+    return outputs
+
+
+class ConfirmationParityTests(unittest.TestCase):
+    def test_terminal_output_byte_identical_after_refactor(self):
+        expected = json.loads(PARITY_FIXTURE.read_text(encoding="utf-8"))
+        actual = parity_outputs()
+        self.assertEqual(sorted(actual), sorted(expected))
+        for key, value in expected.items():
+            with self.subTest(case=key):
+                self.assertEqual(actual[key], value)
+        # The fixture really exercises the branches it is meant to.
+        self.assertIn("\\u{202e}", expected["bidi_zero_width/confirm/plain"]["stdout"])
+        self.assertIn("\033[32m", expected["bidi_zero_width/confirm/colour"]["stdout"])
+        self.assertIn("... 57 more lines not shown", expected["over_400_lines/details/plain"]["stdout"])
+        self.assertNotIn("not shown", expected["exactly_400_lines/details/plain"]["stdout"])
+        self.assertIn("Why asked:", expected["empty_details_paths_reason/confirm/plain"]["stdout"])
+
+
+class ConfirmationViewTests(unittest.TestCase):
+    def test_view_holds_exactly_what_the_terminal_prints(self):
+        request = parity_cases()["bidi_zero_width"]
+        view = terminal.build_confirmation_view(request)
+        self.assertEqual(view.label, "SENSITIVE ACTION")
+        self.assertEqual(view.tool, "edit_workspace_file")
+        self.assertEqual(view.affected_paths, ("/w/auth.py",))
+        self.assertEqual(view.hidden, 15)
+        self.assertEqual(view.omitted, 0)
+        self.assertEqual(view.lines[:5], (("ctx", "--- a/auth.py"), ("ctx", "+++ b/auth.py"),
+                                          ("hunk", "@@ -1,4 +1,4 @@"), ("del", "-access = 'user'"),
+                                          ("add", "+access = 'user\\u{202e} \\u{2066}// admin\\u{2069}'")))
+        self.assertEqual({kind for kind, _ in view.lines}, {"add", "del", "hunk", "ctx"})
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            view.operation = "something else"
+
+    def test_long_details_are_capped(self):
+        view = terminal.build_confirmation_view(parity_cases()["over_400_lines"])
+        self.assertEqual((len(view.lines), view.omitted), (terminal.MAX_DETAIL_LINES, 57))
+        empty = terminal.build_confirmation_view(parity_cases()["empty_details_paths_reason"])
+        self.assertEqual((empty.lines, empty.hidden, empty.omitted), ((), 0, 0))
+        self.assertEqual(empty.label, "ACTION")
+        self.assertEqual(empty.affected_paths[1:], ("/home/u/My Docs/a\\u{202e}b.txt", "/w/lone?surrogate"))
+
+    def test_digest_is_stable_and_binds_every_field(self):
+        view = terminal.build_confirmation_view(parity_cases()["headers"])
+        again = terminal.build_confirmation_view(parity_cases()["headers"])
+        self.assertEqual(view.digest(), again.digest())
+        self.assertRegex(view.digest(), r"^[0-9a-f]{64}$")
+        canonical = json.dumps(dataclasses.asdict(view), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        self.assertEqual(view.digest(), hashlib.sha256(canonical.encode("ascii")).hexdigest())
+        changes = {"label": "ACTION", "tool": "other", "operation": "x", "affected_paths": ("/other",),
+                   "reason": "r", "hidden": 1, "omitted": 1, "lines": view.lines[:-1] + (("add", "+changed"),)}
+        digests = {dataclasses.replace(view, **{field: value}).digest() for field, value in changes.items()}
+        self.assertEqual(len(digests), len(changes))
+        self.assertNotIn(view.digest(), digests)
+
+    def test_payload_form(self):
+        view = terminal.build_confirmation_view(TerminalConfirmTests.REQUEST)
+        self.assertEqual(view.as_payload(), {
+            "tool": "edit_workspace_file", "label": "SENSITIVE ACTION",
+            "operation": "Edit app.py: 1 line(s) added, 1 removed.", "affected_paths": ["/w/app.py"],
+            "reason": "", "hidden": 0, "omitted": 0,
+            "lines": [{"k": "ctx", "t": "--- a/app.py"}, {"k": "ctx", "t": "+++ b/app.py"},
+                      {"k": "hunk", "t": "@@ -1 +1 @@"}, {"k": "del", "t": "-x = 1"}, {"k": "add", "t": "+x = 2"}],
+        })
+
+    def test_print_confirmation_with_a_prompt_hint(self):
+        view = terminal.build_confirmation_view(TerminalConfirmTests.REQUEST)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            terminal.print_confirmation(view, prompt_hint="   Answer: ")
+        self.assertTrue(out.getvalue().endswith("+x = 2\n   Answer: "))
+        plain = io.StringIO()
+        with contextlib.redirect_stdout(plain):
+            terminal.print_confirmation(view)
+        self.assertEqual(out.getvalue(), plain.getvalue() + "   Answer: ")
 
 
 class LooksLikeDeveloperRequestTests(unittest.TestCase):

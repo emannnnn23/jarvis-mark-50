@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
 import queue
@@ -41,42 +43,113 @@ if TYPE_CHECKING:
 MAX_DETAIL_LINES = 400
 
 
+# Line kinds of a review, and the colour each is printed in (context lines are printed as they are).
+_KIND_COLOURS = {"add": "green", "del": "red", "hunk": "cyan"}
+
+
+@dataclasses.dataclass(frozen=True)
+class ConfirmationView:
+    """Exactly what a confirmation shows, built once so the terminal and Mission Control show the same
+    thing, and so an approval from the browser can be bound to it by `digest`.
+
+    `operation`, `affected_paths` and `lines` are already revealed (invisible characters as \\u{...});
+    `tool` and `reason` come from JARVIS itself, not the model, and are printed as they are, as before."""
+
+    label: str
+    tool: str
+    operation: str
+    affected_paths: tuple[str, ...]
+    reason: str
+    hidden: int
+    lines: tuple[tuple[str, str], ...]  # (kind, text): kind is add | del | hunk | ctx
+    omitted: int
+
+    def digest(self) -> str:
+        """sha256 of the canonical JSON of every field: any change to what is shown changes it."""
+        canonical = json.dumps(dataclasses.asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+    def as_payload(self) -> dict:
+        """The view as JSON types, in the shape of the confirm.request event (before scrubbing)."""
+        return {"tool": self.tool, "label": self.label, "operation": self.operation,
+                "affected_paths": list(self.affected_paths), "reason": self.reason, "hidden": self.hidden,
+                "lines": [{"k": kind, "t": text} for kind, text in self.lines], "omitted": self.omitted}
+
+
+def _line_kind(line: str) -> str:
+    if line.startswith("+") and not line.startswith("+++"):
+        return "add"
+    if line.startswith("-") and not line.startswith("---"):
+        return "del"
+    if line.startswith("@@"):
+        return "hunk"
+    return "ctx"
+
+
+def _review_lines(details: str) -> tuple[int, tuple[tuple[str, str], ...], int]:
+    """(hidden characters, the first MAX_DETAIL_LINES lines with their kinds, lines left out)."""
+    # Reveal before anything is stripped, so control characters are shown rather than silently removed.
+    revealed, hidden = reveal_invisible(clean_text(details))
+    lines = revealed.splitlines()
+    shown = tuple((_line_kind(line), line) for line in lines[:MAX_DETAIL_LINES])
+    return hidden, shown, max(0, len(lines) - MAX_DETAIL_LINES)
+
+
+def _print_review(hidden: int, lines: tuple[tuple[str, str], ...], omitted: int) -> None:
+    if hidden:
+        print("   " + style(f"!! {hidden} invisible or text-direction character(s), shown as \\u{{...}}", "yellow"))
+    for kind, line in lines:
+        colour = _KIND_COLOURS.get(kind)
+        print("   " + (style(line, colour) if colour else line))
+    if omitted:
+        print("   " + style(f"... {omitted} more lines not shown", "dim"))
+
+
+def build_confirmation_view(request: ConfirmationRequest) -> ConfirmationView:
+    """What `print_confirmation` shows for this request."""
+    label = "SENSITIVE ACTION" if request.permission is Permission.SENSITIVE_ACTION else "ACTION"
+    hidden, lines, omitted = _review_lines(request.details) if request.details else (0, (), 0)
+    return ConfirmationView(
+        label=label,
+        tool=request.tool_name,
+        operation=reveal_invisible(clean_text(request.operation))[0],
+        affected_paths=tuple(reveal_invisible(clean_text(path))[0] for path in request.affected_paths),
+        reason=request.reason,
+        hidden=hidden,
+        lines=lines,
+        omitted=omitted,
+    )
+
+
+def print_confirmation(view: ConfirmationView, prompt_hint: str = "") -> None:
+    """Print a confirmation; `prompt_hint`, if given, is printed last without a newline, as a prompt."""
+    print(f"\n{style('!! Confirmation required', 'yellow')} [{view.label}: {view.tool}]")
+    print(f"   Operation: {view.operation}")
+    for path in view.affected_paths:
+        print(f"   Affects:   {path}")
+    if view.reason:
+        print(f"   Why asked: {view.reason}")
+    _print_review(view.hidden, view.lines, view.omitted)
+    if prompt_hint:
+        print(prompt_hint, end="", flush=True)
+
+
 def print_details(details: str) -> None:
     """Show a confirmation's details (usually a unified diff), coloured and capped in length.
     Invisible and text-direction characters are shown as \\u{...} so nothing is hidden."""
-    # Reveal before anything is stripped, so control characters are shown rather than silently removed.
-    revealed, hidden = reveal_invisible(clean_text(details))
-    if hidden:
-        print("   " + style(f"!! {hidden} invisible or text-direction character(s), shown as \\u{{...}}", "yellow"))
-    lines = revealed.splitlines()
-    for line in lines[:MAX_DETAIL_LINES]:
-        if line.startswith("+") and not line.startswith("+++"):
-            print("   " + style(line, "green"))
-        elif line.startswith("-") and not line.startswith("---"):
-            print("   " + style(line, "red"))
-        elif line.startswith("@@"):
-            print("   " + style(line, "cyan"))
-        else:
-            print("   " + line)
-    if len(lines) > MAX_DETAIL_LINES:
-        print("   " + style(f"... {len(lines) - MAX_DETAIL_LINES} more lines not shown", "dim"))
+    _print_review(*_review_lines(details))
+
+
+CONFIRM_PROMPT = "   Type 'yes' to proceed, anything else cancels: "
 
 
 def terminal_confirm(request: ConfirmationRequest) -> bool:
     """Ask the person at the keyboard to approve one specific operation."""
     if not sys.stdin.isatty():
         return False
-    label = "SENSITIVE ACTION" if request.permission is Permission.SENSITIVE_ACTION else "ACTION"
-    print(f"\n{style('!! Confirmation required', 'yellow')} [{label}: {request.tool_name}]")
-    print(f"   Operation: {reveal_invisible(clean_text(request.operation))[0]}")
-    for path in request.affected_paths:
-        print(f"   Affects:   {reveal_invisible(clean_text(path))[0]}")
-    if request.reason:
-        print(f"   Why asked: {request.reason}")
-    if request.details:
-        print_details(request.details)
+    print_confirmation(build_confirmation_view(request))
     try:
-        answer = input("   Type 'yes' to proceed, anything else cancels: ")
+        answer = input(CONFIRM_PROMPT)
     except (EOFError, KeyboardInterrupt):
         print()
         return False
