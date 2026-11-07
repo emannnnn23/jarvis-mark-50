@@ -7,6 +7,7 @@ import time
 import unittest
 
 from core import events
+from core.audit import clean_text, redact, safe_display
 from core.events import BUS, EventBus, PROTOCOL_VERSION, emit, emit_throttled, scrub
 
 
@@ -238,6 +239,12 @@ class TestScrub(unittest.TestCase):
         self.assertNotIn("gsk_", out)
         self.assertNotIn("kkkk", out)
         self.assertTrue(out.startswith("x" * 96))
+
+    def test_long_quoted_secret_across_the_cut_is_fully_redacted(self) -> None:
+        text = "x" * 49 + " password=" + '"' + " ".join(["hunter2word"] * 50) + '"'
+        out = scrub(text, max_str=100)
+        self.assertEqual(out, safe_display(redact(clean_text(text)))[:100])
+        self.assertNotIn("hunter2word", out)
 
     def test_scrub_is_fast_on_long_hyphenated_strings(self) -> None:
         # redact() used to backtrack quadratically on "a-a-a-..."; publish scrubs on the caller's
