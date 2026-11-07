@@ -242,6 +242,27 @@ def launch_detached(argv: list[str], cwd: Path | None = None, settle_seconds: fl
     return {"pid": process.pid, "still_running": code is None}
 
 
+def probe_https(host: str, port: int = 443, timeout: float = 4.0) -> dict[str, Any]:
+    """Resolve `host` and open a TCP connection to `port`; report each step without raising.
+
+    Shared by the `check_network` tool and Mission Control's Groq probe so both agree on what "reachable"
+    means. `latency_ms` (connect time) is present only when the connection succeeded. When DNS fails,
+    `https_port` is absent, exactly as `check_network` has always reported it."""
+    check: dict[str, Any] = {"host": host}
+    try:
+        socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        check["dns"] = "ok"
+        started = time.monotonic()
+        with socket.create_connection((host, port), timeout=timeout):
+            check["https_port"] = "reachable"
+            check["latency_ms"] = max(0, int((time.monotonic() - started) * 1000))
+    except socket.gaierror:
+        check["dns"] = "failed"
+    except OSError as exc:
+        check["https_port"] = f"unreachable ({exc.strerror or exc})"
+    return check
+
+
 class SystemTools:
     """System and application tool handlers. Mixed into JarvisTools, which provides self.config and self.memory."""
 
@@ -367,16 +388,8 @@ class SystemTools:
     def check_network(self) -> dict[str, Any]:
         checks = []
         for host in ("api.groq.com", "duckduckgo.com"):
-            check = {"host": host}
-            try:
-                socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-                check["dns"] = "ok"
-                with socket.create_connection((host, 443), timeout=4):
-                    check["https_port"] = "reachable"
-            except socket.gaierror:
-                check["dns"] = "failed"
-            except OSError as exc:
-                check["https_port"] = f"unreachable ({exc.strerror or exc})"
+            check = probe_https(host)
+            check.pop("latency_ms", None)  # the tool's output predates latency; keep it byte-for-byte stable
             checks.append(check)
         online = any(c.get("https_port") == "reachable" for c in checks)
         result: dict[str, Any] = {"online": online, "checks": checks}
