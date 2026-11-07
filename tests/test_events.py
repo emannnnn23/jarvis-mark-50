@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 
 from core import events
@@ -229,6 +230,24 @@ class TestScrub(unittest.TestCase):
         self.assertLessEqual(len(out), 2000)
         self.assertNotIn("gsk_k", out)
         self.assertNotIn("gsk_", out.replace("[REDACTED]", ""))
+
+    def test_secret_near_the_cut_is_still_redacted(self) -> None:
+        text = "x" * 96 + "gsk_" + "k" * 30 + " tail " * 200
+        out = scrub(text, max_str=100)
+        self.assertEqual(len(out), 100)
+        self.assertNotIn("gsk_", out)
+        self.assertNotIn("kkkk", out)
+        self.assertTrue(out.startswith("x" * 96))
+
+    def test_scrub_is_fast_on_long_hyphenated_strings(self) -> None:
+        # redact() used to backtrack quadratically on "a-a-a-..."; publish scrubs on the caller's
+        # thread, so even the biggest payload string must finish quickly.
+        for text in ("a-" * 4256, "a-" * 50000, "a_" * 50000):
+            started = time.perf_counter()
+            out = scrub(text, max_str=events.PUBLISH_MAX_STR)
+            elapsed = time.perf_counter() - started
+            self.assertEqual(len(out), events.PUBLISH_MAX_STR)
+            self.assertLess(elapsed, 1.0)
 
     def test_scrub_strips_control_codes(self) -> None:
         self.assertEqual(scrub("a\x1b[31mb\x07"), "a[31mb")

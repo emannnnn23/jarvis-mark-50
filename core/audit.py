@@ -39,12 +39,61 @@ _SECRET_PATTERNS = [
 
 
 # Matches DB_PASSWORD=x, "api_key": "x", AWS_SECRET_ACCESS_KEY: x, "my password is x", ...
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_-])*"
-    r"(?:api[_ -]?key|secret|token|password|passwd|pwd|passphrase|access[_-]?key|private[_-]?key|pin(?: code| number)?)"
-    r"(?:[_-][A-Za-z0-9]+)*)"
-    r"([\"']?\s*[:=]\s*|\s+is\s+)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+#
+# The obvious single regex, ((?:\w+[_-])*KEYWORD(?:[_-]\w+)*)SEP VALUE, backtracks quadratically on a
+# long run like "a-a-a-..." (the prefix is retried from every segment). Redaction runs on every
+# string the assistant logs or sends to the browser, so it is done in one linear pass instead:
+# split the text into identifier chains, and look at the separator and value after each chain once.
+_SECRET_KEYWORD = re.compile(
+    r"(?:api[_ -]?key|secret|token|password|passwd|pwd|passphrase|access[_-]?key|private[_-]?key"
+    r"|pin(?: code| number)?)",
+    re.IGNORECASE,
 )
+
+# A maximal identifier such as x-auth-token or AWS_SECRET_ACCESS_KEY: segments joined by _ or -.
+_IDENTIFIER_CHAIN = re.compile(r"[A-Za-z0-9]++(?:[_-][A-Za-z0-9]++)*+", re.IGNORECASE)
+
+# What follows a credential name: the separator (":", "=", or " is ") and then the value.
+_ASSIGNMENT_TAIL = re.compile(
+    r"(?:[\"']?\s*[:=]\s*|\s+is\s+)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+    re.IGNORECASE,
+)
+
+
+def _names_a_secret(text: str, start: int, end: int, previous: tuple[int, int] | None, floor: int) -> bool:
+    """Whether the identifier chain text[start:end] contains a credential keyword.
+
+    A keyword is a whole segment (password) or two adjacent ones (api_key, access-key), and may also
+    be split by a single space across two chains ("api key", "pin code", "pin number") when
+    `previous` is the chain just before. Keywords inside a word (tokenizer, secretary) do not count."""
+    parts = re.split("([_-])", text[start:end])
+    segments, delimiters = parts[0::2], parts[1::2]
+    if any(_SECRET_KEYWORD.fullmatch(segment) for segment in segments):
+        return True
+    if any(_SECRET_KEYWORD.fullmatch(f"{segments[i]}{delimiters[i]}{segments[i + 1]}")
+           for i in range(len(delimiters))):
+        return True
+    if previous is not None and previous[1] == start - 1 and text[start - 1] == " ":
+        before = re.split("[_-]", text[previous[0]:previous[1]])[-1]
+        if previous[1] - len(before) >= floor and _SECRET_KEYWORD.fullmatch(f"{before} {segments[0]}"):
+            return True
+    return False
+
+
+def _secret_values(text: str) -> list[tuple[int, int]]:
+    """Spans of values assigned to credential-like names (password=x, "token": "x", pin is 1234)."""
+    spans: list[tuple[int, int]] = []
+    floor = 0  # end of the last value found: text inside it is not scanned again
+    previous: tuple[int, int] | None = None
+    for chain in _IDENTIFIER_CHAIN.finditer(text):
+        start, end = chain.span()
+        if start >= floor and _names_a_secret(text, start, end, previous, floor):
+            tail = _ASSIGNMENT_TAIL.match(text, end)
+            if tail:
+                spans.append(tail.span(1))
+                floor = tail.end(1)
+        previous = (start, end)
+    return spans
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
@@ -100,12 +149,16 @@ def redact(text: Any) -> str:
     text = str(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
-    return _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
+    pieces, cursor = [], 0
+    for start, end in _secret_values(text):
+        pieces += [text[cursor:start], "[REDACTED]"]
+        cursor = end
+    return "".join(pieces) + text[cursor:]
 
 
 def contains_secret(text: str) -> bool:
     """Heuristic check for content that must never be written to memory."""
-    if any(p.search(text) for p in _SECRET_PATTERNS) or _SECRET_ASSIGNMENT.search(text):
+    if any(p.search(text) for p in _SECRET_PATTERNS) or _secret_values(text):
         return True
     return bool(_CARD_NUMBER.search(text) or _HIGH_ENTROPY_TOKEN.search(text))
 

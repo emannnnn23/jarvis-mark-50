@@ -41,15 +41,22 @@ PUBLISH_MAX_STR = 8000
 PUBLISH_MAX_ITEMS = 500
 
 
+# Text kept beyond max_str while redacting. redact() is superlinear on long unbroken chains such as
+# "a-a-a-..." (core/audit.py's assignment pattern backtracks), so scrub looks only at max_str plus
+# this margin: a secret that starts inside the kept text still lies fully inside the window.
+REDACT_MARGIN = 512
+
+
 _current_request: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_request_id", default=None)
 
 
 def scrub(value: Any, *, max_str: int = 2000, max_items: int = 200, depth: int = 4) -> Any:
     """Make any value safe to send to the browser: JSON types only, no secrets, no control codes, bounded.
 
-    Redaction runs before truncation so a key cut in half can never slip past the patterns."""
+    Redaction runs before the final truncation so a key cut in half can never slip past the patterns;
+    the input is first cut to max_str + REDACT_MARGIN so a huge string cannot stall the caller."""
     if isinstance(value, str):
-        return safe_display(redact(clean_text(value)))[:max_str]
+        return safe_display(redact(clean_text(value[:max_str + REDACT_MARGIN])))[:max_str]
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
