@@ -63,7 +63,10 @@ MAX_MESSAGES_PER_SECOND = 20
 SEND_QUEUE_SIZE = 512
 MAX_MESSAGE_SIZE = 65536
 HEARTBEAT = 20.0
-CLOSE_TIMEOUT = 1.0  # how long a close waits for the browser's reply, so shutdown stays bounded
+# A send or a close that has not finished in this time means the browser stopped reading (a frozen tab,
+# a paused debugger): the connection is aborted, which frees its slot and its queued frames.
+CLOSE_TIMEOUT = 3.0
+CLOSE_REPLY_TIMEOUT = 1.0  # how long a close waits for the browser's reply; also bounds shutdown
 RECENT_EVENTS = 200  # events carried in a snapshot
 SNAPSHOT_DEPTH = 6  # a bus event (scrubbed at depth 4) sits two levels down in a snapshot
 
@@ -109,11 +112,32 @@ INVALID_FRAME = json.dumps({"type": "error", "code": "invalid"}, separators=(","
 PONG_FRAME = json.dumps({"type": "pong"}, separators=(",", ":"))
 
 
+async def _close_or_abort(ws: web.WebSocketResponse, transport: asyncio.BaseTransport | None, code: int,
+                          message: bytes, timeout: float | None = None) -> None:
+    """ws.close(), but bounded: aiohttp's close waits for the send buffer to drain with no timeout, so
+    a peer that stopped reading would hold it (and its slot) forever. On timeout the TCP connection is
+    aborted; a plain transport.close() would also wait for the buffer to flush."""
+    try:
+        await asyncio.wait_for(ws.close(code=code, message=message),
+                               CLOSE_TIMEOUT if timeout is None else timeout)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - TimeoutError, or the socket already broke: drop it either way
+        _abort(transport)
+
+
+def _abort(transport: asyncio.BaseTransport | None) -> None:
+    if transport is not None:
+        with contextlib.suppress(Exception):
+            transport.abort()
+
+
 class _Client:
     """One browser socket: its bounded send queue, the task that drains it, and its message rate."""
 
-    def __init__(self, ws: web.WebSocketResponse) -> None:
+    def __init__(self, ws: web.WebSocketResponse, transport: asyncio.BaseTransport | None = None) -> None:
         self.ws = ws
+        self.transport = transport  # aborted when the browser stops reading
         self.queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=SEND_QUEUE_SIZE)
         self.authenticated = False
         # Seqs sent in the replay or snapshot; the same events may still be on their way live.
@@ -149,7 +173,13 @@ class _Client:
         if self.closing:
             return
         self.closing = True
-        self.closer = asyncio.get_running_loop().create_task(self.ws.close(code=code, message=message))
+        self.closer = asyncio.get_running_loop().create_task(
+            _close_or_abort(self.ws, self.transport, code, message))
+
+    def abort(self) -> None:
+        """Drop the connection now; serve()'s receive then ends and the handler frees the slot."""
+        self.closing = True
+        _abort(self.transport)
 
     async def run_sender(self) -> None:
         try:
@@ -158,11 +188,15 @@ class _Client:
                 try:
                     if text is None:  # flush marker from shutdown: everything before it was sent
                         return
-                    await self.ws.send_str(text)
+                    # Bounded: send_str waits for the TCP buffer to drain, forever if the peer stopped reading.
+                    await asyncio.wait_for(self.ws.send_str(text), CLOSE_TIMEOUT)
                 finally:
                     self.queue.task_done()
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            log.debug("mission control client stopped reading; dropping it")
+            self.abort()
         except Exception as exc:  # noqa: BLE001 - the socket went away; the handler cleans up
             log.debug("mission control send stopped: %s", type(exc).__name__)
 
@@ -259,13 +293,10 @@ class Hub:
                   if client.authenticated and client.sender is not None and not client.sender.done()]
         if drains:
             await asyncio.gather(*drains, return_exceptions=True)
-        closes = asyncio.gather(*(client.ws.close(code=WSCloseCode.GOING_AWAY, message=b"JARVIS is shutting down")
-                                  for client in clients), return_exceptions=True)
-        try:
-            # A browser that stopped reading can block a close; the runner's shutdown cancels it after this.
-            await asyncio.wait_for(closes, CLOSE_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.debug("some Mission Control clients did not close in time")
+        # Each close is bounded and aborts a browser that stopped reading, so stop() stays fast.
+        await asyncio.gather(*(_close_or_abort(client.ws, client.transport, WSCloseCode.GOING_AWAY,
+                                               b"JARVIS is shutting down", CLOSE_REPLY_TIMEOUT)
+                               for client in clients), return_exceptions=True)
 
     async def cleanup(self) -> None:
         self._closed = True
@@ -366,7 +397,7 @@ class Hub:
         try:
             msg = await ws.receive(timeout=AUTH_TIMEOUT)
         except asyncio.TimeoutError:
-            await ws.close(code=CLOSE_AUTH_TIMEOUT, message=b"authentication timed out")
+            await _close_or_abort(ws, client.transport, CLOSE_AUTH_TIMEOUT, b"authentication timed out")
             return
         if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
             return
@@ -374,7 +405,7 @@ class Hub:
         auth = self._parse(msg)
         if auth is None or auth.get("type") != "auth" or not self.check_token(auth.get("token")):
             await asyncio.sleep(BAD_TOKEN_DELAY)
-            await ws.close(code=CLOSE_UNAUTHORIZED, message=b"unauthorized")
+            await _close_or_abort(ws, client.transport, CLOSE_UNAUTHORIZED, b"unauthorized")
             return
         last_seq = auth.get("last_seq")
         if not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0:
@@ -389,7 +420,7 @@ class Hub:
                 break  # ERROR (for example a frame over MAX_MESSAGE_SIZE): aiohttp has closed the socket
             if client.over_rate(loop.time()):
                 client.closing = True
-                await ws.close(code=CLOSE_RATE_LIMITED, message=b"too many messages")
+                await _close_or_abort(ws, client.transport, CLOSE_RATE_LIMITED, b"too many messages")
                 break
             self._handle(client, msg)
 
@@ -552,12 +583,12 @@ async def _snapshot(request: web.Request) -> web.Response:
 
 async def _websocket(request: web.Request) -> web.WebSocketResponse:
     hub = request.app[HUB_KEY]
-    ws = web.WebSocketResponse(heartbeat=HEARTBEAT, max_msg_size=MAX_MESSAGE_SIZE, timeout=CLOSE_TIMEOUT)
+    ws = web.WebSocketResponse(heartbeat=HEARTBEAT, max_msg_size=MAX_MESSAGE_SIZE, timeout=CLOSE_REPLY_TIMEOUT)
     if len(hub.clients) >= MAX_CLIENTS:
         await ws.prepare(request)
-        await ws.close(code=CLOSE_TOO_MANY_CLIENTS, message=b"too many clients")
+        await _close_or_abort(ws, request.transport, CLOSE_TOO_MANY_CLIENTS, b"too many clients")
         return ws
-    client = _Client(ws)
+    client = _Client(ws, request.transport)
     hub.clients.add(client)  # before the first await, so two racing sockets cannot both take the last slot
     try:
         await ws.prepare(request)

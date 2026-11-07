@@ -429,6 +429,51 @@ class WebSocketTests(AppTestCase):
         await ws.send_str(json.dumps({"type": "ping", "pad": "x" * 70000}))
         await self.expect_close(ws, 1009)
 
+    async def stalled_client(self) -> socket.socket:
+        """A raw WebSocket that authenticates and then never reads again (a frozen tab)."""
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)  # before connect, so the window stays small
+        sock.setblocking(False)
+        await loop.sock_connect(sock, ("127.0.0.1", self.port))
+        request = (f"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: {self.origin}\r\n"
+                   "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+        await loop.sock_sendall(sock, request.encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = await asyncio.wait_for(loop.sock_recv(sock, 1), 3)
+            self.assertTrue(chunk, "the server closed the handshake")
+            head += chunk
+        self.assertIn(b" 101 ", head.split(b"\r\n", 1)[0] + b" ")
+        payload = json.dumps({"type": "auth", "token": TOKEN, "last_seq": None}).encode()
+        self.assertLess(len(payload), 126)
+        mask = b"\x01\x02\x03\x04"
+        frame = bytes([0x81, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        await loop.sock_sendall(sock, frame)
+        return sock
+
+    async def test_stalled_reader_is_dropped_and_frees_its_slot(self):
+        await self.start()
+        with mock.patch("mission_control.server.CLOSE_TIMEOUT", 0.5):
+            await self.stalled_client()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 3
+            while not any(c.authenticated for c in self.hub.clients):
+                self.assertLess(loop.time(), deadline, "the stalled client never authenticated")
+                await asyncio.sleep(0.01)
+            big = "y" * 7000
+            deadline = loop.time() + 15
+            while self.hub.clients:
+                self.assertLess(loop.time(), deadline, "a client that stopped reading kept its slot")
+                for _ in range(50):
+                    self.bus.publish("notice", level="info", text=big)
+                await asyncio.sleep(0.02)
+        # The slot is free again: a normal tab can connect.
+        ws = await self.authed()
+        self.assertEqual((await self.recv(ws))["type"], "snapshot")
+
     async def test_send_queue_overflow_closes_1013(self):
         await self.start()
         ws = await self.authed()
