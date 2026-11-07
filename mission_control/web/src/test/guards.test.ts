@@ -85,6 +85,14 @@ describe("isServerEvent against the shared fixtures", () => {
     }
   });
 
+  it("counts text limits in code points, like the backend, not UTF-16 units", () => {
+    // Each emoji is one code point but two UTF-16 units: a 500-emoji request is within the 500 limit.
+    const event = fixtures.find((candidate) => candidate.type === "request.start")!;
+    const limit = MAX_TEXT["request.start:text"];
+    expect(isServerEvent({ ...clone(event), text: "\u{1F680}".repeat(limit) })).toBe(true);
+    expect(isServerEvent({ ...clone(event), text: "\u{1F680}".repeat(limit + 1) })).toBe(false);
+  });
+
   it("rejects wrong shapes the UI would trip over", () => {
     const byType = Object.fromEntries(fixtures.map((event) => [event.type, event]));
     const bad: [string, string, unknown][] = [

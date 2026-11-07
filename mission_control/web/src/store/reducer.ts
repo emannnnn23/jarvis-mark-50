@@ -7,6 +7,10 @@
  *   events can run ahead of the fields (still in flight to the backend tracker);
  * - each field remembers the seq that last set it, so an event delivered late never overwrites newer data.
  * The headline state comes from the backend (jarvis.state); only "offline" is decided here, from the socket.
+ *
+ * Subsystem blocks start from the backend tracker's snapshot and are then folded from live events with
+ * the same rules, plus a few browser-only details the node panels show (call in flight, retry reason,
+ * active tool status, recalled hits versus the stored fact total).
  */
 
 import { isConfirmPayload, isServerEvent, isSubsystemStatus, isTaskView } from "../types/guards";
@@ -26,6 +30,8 @@ import type {
   Subsystems,
   SystemMetricsEvent,
   TaskView,
+  ToolExecutionEvent,
+  VoiceLevelEvent,
 } from "../types/events";
 
 export const LOG_LIMIT = 500;
@@ -36,6 +42,42 @@ const UNLOGGED: ReadonlySet<string> = new Set(["system.metrics", "voice.level"])
 const RECENT_TOOLS = 5;
 
 export const SUBSYSTEM_IDS: readonly SubsystemId[] = ["llm", "memory", "tools", "system", "voice", "network"];
+/** llm error kinds that mean Groq could not be reached at all (mission_control/state.py LLM_OFFLINE_KINDS). */
+const LLM_OFFLINE_KINDS: ReadonlySet<string> = new Set(["network"]);
+/** voice.input phases during which the microphone level is meaningful. */
+const LEVEL_PHASES: ReadonlySet<string> = new Set(["armed", "wake_detected", "collecting"]);
+
+/** One finished tool call in the TOOLS node's recent list. seq is null for entries from a snapshot. */
+export interface ToolEntry {
+  tool: string;
+  status: string;
+  seq: number | null;
+  duration_ms?: number;
+  target?: string;
+}
+
+/** The recent list as entries, whatever the backend or an older state put there. */
+export function toolEntries(value: unknown): ToolEntry[] {
+  if (!Array.isArray(value)) return [];
+  const entries: ToolEntry[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null) continue;
+    const raw = item as Record<string, unknown>;
+    if (typeof raw.tool !== "string" || typeof raw.status !== "string") continue;
+    const entry: ToolEntry = { tool: raw.tool, status: raw.status, seq: typeof raw.seq === "number" ? raw.seq : null };
+    if (typeof raw.duration_ms === "number") entry.duration_ms = raw.duration_ms;
+    if (typeof raw.target === "string") entry.target = raw.target;
+    entries.push(entry);
+  }
+  return entries;
+}
+
+/** The latest microphone level (voice.level), shown only as a live meter. */
+export interface VoiceLevel {
+  rms: number;
+  phase: VoiceLevelEvent["phase"];
+  at: number;
+}
 
 /** Status changes of the socket, from the browser itself. */
 export interface ConnectionEvent {
@@ -70,6 +112,10 @@ export interface MissionState {
   pendingConfirmation: ConfirmPayload | null;
   metrics: SystemMetricsEvent | null;
   network: NetworkStatusEvent | null;
+  /** The latest microphone level while listening for the wake word or collecting speech. */
+  voiceLevel: VoiceLevel | null;
+  /** The latest task.progress line for the current task. */
+  taskProgress: { message: string; at: number } | null;
   /** Recent events in seq order, newest last, at most LOG_LIMIT. */
   log: ServerEvent[];
   /** Highest seq seen: sent as last_seq when the socket resumes. */
@@ -83,9 +129,12 @@ export interface MissionState {
 
 function unknownSubsystems(): Subsystems {
   return {
-    llm: { status: "unknown", model: null, last_duration_ms: null, last_status: null, last_error_kind: null },
-    memory: { status: "unknown", last_op: null, count: null },
-    tools: { status: "unknown", active: [], recent: [] },
+    llm: {
+      status: "unknown", model: null, last_duration_ms: null, last_status: null, last_error_kind: null,
+      in_flight: false, attempt: null, last_retry_reason: null, last_error_message: null,
+    },
+    memory: { status: "unknown", last_op: null, count: null, recall_op: null, recall_count: null, facts: null },
+    tools: { status: "unknown", active: [], active_status: {}, recent: [], last_tool: null, last_target: null },
     system: { status: "unknown", cpu_percent: null, memory_percent: null, disk_percent: null },
     voice: { status: "unknown", mode: null, input_phase: null, speaking: false },
     network: { status: "unknown", groq: null, source: null, latency_ms: null, checked_at: null },
@@ -103,6 +152,8 @@ export function initialMissionState(): MissionState {
     pendingConfirmation: null,
     metrics: null,
     network: null,
+    voiceLevel: null,
+    taskProgress: null,
     log: [],
     lastSeq: 0,
     seqFloor: 0,
@@ -144,7 +195,40 @@ function readSubsystems(raw: Record<string, unknown>): Subsystems {
       result[id] = { ...result[id], ...(block as Record<string, unknown>), status: isSubsystemStatus(status) ? status : "unknown" };
     }
   }
+  // The tracker keeps one op and count; the panels keep recalled hits and the stored total apart.
+  const memory = result.memory;
+  if (typeof memory.count === "number") {
+    result.memory = memory.last_op === "store"
+      ? { ...memory, facts: memory.count }
+      : { ...memory, recall_op: memory.last_op ?? null, recall_count: memory.count };
+  }
+  const tools = result.tools;
+  result.tools = {
+    ...tools,
+    active: Array.isArray(tools.active) ? tools.active.filter((name) => typeof name === "string") : [],
+    active_status: {},
+    recent: toolEntries(tools.recent),
+  };
   return result;
+}
+
+/**
+ * The snapshot's recent tool list was folded by the tracker from the same events that recent_events
+ * replays, so keep only the part of it the replay does not cover. The tracker's entries carry no seq;
+ * the overlap is the longest tail of its list that matches the head of the replayed results.
+ */
+function withoutReplayedTools(subsystems: Subsystems, recent: ServerEvent[]): Subsystems {
+  const replayed = recent.filter(
+    (event): event is ToolExecutionEvent => event.type === "tool.execution" && FINAL_TOOL.has(event.status),
+  );
+  const listed = toolEntries(subsystems.tools.recent);
+  let overlap = Math.min(listed.length, replayed.length);
+  while (overlap > 0) {
+    const tail = listed.slice(listed.length - overlap);
+    if (tail.every((entry, index) => entry.tool === replayed[index]!.tool && entry.status === replayed[index]!.status)) break;
+    overlap -= 1;
+  }
+  return overlap === 0 ? subsystems : patch(subsystems, "tools", { recent: listed.slice(0, listed.length - overlap) });
 }
 
 function eventOfType<T extends ServerEvent["type"]>(value: unknown, type: T): Extract<ServerEvent, { type: T }> | null {
@@ -155,16 +239,19 @@ function applySnapshot(state: MissionState, snap: Snapshot): MissionState {
   const session = eventOfType(snap.session, "session.start");
   const metrics = eventOfType(snap.metrics, "system.metrics");
   const network = eventOfType(snap.network, "network.status");
+  const recent = snap.recent_events.filter(isServerEvent).sort((a, b) => a.seq - b.seq);
   let next: MissionState = {
     ...state,
     jarvis: { state: snap.state.state, detail: snap.state.detail ?? null, since: snap.state.since },
     session,
     sessionEnded: false,
-    subsystems: readSubsystems(snap.subsystems),
+    subsystems: withoutReplayedTools(readSubsystems(snap.subsystems), recent),
     task: isTaskView(snap.task) ? snap.task : null,
     pendingConfirmation: isConfirmPayload(snap.pending_confirmation) ? snap.pending_confirmation : null,
     metrics,
     network,
+    voiceLevel: null,
+    taskProgress: null,
     // The snapshot's state is the tracker's latest, so no jarvis.state at or below its seq may replace it.
     // The task has no seq of its own: recent task.update events, folded in order, end on the newest.
     fieldSeq: {
@@ -175,7 +262,6 @@ function applySnapshot(state: MissionState, snap: Snapshot): MissionState {
       task: 0,
     },
   };
-  const recent = snap.recent_events.filter(isServerEvent).sort((a, b) => a.seq - b.seq);
   for (const event of recent) next = applyEvent(next, event);
   const floor = Math.max(next.seqFloor, snap.seq);
   return { ...next, seqFloor: floor, seen: next.seen.filter((seq) => seq > floor), lastSeq: Math.max(next.lastSeq, snap.seq) };
@@ -236,44 +322,65 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       break;
     case "session.end":
       next.sessionEnded = true;
-      subsystems = patch(subsystems, "tools", { active: [] });
+      next.voiceLevel = null;
+      subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
       subsystems = patch(subsystems, "voice", { speaking: false });
+      subsystems = patch(subsystems, "llm", { in_flight: false });
       break;
     case "request.start":
     case "request.end":
       // A request that started or ended cannot still be running a tool.
-      subsystems = patch(subsystems, "tools", { active: [] });
+      subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
       break;
     case "llm.call":
-      subsystems = patch(subsystems, "llm", { model: event.model });
+      subsystems = patch(subsystems, "llm", { model: event.model, attempt: event.attempt, in_flight: event.phase === "start" });
       if (event.phase === "end" && typeof event.ok === "boolean") {
+        const kind = event.error_kind ?? null;
         subsystems = patch(subsystems, "llm", {
           ...(typeof event.duration_ms === "number" ? { last_duration_ms: event.duration_ms } : {}),
           ...(event.ok
-            ? { status: "online", last_status: "success", last_error_kind: null }
-            : { status: "degraded", last_status: "error", last_error_kind: event.error_kind ?? null }),
+            ? { status: "online", last_status: "success", last_error_kind: null, last_error_message: null }
+            : {
+              status: kind !== null && LLM_OFFLINE_KINDS.has(kind) ? "offline" : "degraded",
+              last_status: "error", last_error_kind: kind,
+            }),
         });
       }
       break;
     case "llm.retry":
-      subsystems = patch(subsystems, "llm", { status: "degraded", last_status: "retry" });
+      subsystems = patch(subsystems, "llm", { status: "degraded", last_status: "retry", last_retry_reason: event.reason });
       break;
     case "llm.error":
       subsystems = patch(subsystems, "llm", {
-        status: event.kind === "network" ? "offline" : "degraded", last_status: "error", last_error_kind: event.kind,
+        status: LLM_OFFLINE_KINDS.has(event.kind) ? "offline" : "degraded", last_status: "error",
+        last_error_kind: event.kind, last_error_message: event.message, in_flight: false,
       });
       break;
     case "tool.execution":
-      subsystems = foldTool(subsystems, event.tool, event.status);
+      subsystems = foldTool(subsystems, event);
       break;
-    case "memory.activity":
-      subsystems = patch(subsystems, "memory", { status: "online", last_op: event.op, count: event.count ?? null });
+    case "memory.activity": {
+      const count = typeof event.count === "number" ? event.count : null;
+      subsystems = patch(subsystems, "memory", {
+        status: "online", last_op: event.op, count,
+        ...(event.op === "store"
+          ? (count === null ? {} : { facts: count })
+          : { recall_op: event.op, recall_count: count }),
+      });
       break;
+    }
     case "task.update":
       if (newer("task")) {
+        if (event.task === null || event.task.id !== state.task?.id) next.taskProgress = null;
         next.task = event.task;
         claim("task");
       }
+      break;
+    case "task.progress":
+      next.taskProgress = { message: event.message, at: event.timestamp };
+      break;
+    case "voice.level":
+      next.voiceLevel = { rms: event.rms, phase: event.phase, at: event.timestamp };
       break;
     case "voice.output":
       subsystems = patch(subsystems, "voice",
@@ -285,8 +392,10 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       const status = subsystems.voice.status;
       subsystems = patch(subsystems, "voice", {
         mode: event.mode, input_phase: event.phase,
+        ...(event.message !== undefined ? { input_message: event.message } : {}),
         ...(status === "unknown" || status === "degraded" ? { status: "online" } : {}),
       });
+      if (event.mode === "off" || !LEVEL_PHASES.has(event.phase)) next.voiceLevel = null;
       break;
     }
     case "confirm.request":
@@ -331,19 +440,32 @@ const MEMORY_STATUS: Record<SessionStartEvent["memory_status"], SubsystemStatus>
 const ACTIVE_TOOL = new Set(["running", "awaiting_confirmation"]);
 const FINAL_TOOL = new Set(["success", "error", "denied", "partial", "unverified"]);
 
-function foldTool(subsystems: Subsystems, tool: string, status: string): Subsystems {
+function foldTool(subsystems: Subsystems, event: ToolExecutionEvent): Subsystems {
+  const { tool, status } = event;
   const block = subsystems.tools;
   const active = Array.isArray(block.active) ? (block.active as string[]).filter((name) => name !== tool) : [];
+  const activeStatus: Record<string, string> = { ...(block.active_status as Record<string, string> | undefined) };
+  delete activeStatus[tool];
+  const last = { last_tool: tool, ...(event.target !== undefined ? { last_target: event.target } : {}) };
   if (ACTIVE_TOOL.has(status) && tool) {
-    return patch(subsystems, "tools", { active: [...active, tool], ...(block.status === "unknown" ? { status: "online" } : {}) });
+    return patch(subsystems, "tools", {
+      ...last, active: [...active, tool], active_status: { ...activeStatus, [tool]: status },
+      ...(block.status === "unknown" ? { status: "online" } : {}),
+    });
   }
   if (FINAL_TOOL.has(status)) {
-    const recent = Array.isArray(block.recent) ? (block.recent as unknown[]) : [];
+    const recent = toolEntries(block.recent);
+    const entry: ToolEntry = { tool, status, seq: event.seq };
+    if (event.duration_ms !== undefined) entry.duration_ms = event.duration_ms;
+    if (event.target !== undefined) entry.target = event.target;
+    const listed = recent.some((item) => item.seq === event.seq);
     return patch(subsystems, "tools", {
+      ...last,
       active,
-      recent: [...recent, { tool, status }].slice(-RECENT_TOOLS),
+      active_status: activeStatus,
+      recent: listed ? recent : [...recent, entry].slice(-RECENT_TOOLS),
       status: status === "error" ? "degraded" : "online",
     });
   }
-  return subsystems;
+  return patch(subsystems, "tools", last);
 }

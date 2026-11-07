@@ -1,6 +1,7 @@
 /**
  * The performance budget for an Intel HD 620 class GPU, as one pure lookup: how many particles to draw
- * and the device-pixel-ratio range the canvas may use. Task 7 adds the user's choice and auto-degrade.
+ * and the device-pixel-ratio range the canvas may use. The person picks the level (usePerformanceMode);
+ * below 900 px the particle count halves, because a small screen shows less of the field anyway.
  */
 
 export type QualityLevel = "low" | "balanced" | "high";
@@ -22,11 +23,14 @@ export function qualityProfile(level: QualityLevel): QualityProfile {
   return { ...profile, dpr: [...profile.dpr] as [number, number] };
 }
 
-/** Balanced unless the person asked the system for less motion. */
-export function defaultQuality(): QualityLevel {
-  try {
-    return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "low" : "balanced";
-  } catch {
-    return "balanced";
-  }
+export const QUALITY_LEVELS: readonly QualityLevel[] = ["low", "balanced", "high"];
+
+export function isQualityLevel(value: unknown): value is QualityLevel {
+  return typeof value === "string" && (QUALITY_LEVELS as readonly string[]).includes(value);
+}
+
+/** Particles to draw: the level's budget, halved on narrow screens. */
+export function particleCount(level: QualityLevel, narrow: boolean): number {
+  const count = PROFILES[level].particles;
+  return narrow ? count / 2 : count;
 }

@@ -13,6 +13,8 @@
  * - 1001 JARVIS is shutting down: show offline, keep retrying (it may be restarted);
  * - 4408, 1013 (this tab fell behind), 1006 (dropped, or refused before the upgrade) and anything else: retry.
  * Retries back off 0.5 s × 2^n, capped at 15 s, with ±20 % jitter so several tabs do not retry in step.
+ * The backoff resets only after a connection has stayed authenticated for 5 s, so a server that accepts
+ * and then drops at once is retried ever more slowly instead of at about 2 Hz.
  *
  * Silence: a ping goes out every 15 s and the server answers; if nothing at all arrives for 45 s the
  * connection is presumed dead (a sleeping laptop, a half-open TCP link) and is replaced.
@@ -40,6 +42,8 @@ export const RATE_LIMITED_MIN_MS = 2000;
 export const PING_INTERVAL_MS = 15000;
 export const SILENCE_LIMIT_MS = 45000;
 const SILENCE_CHECK_MS = 5000;
+/** How long an authenticated connection must last before the backoff starts again from 0.5 s. */
+export const STABLE_CONNECTION_MS = 5000;
 
 /** The wait before retry number `attempt` (0-based): 0.5 s × 2^attempt ±20 %, never above 15 s. */
 export function backoffDelay(attempt: number, random: () => number = Math.random): number {
@@ -65,6 +69,7 @@ export class MissionSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private silenceTimer: ReturnType<typeof setInterval> | null = null;
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly WebSocketImpl: typeof WebSocket;
   private readonly random: () => number;
 
@@ -109,8 +114,10 @@ export class MissionSocket {
     try {
       ws = new this.WebSocketImpl(this.url);
     } catch {
-      // A malformed URL or a CSP refusal throws synchronously; treat it like a failed attempt.
-      this.scheduleReconnect(this.attempt, this.status === "offline" ? "offline" : "reconnecting");
+      // A malformed URL or a CSP refusal throws synchronously; treat it like a failed attempt, backoff included.
+      const attempt = this.attempt;
+      this.attempt += 1;
+      this.scheduleReconnect(attempt, this.status === "offline" ? "offline" : "reconnecting");
       return;
     }
     this.ws = ws;
@@ -148,7 +155,7 @@ export class MissionSocket {
     if (!isServerFrame(frame)) return;
     if (frame.type === "auth.ok") {
       this.authenticated = true;
-      this.attempt = 0;
+      this.startStableTimer();
       this.startPing();
       this.setStatus("open");
     } else if ("seq" in frame && typeof frame.seq === "number") {
@@ -219,6 +226,21 @@ export class MissionSocket {
     this.authenticated = false;
     this.stopPing();
     this.stopSilenceWatch();
+    this.stopStableTimer();
+  }
+
+  /** Forgive earlier failures only once this connection has proved it stays up. Cleared on close. */
+  private startStableTimer(): void {
+    this.stopStableTimer();
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      this.attempt = 0;
+    }, STABLE_CONNECTION_MS);
+  }
+
+  private stopStableTimer(): void {
+    if (this.stableTimer !== null) clearTimeout(this.stableTimer);
+    this.stableTimer = null;
   }
 
   private startPing(): void {

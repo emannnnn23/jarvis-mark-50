@@ -1,29 +1,40 @@
 /**
- * The six node labels: name, status word and one real fact each, placed by the scene's projector.
- * Without a live link the statuses are not known any more, so they say so instead of showing old health.
+ * The six node labels: name, status word and the node's real facts, placed by the scene's projector.
+ * Each label is a button that opens the node's detail panel, so every node can be reached by keyboard
+ * as well as by clicking its marker. Without a live link the statuses are not known any more, so they
+ * say so instead of showing old health.
  */
 
 import { displayState } from "../../store/reducer";
 import { useMission } from "../../store/store";
-import { NODE_LAYOUT, STATUS_LOOK, nodeFact } from "./layout";
+import { useUi } from "../../store/ui";
+import { NODE_LAYOUT, STATUS_LOOK, nodeFacts } from "./layout";
 import { registerLabel } from "./labelRegistry";
 
 export function NodeLabels() {
   const subsystems = useMission((state) => state.subsystems);
   const model = useMission((state) => state.session?.model ?? null);
   const stale = useMission((state) => displayState(state) === "offline");
+  const selected = useUi((ui) => ui.selected);
+  const hovered = useUi((ui) => ui.hovered);
+  const select = useUi((ui) => ui.select);
+  const hover = useUi((ui) => ui.hover);
   return (
-    <div className={`node-labels${stale ? " node-labels-stale" : ""}`} aria-label="Subsystems">
+    <div className={`node-labels${stale ? " node-labels-stale" : ""}`} role="group" aria-label="Subsystems">
       {NODE_LAYOUT.map(({ id, label }) => {
         const view = subsystems[id];
-        const fact = nodeFact(id, view, model);
+        const facts = nodeFacts(id, view, model);
+        const status = stale ? "NO LINK" : STATUS_LOOK[view.status].word;
         return (
-          <div key={id} ref={registerLabel(id)} className={`node-label node-${stale ? "unknown" : view.status}`}
-            data-node={id}>
+          <button key={id} type="button" ref={registerLabel(id)} data-node={id}
+            className={`node-label node-${stale ? "unknown" : view.status}${hovered === id ? " node-label-hover" : ""}`}
+            aria-pressed={selected === id} aria-controls="node-detail"
+            onClick={() => select(selected === id ? null : id)}
+            onPointerEnter={() => hover(id)} onPointerLeave={() => hover(null)}>
             <span className="node-name">{label}</span>
-            <span className="node-status">{stale ? "NO LINK" : STATUS_LOOK[view.status].word}</span>
-            {fact !== null && <span className="node-fact">{fact}</span>}
-          </div>
+            <span className="node-status">{status}</span>
+            {facts.map((fact) => <span key={fact} className="node-fact">{fact}</span>)}
+          </button>
         );
       })}
     </div>

@@ -29,6 +29,8 @@
   --step-3: 1.625rem;   /* 26px: the state word */
 
   --gutter: 20px;
+  --side: 252px;
+  --volt-text: #8db9ff;
   color-scheme: dark;
 }
 
@@ -78,38 +80,83 @@ body {
   background: radial-gradient(ellipse 75% 70% at 50% 48%, transparent 55%, rgba(2, 4, 7, 0.72) 100%);
 }
 
+/*
+ * Wide screens: a column docked on each side (width --side, from cameraFit.ts so the camera frames the
+ * node ring between them), the scene's top centre for view controls, and the bottom centre reserved
+ * for the command bar dock. Columns let the pointer through to the scene; only their panels catch it.
+ */
 .hud-overlay {
   pointer-events: none;
   display: grid;
-  grid-template-rows: auto auto 1fr;
+  grid-template-columns: var(--side) minmax(0, 1fr) var(--side);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "top top top"
+    "left center banner"
+    "left center right"
+    "left dock right";
   padding: var(--gutter);
   gap: 14px;
 }
 
-.hud-overlay > * {
+.topbar {
+  grid-area: top;
+}
+
+.topbar,
+.panel,
+.banner,
+.button,
+.node-label {
   pointer-events: auto;
 }
 
-.topbar {
-  grid-row: 1;
-}
-
-/* Top right, under the session facts: clear of the core and of the LLM CORE node above it. */
+/* Top right, above the task and the events: clear of the core and of the LLM CORE node. */
 .hud-banner {
-  grid-row: 2;
-  justify-self: end;
-  width: min(420px, 100%);
+  grid-area: banner;
+  min-width: 0;
 }
 
 .hud-banner:empty {
   display: none;
 }
 
+.hud-center {
+  grid-area: center;
+  justify-self: center;
+  align-self: start;
+}
+
+.hud-left,
+.hud-right {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
 .hud-left {
-  grid-row: 3;
-  align-self: end;
-  justify-self: start;
-  width: 252px;
+  grid-area: left;
+}
+
+/* The system monitor keeps its place at the bottom left; node details open above it. */
+.hud-left > .system-panel {
+  margin-top: auto;
+}
+
+.hud-right {
+  grid-area: right;
+  overflow: hidden;
+}
+
+.hud-dock {
+  grid-area: dock;
+  justify-self: center;
+  width: min(640px, 100%);
 }
 
 .scene-fallback {
@@ -358,9 +405,69 @@ body {
   background: rgba(111, 231, 245, 0.16);
 }
 
-.button:focus-visible {
+.button:focus-visible,
+.icon-button:focus-visible,
+.select:focus-visible,
+.event-line:focus-visible,
+.node-label:focus-visible,
+.quality-option input:focus-visible {
   outline: 1px solid var(--holo);
   outline-offset: 2px;
+}
+
+.button:disabled {
+  color: var(--faint);
+  cursor: default;
+  background: transparent;
+}
+
+.button[aria-pressed="true"],
+.button[aria-expanded="true"] {
+  border-color: rgba(111, 231, 245, 0.45);
+  background: rgba(111, 231, 245, 0.14);
+}
+
+.button-small {
+  padding: 3px 10px;
+  font-size: var(--step--1);
+}
+
+.icon-button {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--mist);
+  background: none;
+  border: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: var(--ice);
+}
+
+.select {
+  font: inherit;
+  font-size: var(--step--1);
+  color: var(--ice);
+  background: rgba(9, 17, 25, 0.9);
+  border: 1px solid var(--glass-edge);
+  border-radius: 2px;
+  padding: 2px 4px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.reset-view {
+  margin-top: 6px;
 }
 
 /* --- panels ------------------------------------------------------------------------------------ */
@@ -483,7 +590,373 @@ body {
   white-space: pre;
 }
 
-/* --- node labels (DOM, positioned by drei Html) ------------------------------------------------ */
+/* --- node details -------------------------------------------------------------------------------- */
+
+.node-detail .panel-head {
+  align-items: center;
+}
+
+.node-detail-name {
+  font-family: var(--font-display);
+  font-size: 11px !important;
+  letter-spacing: 0.24em;
+  flex: 1;
+}
+
+.node-detail-status {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  color: var(--holo);
+}
+
+.node-detail.node-degraded .node-detail-status {
+  color: var(--amber);
+}
+
+.node-detail.node-offline .node-detail-status {
+  color: var(--amber-deep);
+}
+
+.node-detail.node-unknown .node-detail-status,
+.node-detail.node-unavailable .node-detail-status {
+  color: var(--faint);
+}
+
+.facts-detail dd {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.detail-subhead {
+  margin: 4px 0 0;
+  font-size: var(--step--1);
+  font-weight: 400;
+  color: var(--mist);
+}
+
+.tool-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.tool-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tool-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-result {
+  color: var(--mist);
+  white-space: nowrap;
+}
+
+.tool-error .tool-result,
+.tool-denied .tool-result {
+  color: var(--amber);
+}
+
+.meter-live .meter-fill {
+  transition: width 120ms linear;
+}
+
+/* --- task -------------------------------------------------------------------------------------- */
+
+.task-panel {
+  flex: 0 0 auto;
+  max-height: 44%;
+  overflow-y: auto;
+}
+
+.task-goal {
+  margin: 0;
+  font-size: var(--step-1);
+  font-weight: 300;
+  color: var(--ice);
+}
+
+.task-warning {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--amber);
+  background: rgba(255, 181, 71, 0.07);
+  color: var(--amber);
+}
+
+.task-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.task-step {
+  display: grid;
+  grid-template-columns: 12px 1fr;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--mist);
+}
+
+.step-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--holo-dim);
+  transform: translateY(-1px);
+}
+
+.step-in_progress {
+  color: var(--ice);
+}
+
+.step-in_progress .step-mark {
+  border-color: var(--holo);
+  box-shadow: 0 0 6px var(--holo), inset 0 0 0 2px var(--void);
+  background: var(--holo);
+}
+
+.step-done .step-mark {
+  background: var(--holo-dim);
+  border-color: var(--holo-dim);
+}
+
+.step-done .step-text,
+.step-skipped .step-text {
+  color: var(--faint);
+}
+
+.step-skipped .step-mark {
+  border-style: dashed;
+}
+
+.step-failed {
+  color: var(--amber);
+}
+
+.step-failed .step-mark {
+  border-color: var(--amber);
+}
+
+.task-progress {
+  margin: 0;
+  color: var(--holo);
+  font-size: var(--step--1);
+}
+
+/* --- event stream ------------------------------------------------------------------------------ */
+
+.stream-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 180px;
+  position: relative;
+  padding-bottom: 8px;
+}
+
+.stream-head {
+  align-items: center;
+}
+
+.stream-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.stream-paused {
+  margin: 0;
+  color: var(--holo);
+  font-size: var(--step--1);
+}
+
+.event-list {
+  list-style: none;
+  margin: 0 -8px;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
+.event-line {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  font: inherit;
+  text-align: left;
+  color: var(--ice);
+  background: none;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.event-line:hover,
+.event-line[aria-expanded="true"] {
+  background: rgba(111, 231, 245, 0.06);
+}
+
+.event-time {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+/* Two lines at most in the list; the whole line once the row is expanded. */
+.event-status {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.event-line[aria-expanded="true"] .event-status {
+  display: block;
+}
+
+/* Category chips: hue carries the family (thinking and acting in electric blue, what JARVIS keeps in
+   cyan, the plumbing in grey); amber is reserved for rows that need attention. */
+.chip {
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 4px 2px;
+  border: 1px solid rgba(138, 163, 179, 0.3);
+  border-radius: 2px;
+  color: var(--mist);
+  min-width: 4.4em;
+  text-align: center;
+  transform: translateY(-1px);
+}
+
+.chip-llm,
+.chip-tool,
+.chip-request {
+  color: var(--volt-text);
+  border-color: rgba(46, 124, 246, 0.45);
+}
+
+.chip-memory,
+.chip-task {
+  color: var(--holo);
+  border-color: rgba(111, 231, 245, 0.35);
+}
+
+.chip-notice {
+  color: var(--ice);
+}
+
+.event-attention .chip {
+  color: var(--amber);
+  border-color: rgba(255, 181, 71, 0.5);
+}
+
+.event-attention .event-status {
+  color: var(--amber);
+}
+
+.event-detail {
+  margin: 2px 8px 8px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font: inherit;
+  font-size: var(--step--1);
+  color: var(--mist);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: rgba(4, 7, 11, 0.55);
+  border-left: 1px solid var(--glass-edge);
+}
+
+.stream-empty {
+  align-self: start;
+}
+
+.jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  background: rgba(9, 17, 25, 0.95);
+}
+
+/* --- view menu --------------------------------------------------------------------------------- */
+
+.view-menu {
+  position: relative;
+}
+
+.view-menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 10px);
+  z-index: 5;
+  width: 260px;
+  background: rgba(9, 17, 25, 0.94);
+}
+
+.quality-choice {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.quality-choice legend {
+  padding: 0;
+  margin-bottom: 6px;
+  color: var(--ice);
+  font-weight: 400;
+}
+
+.quality-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  cursor: pointer;
+}
+
+.quality-option input {
+  grid-row: span 2;
+  accent-color: var(--holo);
+  margin: 3px 0 0;
+}
+
+.quality-note {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.quality-choice:disabled .quality-option {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.overlay-toggles {
+  display: flex;
+  gap: 6px;
+}
+
+/* --- node labels (DOM, positioned by the scene's projector) ------------------------------------- */
 
 .node-labels {
   position: absolute;
@@ -504,6 +977,25 @@ body {
   white-space: nowrap;
   text-shadow: 0 0 10px rgba(4, 7, 11, 0.9);
   will-change: transform;
+  /* A button that looks like an engraved label. */
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: 2px;
+  padding: 2px 8px 3px;
+  cursor: pointer;
+}
+
+.node-label-hover .node-name,
+.node-label:hover .node-name {
+  color: var(--holo);
+}
+
+/* The selected node: a hairline bracket under its name. */
+.node-label[aria-pressed="true"] .node-name {
+  color: var(--holo);
+  box-shadow: 0 1px 0 var(--holo);
 }
 
 .node-name {
@@ -552,9 +1044,54 @@ body {
 
 /* --- small screens: the core stays centred, panels shrink to the edges --------------------------- */
 
-@media (max-width: 900px) {
+/* Below 900 px (cameraFit.ts NARROW_MAX_WIDTH): the side columns become overlays opened from the top
+   bar, over the scene and above the command bar dock; the core stays centred. */
+@media (max-width: 899px) {
   :root {
     --gutter: 12px;
+  }
+
+  .hud-overlay {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "top"
+      "banner"
+      "main"
+      "dock";
+  }
+
+  .hud-left,
+  .hud-right,
+  .hud-center {
+    grid-area: main;
+  }
+
+  .hud-left {
+    justify-self: start;
+    width: min(340px, 100%);
+    z-index: 2;
+  }
+
+  .hud-right {
+    justify-self: end;
+    width: min(360px, 100%);
+    z-index: 3;
+  }
+
+  .hud-left[data-open="false"],
+  .hud-right[data-open="false"] {
+    display: none;
+  }
+
+  .hud-narrow .hud-left .panel,
+  .hud-narrow .hud-right .panel {
+    background: rgba(9, 17, 25, 0.92);
+  }
+
+  .session {
+    flex-wrap: wrap;
+    gap: 8px 10px;
   }
 
   .topbar {
@@ -576,14 +1113,17 @@ body {
     font-size: 1.25rem;
   }
 
-  .hud-left {
-    width: min(252px, 100%);
-  }
 }
 
 @media (max-width: 560px) {
-  .hud-left {
+  .hud-left,
+  .hud-right {
     width: 100%;
+  }
+
+  .brand-mark,
+  .brand-version {
+    display: none;
   }
 
   .system-panel .facts,
@@ -596,7 +1136,8 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .link-dot,
   .meter-fill,
-  .state-word {
+  .state-word,
+  .step-mark {
     animation: none !important;
     transition: none !important;
   }

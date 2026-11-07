@@ -39,8 +39,7 @@ export const STATUS_LOOK: Record<SubsystemStatus, StatusLook> = {
   unavailable: { color: "#4b5864", glow: 0.3, word: "UNAVAILABLE" },
 };
 
-const MEMORY_OP: Record<string, string> = { retrieve: "Recalled", search: "Searched", store: "Stored" };
-const VOICE_PHASE: Record<string, string> = {
+export const VOICE_PHASE: Record<string, string> = {
   armed: "Wake word armed",
   wake_detected: "Wake word heard",
   collecting: "Listening",
@@ -53,40 +52,50 @@ const VOICE_PHASE: Record<string, string> = {
 const text = (value: unknown): string | null => (typeof value === "string" && value ? value : null);
 const number = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
 
-/** One short fact under a node's name, from its own block; null when there is nothing real to say. */
-export function nodeFact(id: SubsystemId, view: SubsystemView, model: string | null): string | null {
-  if (view.status === "unavailable") return text(view.reason);
+/**
+ * The short facts under a node's name, from its own block; empty when there is nothing real to say.
+ * MEMORY keeps two lines apart: "Recalled N" (hits from the last retrieve or search) and "N facts"
+ * (the total after the last store), so a save never reads as a recall.
+ */
+export function nodeFacts(id: SubsystemId, view: SubsystemView, model: string | null): string[] {
+  if (view.status === "unavailable") return lines(text(view.reason));
   switch (id) {
     case "llm":
-      return text(view.model) ?? model;
+      return lines(text(view.model) ?? model);
     case "memory": {
-      const op = text(view.last_op);
-      if (!op) return null;
-      const count = number(view.count);
-      return count === null ? MEMORY_OP[op] ?? op : `${MEMORY_OP[op] ?? op} ${count}`;
+      const recalled = number(view.recall_count);
+      const facts = number(view.facts);
+      return lines(
+        recalled === null ? null : `Recalled ${recalled}`,
+        facts === null ? null : `${facts} ${facts === 1 ? "fact" : "facts"}`,
+      );
     }
     case "tools": {
       const active = Array.isArray(view.active) ? (view.active as unknown[]).filter((t) => typeof t === "string") : [];
-      if (active.length) return `Running ${String(active[active.length - 1])}`;
+      if (active.length) return [`Running ${String(active[active.length - 1])}`];
       const recent = Array.isArray(view.recent) ? (view.recent as { tool?: unknown; status?: unknown }[]) : [];
       const last = recent[recent.length - 1];
-      return last && text(last.tool) ? `${String(last.tool)}: ${String(last.status)}` : null;
+      return lines(last && text(last.tool) ? `${String(last.tool)}: ${String(last.status)}` : null);
     }
     case "system": {
       const cpu = number(view.cpu_percent);
-      return cpu === null ? null : `CPU ${Math.round(cpu)}%`;
+      return lines(cpu === null ? null : `CPU ${Math.round(cpu)}%`);
     }
     case "voice":
-      if (view.speaking === true) return "Speaking";
-      return VOICE_PHASE[text(view.input_phase) ?? ""] ?? (view.mode === "off" ? "Mic off" : null);
+      if (view.speaking === true) return ["Speaking"];
+      return lines(VOICE_PHASE[text(view.input_phase) ?? ""] ?? (view.mode === "off" ? "Mic off" : null));
     case "network": {
       const groq = text(view.groq);
-      if (groq === "down") return "Groq unreachable";
+      if (groq === "down") return ["Groq unreachable"];
       const latency = number(view.latency_ms);
-      if (groq === "up") return latency === null ? "Groq reachable" : `Groq ${Math.round(latency)} ms`;
-      return null;
+      if (groq === "up") return [latency === null ? "Groq reachable" : `Groq ${Math.round(latency)} ms`];
+      return [];
     }
     default:
-      return null;
+      return [];
   }
+}
+
+function lines(...values: (string | null)[]): string[] {
+  return values.filter((value): value is string => value !== null);
 }

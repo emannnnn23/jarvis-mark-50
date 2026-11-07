@@ -1,55 +1,59 @@
 /**
- * The 3D canvas. It renders only while the tab is visible (frameloop "never" otherwise), caps the
- * device pixel ratio by quality level, and keeps the whole node ring in frame on narrow screens.
+ * The 3D canvas. How often it draws is decided by useAdaptiveFrameloop: never while the tab is hidden,
+ * continuously while JARVIS works or the camera moves, otherwise on demand with a slow idle breath.
+ * The device pixel ratio and particle count follow the quality level (halved particles on narrow
+ * screens), and the camera rig keeps the node ring framed between the side panels.
  */
 
 import { Canvas, useThree } from "@react-three/fiber";
-import { useLayoutEffect } from "react";
+import { useEffect } from "react";
 
-import { useDocumentVisible } from "../../hooks/useDocumentVisible";
+import { useAdaptiveFrameloop } from "../../hooks/useAdaptiveFrameloop";
+import { useUi } from "../../store/ui";
 import { JarvisCore } from "../core/JarvisCore";
 import { SubsystemNodes } from "../nodes/SubsystemNodes";
+import { BASE_DISTANCE, CAMERA_HEIGHT } from "./cameraFit";
+import { CameraRig, ParallaxGroup } from "./CameraRig";
 import { HoloGrid } from "./HoloGrid";
-import { qualityProfile } from "./quality";
+import { particleCount, qualityProfile } from "./quality";
 import type { QualityLevel } from "./quality";
 
-const FOV = 40;
-const BASE_DISTANCE = 9.4;
-const CAMERA_HEIGHT = 0.7;
-/** World half-width that must stay visible: the side nodes plus their labels. */
-const NEEDED_HALF_WIDTH = 3.9;
 const BACKGROUND = "#04070b";
 
-function CameraFit() {
-  const camera = useThree((three) => three.camera);
-  const aspect = useThree((three) => three.size.width / Math.max(1, three.size.height));
-  useLayoutEffect(() => {
-    const halfTan = Math.tan((FOV * Math.PI) / 360);
-    const distance = Math.max(BASE_DISTANCE, NEEDED_HALF_WIDTH / (halfTan * aspect));
-    camera.position.set(0, CAMERA_HEIGHT * (distance / BASE_DISTANCE), distance);
-    camera.lookAt(0, -0.05, 0);
-    camera.updateProjectionMatrix();
-  }, [camera, aspect]);
+/** In "demand" mode, asks for a frame `fps` times a second so the idle core still breathes. */
+function DemandTicker({ fps }: { fps: number }) {
+  const invalidate = useThree((three) => three.invalidate);
+  useEffect(() => {
+    if (fps <= 0) return undefined;
+    const timer = setInterval(() => invalidate(), 1000 / fps);
+    return () => clearInterval(timer);
+  }, [fps, invalidate]);
   return null;
 }
 
-export function Scene({ quality }: { quality: QualityLevel }) {
-  const visible = useDocumentVisible();
+export function Scene({ quality, narrow }: { quality: QualityLevel; narrow: boolean }) {
+  const { frameloop, fps } = useAdaptiveFrameloop(quality);
   const profile = qualityProfile(quality);
+  const select = useUi((ui) => ui.select);
+  const parallax = quality !== "low";
   return (
     <Canvas
       className="scene-canvas"
       dpr={profile.dpr}
-      frameloop={visible ? "always" : "never"}
+      frameloop={frameloop}
       gl={{ antialias: profile.antialias, alpha: false, stencil: false, powerPreference: "high-performance" }}
-      camera={{ fov: FOV, near: 0.1, far: 60, position: [0, CAMERA_HEIGHT, BASE_DISTANCE] }}
+      camera={{ fov: 40, near: 0.1, far: 80, position: [0, CAMERA_HEIGHT, BASE_DISTANCE] }}
+      onPointerMissed={() => select(null)}
     >
       <color attach="background" args={[BACKGROUND]} />
       <fog attach="fog" args={[BACKGROUND, 10, 26]} />
-      <CameraFit />
+      <CameraRig parallax={parallax} />
+      {frameloop === "demand" && <DemandTicker fps={fps} />}
       <HoloGrid />
-      <JarvisCore particles={profile.particles} />
-      <SubsystemNodes />
+      <ParallaxGroup enabled={parallax}>
+        <JarvisCore particles={particleCount(quality, narrow)} />
+        <SubsystemNodes />
+      </ParallaxGroup>
     </Canvas>
   );
 }

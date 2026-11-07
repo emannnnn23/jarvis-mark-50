@@ -11,6 +11,7 @@ import {
   CLOSE_UNAUTHORIZED,
   MissionSocket,
   SILENCE_LIMIT_MS,
+  STABLE_CONNECTION_MS,
   backoffDelay,
 } from "../services/socket";
 import type { ConnectionStatus } from "../services/socket";
@@ -197,7 +198,7 @@ describe("MissionSocket", () => {
     expect(latest().sentFrames()[0]).toMatchObject({ last_seq: 120 });
   });
 
-  it("resets the backoff after a successful authentication", () => {
+  it("resets the backoff once an authenticated connection has stayed up for 5 s", () => {
     const { socket } = make();
     socket.connect();
     latest().serverClose(1006);
@@ -207,10 +208,62 @@ describe("MissionSocket", () => {
     const ws = latest();
     ws.serverOpen();
     ws.serverSend({ type: "auth.ok", protocol: 1 });
+    expect(STABLE_CONNECTION_MS).toBe(5000);
+    vi.advanceTimersByTime(STABLE_CONNECTION_MS);
     const count = FakeWebSocket.instances.length;
     ws.serverClose(1006);
     vi.advanceTimersByTime(500);
     expect(FakeWebSocket.instances.length).toBe(count + 1);
+  });
+
+  it("keeps backing off when the server accepts and then drops at once", () => {
+    // A flapping server must not get reconnects at ~2 Hz: auth.ok alone does not reset the backoff.
+    const { socket } = make();
+    socket.connect();
+    latest().serverClose(1006); // attempt 0 -> waits 0.5 s
+    vi.advanceTimersByTime(500);
+    for (const expected of [1000, 2000, 4000]) {
+      const ws = latest();
+      ws.serverOpen();
+      ws.serverSend({ type: "auth.ok", protocol: 1 });
+      vi.advanceTimersByTime(100);
+      const count = FakeWebSocket.instances.length;
+      ws.serverClose(1006);
+      vi.advanceTimersByTime(expected - 1);
+      expect(FakeWebSocket.instances.length, `before ${expected} ms`).toBe(count);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances.length, `after ${expected} ms`).toBe(count + 1);
+    }
+    socket.close();
+  });
+
+  it("grows the backoff when the WebSocket constructor throws", () => {
+    let throws = 3;
+    class ThrowingWebSocket extends FakeWebSocket {
+      constructor(url: string) {
+        if (throws > 0) {
+          throws -= 1;
+          throw new Error("refused by CSP");
+        }
+        super(url);
+      }
+    }
+    const statuses: ConnectionStatus[] = [];
+    const socket = new MissionSocket("ws://127.0.0.1:8765/ws", "t", () => undefined, (s) => statuses.push(s), {
+      WebSocketImpl: ThrowingWebSocket as unknown as typeof WebSocket, random: () => 0.5,
+    });
+    socket.connect(); // throw 1 -> 0.5 s
+    expect(statuses.at(-1)).toBe("reconnecting");
+    vi.advanceTimersByTime(500); // throw 2 -> 1 s
+    vi.advanceTimersByTime(999);
+    expect(throws).toBe(1);
+    vi.advanceTimersByTime(1); // throw 3 -> 2 s
+    expect(throws).toBe(0);
+    vi.advanceTimersByTime(1999);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    vi.advanceTimersByTime(1);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    socket.close();
   });
 
   it("stops reconnecting after 4401", () => {

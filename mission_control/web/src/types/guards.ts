@@ -38,7 +38,8 @@ const bool: Check = (value) => typeof value === "boolean";
 const nullable = (check: Check): Check => (value) => value === null || check(value);
 const arrayOf = (check: Check): Check => (value) => Array.isArray(value) && value.every(check);
 const oneOf = (...allowed: string[]): Check => (value) => typeof value === "string" && allowed.includes(value);
-const maxText = (limit: number): Check => (value) => typeof value === "string" && value.length <= limit;
+// The backend cuts text in code points (Python str), so count them the same way: an emoji is one, not two.
+const maxText = (limit: number): Check => (value) => typeof value === "string" && [...value].length <= limit;
 const shape = (fields: Fields, optional: Fields = {}): Check => (value) =>
   isObject(value) && checkFields(value, fields, optional);
 
