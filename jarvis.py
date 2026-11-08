@@ -23,6 +23,7 @@ import importlib.metadata
 import importlib.util
 import os
 import platform
+import queue
 import shlex
 import shutil
 import sys
@@ -462,21 +463,44 @@ def publish_voice_level(phase: str, rms: float) -> None:
 def start_mission_control(config: Config, cli: JarvisCLI, voice: VoiceEngine):
     """Start the Mission Control server and turn the event bus on. Returns the server, or None.
 
-    Any failure (aiohttp missing, port in use) is one yellow line: the terminal works as usual. The
-    tokenised link goes to the terminal only, never to the log or the audit trail, and the browser is
-    opened through a private redirect file so the token is not on any command line."""
+    While it runs, confirmations go through a ConfirmationBroker (typed in the terminal, or answered in
+    Mission Control) and the browser can send lines to the loop through a MissionBridge. Any failure
+    (aiohttp missing, port in use) is one yellow line, and the terminal works exactly as before: the
+    previous confirm callable (terminal_confirm) is put back and the bridge detached. The tokenised
+    link goes to the terminal only, never to the log or the audit trail, and the browser is opened
+    through a private redirect file so the token is not on any command line."""
     try:
+        from mission_control.bridge import MissionBridge
+        from mission_control.confirm import ConfirmationBroker
         from mission_control.server import MissionControlError, MissionControlServer
     except ImportError as exc:
         print(style(f"Mission Control is unavailable ({exc}); pip install -r requirements.txt. "
                     "The terminal works as usual.", "yellow"))
         return None
+    policy = cli.ctx.policy
+    previous_confirm = policy.confirm
+    broker = ConfirmationBroker(timeout=config.confirm_timeout)
+    # One slot: a browser command waits for the loop, never a queue of them.
+    bridge = MissionBridge(queue.Queue(maxsize=1), cli.request_cancel, broker)
     server = MissionControlServer(BUS, port=config.ui_port, dist_dir=MISSION_DIST_DIR,
-                                  dev_origin=config.ui_dev_origin)
+                                  dev_origin=config.ui_dev_origin, bridge=bridge, broker=broker)
+    # In place before the server listens, so no browser can ever meet the terminal-only prompt.
+    policy.confirm = broker.confirm
+    cli.attach_mission(bridge)
     try:
         url = server.start()
-    except MissionControlError as exc:
-        print(style(f"Mission Control could not start: {exc} The terminal works as usual.", "yellow"))
+    except BaseException as exc:
+        policy.confirm = previous_confirm
+        cli.attach_mission(None)
+        if not isinstance(exc, Exception):
+            raise  # Ctrl+C during startup still leaves; the terminal state is already restored
+        if isinstance(exc, MissionControlError):
+            print(style(f"Mission Control could not start: {exc} The terminal works as usual.", "yellow"))
+        else:
+            log.warning("Mission Control failed to start", exc_info=True)
+            server.stop()
+            print(style(f"Mission Control could not start ({type(exc).__name__}). The terminal works as usual.",
+                        "yellow"))
         return None
     BUS.enabled = True
     emit("session.start", **session_start_payload(config, cli, voice))

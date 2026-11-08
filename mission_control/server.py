@@ -45,6 +45,8 @@ from core.events import PUBLISH_MAX_STR
 from core.events import scrub
 from mission_control import BUILD_COMMAND
 from mission_control import DIST_DIR
+from mission_control.bridge import MAX_COMMAND_ID
+from mission_control.bridge import SubmitResult
 from mission_control.metrics import MetricsSampler
 from mission_control.metrics import probe_groq
 from mission_control.state import StateTracker
@@ -68,6 +70,7 @@ HEARTBEAT = 20.0
 CLOSE_TIMEOUT = 3.0
 CLOSE_REPLY_TIMEOUT = 1.0  # how long a close waits for the browser's reply; also bounds shutdown
 RECENT_EVENTS = 200  # events carried in a snapshot
+MAX_ECHOED_ID = 128  # longest confirmation id echoed back in confirm.answer.result
 SNAPSHOT_DEPTH = 6  # a bus event (scrubbed at depth 4) sits two levels down in a snapshot
 
 TICK_INTERVAL = 1.0
@@ -225,8 +228,14 @@ class Hub:
         self.bridge = bridge
         self.broker = broker
         self.clients: set[_Client] = set()
-        # Inbound message handlers by type, after authentication; Task 9 adds the command types.
-        self.handlers: dict[str, Callable[[_Client, dict[str, Any]], None]] = {"ping": self._on_ping}
+        # Inbound message handlers by type, after authentication. The command types need a bridge (and
+        # confirm.answer a broker); without one they are answered as invalid.
+        self.handlers: dict[str, Callable[[_Client, dict[str, Any]], None]] = {
+            "ping": self._on_ping,
+            "command.submit": self._on_command_submit,
+            "request.cancel": self._on_request_cancel,
+            "confirm.answer": self._on_confirm_answer,
+        }
         self._loop: asyncio.AbstractEventLoop | None = None
         self._unsubscribe: Callable[[], None] | None = None
         self._tasks: list[asyncio.Task] = []
@@ -236,6 +245,8 @@ class Hub:
         self._task: Any = None
         self._metrics: dict[str, Any] | None = None
         self._network: dict[str, Any] | None = None
+        # The last confirm.request event seen (transient, so not in the ring), for tabs that replay.
+        self._confirm_event: dict[str, Any] | None = None
         self._probe_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._probe_task: asyncio.Task | None = None
         self._probe_running = threading.Event()
@@ -347,6 +358,11 @@ class Hub:
             self._metrics = event
         elif kind == "network.status":
             self._network = event
+        elif kind == "confirm.request":
+            self._confirm_event = event
+        elif kind == "confirm.resolved" and self._confirm_event is not None \
+                and self._confirm_event.get("id") == event.get("id"):
+            self._confirm_event = None
         change = self.tracker.apply(event)
         if change is not None:
             self.bus.publish("jarvis.state", **change)  # comes back through _dispatch like any event
@@ -368,12 +384,7 @@ class Hub:
         tracked = self.tracker.snapshot()
         recent = (self.bus.recent() or [])[-RECENT_EVENTS:]
         seq = max([self._last_seq, *(event["seq"] for event in recent)])
-        pending = None
-        if self.broker is not None:
-            try:
-                pending = self.broker.pending_payload()
-            except Exception:  # noqa: BLE001 - a broker fault must not break every reconnect
-                log.debug("pending_payload failed", exc_info=True)
+        pending = self._pending_confirmation()
         frame = {
             "type": "snapshot",
             "seq": seq,
@@ -387,6 +398,29 @@ class Hub:
             "recent_events": recent,
         }
         return scrub(frame, max_str=PUBLISH_MAX_STR, max_items=PUBLISH_MAX_ITEMS, depth=SNAPSHOT_DEPTH)
+
+    def _pending_confirmation(self) -> dict[str, Any] | None:
+        if self.broker is None:
+            return None
+        try:
+            return self.broker.pending_payload()
+        except Exception:  # noqa: BLE001 - a broker fault must not break every reconnect
+            log.debug("pending_payload failed", exc_info=True)
+            return None
+
+    def _pending_confirmation_frame(self) -> str | None:
+        """The open confirmation as the confirm.request event a replaying tab missed, or None.
+
+        confirm.request is transient, so a replay never holds it: a tab that was away while it was asked
+        would not show the approval at all. The payload is the broker's (the confirmation still open);
+        the envelope is the original event's, so the tab files it under its real seq and request id.
+        None when the hub has not dispatched it yet: it then reaches this client live."""
+        event = self._confirm_event
+        pending = self._pending_confirmation()
+        if event is None or not isinstance(pending, dict) or pending.get("id") != event.get("id"):
+            return None
+        envelope = {key: event[key] for key in ("v", "seq", "type", "timestamp", "request_id") if key in event}
+        return _frame({**pending, **envelope})
 
     # --- clients ----------------------------------------------------------------------------------
 
@@ -435,6 +469,9 @@ class Hub:
             for event in replay:
                 client.replayed.add(event["seq"])
                 client.enqueue(json.dumps(event, separators=(",", ":")))
+            pending = self._pending_confirmation_frame()
+            if pending is not None:  # a snapshot carries it already; a replay would miss it
+                client.enqueue(pending)
             return
         snap = self.snapshot()
         client.replayed.update(event["seq"] for event in snap["recent_events"] if isinstance(event, dict)
@@ -465,6 +502,42 @@ class Hub:
 
     def _on_ping(self, client: _Client, data: dict[str, Any]) -> None:
         client.enqueue(PONG_FRAME)
+
+    def _on_command_submit(self, client: _Client, data: dict[str, Any]) -> None:
+        """A line for the JARVIS loop. The bridge checks it and queues it for the main thread, which runs
+        it like a typed line; the outcome is published as command.ack or command.rejected."""
+        command_id = data.get("id")
+        if self.bridge is None or not isinstance(command_id, str) or not 0 < len(command_id) <= MAX_COMMAND_ID:
+            client.enqueue(INVALID_FRAME)
+            return
+        result = self.bridge.submit(command_id, data.get("text"))  # never coerced: the bridge checks types
+        if result is SubmitResult.ACCEPTED:
+            self.bus.publish("command.ack", command_id=command_id, status="accepted")
+        else:
+            reason = result.value if isinstance(result, SubmitResult) else SubmitResult.INVALID.value
+            self.bus.publish("command.rejected", command_id=command_id, reason=reason)
+
+    def _on_request_cancel(self, client: _Client, data: dict[str, Any]) -> None:
+        """Cancel the request in progress like Ctrl+C. Called here, on the loop thread, never on the main
+        thread; when JARVIS is idle it only stops speaking."""
+        if self.bridge is None:
+            client.enqueue(INVALID_FRAME)
+            return
+        self.bridge.cancel()
+
+    def _on_confirm_answer(self, client: _Client, data: dict[str, Any]) -> None:
+        """The browser's answer to the open confirmation. The fields go to the broker exactly as received:
+        it checks every type, and only `approved is True` approves."""
+        confirm_id = data.get("id")
+        if self.broker is not None:
+            result = self.broker.answer_from_browser(confirm_id, data.get("digest"), data.get("approved"))
+        elif self.bridge is not None:
+            result = self.bridge.answer(confirm_id, data.get("digest"), data.get("approved"))
+        else:
+            client.enqueue(INVALID_FRAME)
+            return
+        echoed = confirm_id[:MAX_ECHOED_ID] if isinstance(confirm_id, str) else ""
+        client.enqueue(_frame({"type": "confirm.answer.result", "id": echoed, "result": str(result)}))
 
     # --- timers -----------------------------------------------------------------------------------
 

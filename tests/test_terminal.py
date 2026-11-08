@@ -10,6 +10,8 @@ import hmac
 import io
 import json
 import os
+import queue
+import signal
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +29,7 @@ from helpers import (  # noqa: E402 - sets up sys.path for the project imports
 import jarvis  # noqa: E402
 from core.events import BUS  # noqa: E402
 from core.orchestrator import AgentResult  # noqa: E402
+from mission_control import bridge  # noqa: E402
 from tools import developer  # noqa: E402
 from ui import terminal  # noqa: E402
 
@@ -143,9 +146,9 @@ def parity_cases() -> dict[str, jarvis.ConfirmationRequest]:
     sensitive, controlled = jarvis.Permission.SENSITIVE_ACTION, jarvis.Permission.CONTROLLED_ACTION
     bidi = ("--- a/auth.py\n+++ b/auth.py\n@@ -1,4 +1,4 @@\n"
             "-access = 'user'\n+access = 'user‮ ⁦// admin⁩'\n"
-            "+zero​width‌join‍\n+x = 1 y = 2 z\n"
+            "+zero\u200bwidth\u200cjoin\u200d\n+x = 1\u2028y = 2\u2029z\n"
             "﻿+bom at line start\n+﻿bom after plus\n context\twith tab\n"
-            "+family \U0001F468‍\U0001F469‍\U0001F467\n"
+            "+family \U0001F468\u200d\U0001F469\u200d\U0001F467\n"
             "+print('hi')\x1b[2J\x1b]0;owned\x07\n-x\r\n+form\x0cfeed\n+del\x7f and c1\x85\n")
     long_diff = "\n".join(
         ("+" if i % 3 == 0 else "-" if i % 3 == 1 else " ") + f"line {i}" for i in range(457))
@@ -167,7 +170,7 @@ def parity_cases() -> dict[str, jarvis.ConfirmationRequest]:
             ["/usr/bin/firefox", "/home/u/My Docs/a‮b.txt", "/w/lone\ud800surrogate"],
             "Requested after reading web or file content, which could contain injected instructions."),
         "no_paths_no_reason": jarvis.ConfirmationRequest(
-            "open_url", controlled, "Open https://example.com/​path\x1b[31m", []),
+            "open_url", controlled, "Open https://example.com/\u200bpath\x1b[31m", []),
         "newline_only_details": jarvis.ConfirmationRequest(
             "write_note", controlled, "Write note", ["/n/a.md"], "", "\n"),
         "trailing_newlines": jarvis.ConfirmationRequest(
@@ -761,6 +764,249 @@ class TerminalEventTests(BusCaptureMixin, AgentTestCase):
             cli.voice_turn()
             cli.stop_wake()
         self.assertEqual(events, [])
+
+
+
+class FakeTty(io.StringIO):
+    """A terminal stand-in for stdout: style() colours what is printed to it."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class MissionCommandTests(BusCaptureMixin, AgentTestCase):
+    """Commands from Mission Control go through the terminal's own loop, under the same rules."""
+
+    def setUp(self):
+        super().setUp()
+        self.voice = jarvis.VoiceEngine(enabled=False, player=["fake-player"])
+        self.addCleanup(self.voice.shutdown)
+        self.events = self.capture_events()
+        ctx = jarvis.AgentContext(FakeGroqClient(), self.config, self.registry, self.policy, self.memory)
+        with mock.patch("builtins.print"):
+            self.cli = jarvis.JarvisCLI(ctx, self.voice, self.memory)
+        self.broker = mock.Mock()
+        self.bridge = bridge.MissionBridge(queue.Queue(maxsize=1), self.cli.request_cancel, self.broker)
+        self.cli.attach_mission(self.bridge)
+
+    def step(self, agent_reply="Done, Sir."):
+        """One pass of the loop with nothing typed at the terminal; returns (left?, printed, run_agent mock)."""
+        with mock.patch("ui.terminal.run_agent", return_value=AgentResult(agent_reply, "complete", [], 1)) as agent, \
+                mock.patch("jarvis.select.select", return_value=([], [], [])), \
+                mock.patch("builtins.print") as printed:
+            left = self.cli._step()
+        return left, printed_text(printed), agent
+
+    def of_type(self, type_):
+        return [e for e in self.events if e["type"] == type_]
+
+    def test_read_line_returns_browser_command_with_mission_attached(self):
+        self.assertIs(self.bridge.submit("c1", "  what time is it  "), bridge.SubmitResult.ACCEPTED)
+        self.assertFalse(self.bridge.busy.is_set())
+        with mock.patch("jarvis.select.select", return_value=([], [], [])) as selected, \
+                mock.patch("builtins.input") as typed, mock.patch("builtins.print") as printed:
+            self.assertEqual(self.cli._read_line(), "what time is it")
+        typed.assert_not_called()
+        self.assertIn("You (browser): what time is it", printed_text(printed))
+        self.assertEqual(self.cli._request_source, "browser")
+        self.assertTrue(self.bridge.busy.is_set())  # taken: the next browser command is refused as busy
+        self.assertIs(self.bridge.submit("c2", "hello"), bridge.SubmitResult.BUSY)
+        self.assertTrue(self.cli._inbox.empty())
+        self.assertIsNot(self.cli._inbox, self.cli._wake_events)
+        selected.assert_not_called()  # the inbox is looked at before the terminal
+
+    def test_read_line_with_mission_attached_still_reads_the_terminal(self):
+        stdin = io.StringIO("  typed here \n")
+        self.bridge.busy.set()
+        with mock.patch("sys.stdin", stdin), mock.patch("jarvis.select.select", return_value=([stdin], [], [])), \
+                mock.patch("builtins.input") as typed, mock.patch("builtins.print"):
+            self.assertEqual(self.cli._read_line(), "typed here")
+        typed.assert_not_called()
+        self.assertEqual(self.cli._request_source, "terminal")
+        self.assertTrue(self.bridge.busy.is_set())
+
+    def test_waiting_at_the_prompt_clears_busy(self):
+        self.bridge.busy.set()
+        seen = []
+
+        def select_once(*args):
+            seen.append(self.bridge.busy.is_set())
+            self.bridge.submit("c1", "hello")
+            return [], [], []
+
+        with mock.patch("jarvis.select.select", side_effect=select_once), mock.patch("builtins.print"):
+            self.assertEqual(self.cli._read_line(), "hello")
+        self.assertEqual(seen, [False])
+
+    def test_browser_line_runs_as_a_browser_request(self):
+        self.bridge.submit("cmd-7", "what time is it")
+        left, printed, agent = self.step()
+        self.assertFalse(left)
+        agent.assert_called_once()
+        self.assertEqual(agent.call_args.args[1], "what time is it")
+        [start] = self.of_type("request.start")
+        self.assertEqual((start["source"], start["text"], start["command_id"]), ("browser", "what time is it", "cmd-7"))
+        self.assertTrue(start["request_id"].startswith("browser-"))
+        self.assert_valid(self.events)
+        # The next typed line is the terminal's again.
+        with mock.patch("ui.terminal.run_agent", return_value=AgentResult("Ok.", "complete", [], 1)), \
+                mock.patch("builtins.print"):
+            self.cli._request_source = "terminal"
+            self.cli.handle_message("typed")
+        starts = self.of_type("request.start")
+        self.assertEqual(starts[-1]["source"], "terminal")
+        self.assertNotIn("command_id", starts[-1])
+
+    def test_exit_word_from_browser_rejected(self):
+        for word in sorted(terminal.EXIT_WORDS) + ["Goodbye!", "EXIT.", "  quit  ", "goodbye   jarvis"]:
+            with self.subTest(word=word):
+                self.assertIs(self.bridge.submit("c1", word), bridge.SubmitResult.TERMINAL_ONLY)
+        self.assertTrue(self.cli._inbox.empty())
+        # Even if one reached the inbox, the loop would refuse it rather than leave.
+        self.cli._inbox.put_nowait(("c9", "exit"))
+        with mock.patch.object(self.voice, "wait") as wait:
+            left, printed, agent = self.step()
+        self.assertFalse(left)
+        wait.assert_not_called()
+        agent.assert_not_called()
+        self.assertNotIn("Until next time", printed)
+        [rejected] = self.of_type("command.rejected")
+        self.assertEqual((rejected["command_id"], rejected["reason"]), ("c9", "terminal_only"))
+
+    def test_terminal_only_commands_never_run_from_the_inbox(self):
+        for line in ("/forget 1", "/memory reset", "/tasks reset", "/wake on", "/listen on", "/talk"):
+            with self.subTest(line=line):
+                self.cli._inbox.put_nowait(("c1", line))
+                with mock.patch.object(self.cli, "handle_command") as handled, \
+                        mock.patch.object(self.cli, "voice_turn") as voice_turn, \
+                        mock.patch("ui.terminal.terminal_confirm") as asked:
+                    left, printed, agent = self.step()
+                self.assertFalse(left)
+                handled.assert_not_called()
+                voice_turn.assert_not_called()
+                asked.assert_not_called()
+                agent.assert_not_called()
+                self.assertIn("terminal", printed)
+
+    def test_request_cancel_busy_sends_sigint(self):
+        self.cli._busy = True
+        with mock.patch("jarvis.os.kill") as kill, mock.patch.object(self.voice, "stop") as stop:
+            self.assertTrue(self.cli.request_cancel())
+        kill.assert_called_once_with(os.getpid(), signal.SIGINT)
+        stop.assert_called_once_with()
+        self.assertTrue(self.cli._interrupt_pending)
+
+    def test_request_cancel_not_busy_only_stops_voice(self):
+        with mock.patch("jarvis.os.kill") as kill, mock.patch.object(self.voice, "stop") as stop:
+            self.assertFalse(self.cli.request_cancel())
+            self.assertFalse(self.bridge.cancel())
+        kill.assert_not_called()
+        self.assertEqual(stop.call_count, 2)
+        self.assertFalse(self.cli._interrupt_pending)
+
+    def test_bridge_cancel_calls_request_cancel(self):
+        self.cli._busy = True
+        with mock.patch("jarvis.os.kill") as kill, mock.patch.object(self.voice, "stop"):
+            self.assertTrue(self.bridge.cancel())
+        kill.assert_called_once_with(os.getpid(), signal.SIGINT)
+
+    def test_submit_while_busy_rejected(self):
+        self.bridge.busy.set()
+        self.assertIs(self.bridge.submit("c1", "hello"), bridge.SubmitResult.BUSY)
+        self.assertTrue(self.cli._inbox.empty())
+        self.bridge.busy.clear()
+        self.assertIs(self.bridge.submit("c1", "hello"), bridge.SubmitResult.ACCEPTED)
+        self.assertIs(self.bridge.submit("c2", "again"), bridge.SubmitResult.QUEUE_FULL)
+        self.assertEqual(self.cli._inbox.qsize(), 1)
+
+    def test_submit_checks_its_input(self):
+        S = bridge.SubmitResult
+        cases = [(None, "hi", S.INVALID), ("", "hi", S.INVALID), (7, "hi", S.INVALID), ("x" * 129, "hi", S.INVALID),
+                 ("c", None, S.INVALID), ("c", 42, S.INVALID), ("c", "", S.INVALID), ("c", "   ", S.INVALID),
+                 ("c", "two\nlines", S.INVALID), ("c", "bell\x07", S.INVALID), ("c", "sep\u2028x", S.INVALID),
+                 ("c", "x" * 4001, S.TOO_LONG), ("c", "x" * 4000, S.ACCEPTED)]
+        for command_id, text, expected in cases:
+            with self.subTest(command_id=command_id, text=str(text)[:20]):
+                self.assertIs(self.bridge.submit(command_id, text), expected)
+                with contextlib.suppress(queue.Empty):
+                    self.cli._inbox.get_nowait()
+
+    def test_answer_passes_through_to_the_broker(self):
+        self.broker.answer_from_browser.return_value = "digest_mismatch"
+        self.assertEqual(self.bridge.answer("id1", "d", "true"), "digest_mismatch")
+        self.broker.answer_from_browser.assert_called_once_with("id1", "d", "true")
+
+    def test_slash_command_output_captured_without_ansi(self):
+        self.memory.remember_fact("I prefer tea")
+        self.bridge.submit("c5", "/memory")
+        tty = FakeTty()
+        with mock.patch("sys.stdout", tty), mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch("jarvis.select.select", return_value=([], [], [])):
+            os.environ.pop("NO_COLOR", None)
+            self.assertFalse(self.cli._step())
+        terminal_text = tty.getvalue()
+        self.assertIn("I prefer tea", terminal_text)
+        self.assertIn("\033[", terminal_text)  # the terminal itself still gets colour
+        [output] = self.of_type("command.output")
+        self.assertEqual((output["command_id"], output["command"]), ("c5", "/memory"))
+        self.assertIn("I prefer tea", output["text"])
+        self.assertNotIn("\033", output["text"])
+        self.assertNotIn("[2m", output["text"])
+        self.assertNotIn("You (browser)", output["text"])
+        self.assert_valid(self.events)
+
+    def test_command_output_is_scrubbed_and_capped(self):
+        secret = "gsk_" + "Qz7" * 14
+        self.bridge.submit("c6", "/status")
+
+        def noisy(line):
+            print("x" * 7990 + " " + secret)
+            print("y" * 20000)
+
+        with mock.patch.object(self.cli, "handle_command", side_effect=noisy), \
+                mock.patch("sys.stdout", io.StringIO()), mock.patch("jarvis.select.select", return_value=([], [], [])):
+            self.cli._step()
+        [output] = self.of_type("command.output")
+        self.assertLessEqual(len(output["text"]), 8000)
+        self.assertNotIn("gsk_Qz7", output["text"])
+        self.assert_valid(self.events)
+
+    def test_terminal_slash_commands_are_not_captured(self):
+        stdin = io.StringIO("/help\n")
+        with mock.patch("sys.stdin", stdin), mock.patch("jarvis.select.select", return_value=([stdin], [], [])), \
+                mock.patch("builtins.print"):
+            self.cli._step()
+        self.assertEqual(self.of_type("command.output"), [])
+
+    def test_attach_none_restores_the_plain_prompt(self):
+        self.cli.attach_mission(None)
+        with mock.patch("builtins.input", return_value=" hi ") as typed, mock.patch("jarvis.select.select") as selected:
+            self.assertEqual(self.cli._read_line(), "hi")
+        typed.assert_called_once()
+        selected.assert_not_called()
+
+
+class BrowserCommandPolicyTests(unittest.TestCase):
+    ALLOWED = ["what time is it", "continue", "help", "/help", "/tools", "/status", "/memory", "/memory tea",
+               "/tasks", "/tasks clear", "/resume", "/resume abc123", "/abandon", "/abandon abc123", "/dev on",
+               "/dev off", "/dev auto", "/dev", "/voice on", "/voice off", "/stop", "/clear", "/wake off",
+               "/listen off", "/HELP", "  /status  ", "please exit the editor", "/memory x", "/wake", "/voice"]
+    TERMINAL_ONLY = ["/forget 1", "/forget", "/FORGET abc", "/memory reset", "/memory RESET", "/memory  reset ",
+                     "/tasks reset", "/Tasks Reset", "/wake on", "/WAKE ON", "/listen on", "/talk", "/TALK",
+                     "/talk now", "/memory reset now", "/wake on please", *sorted(terminal.EXIT_WORDS), "Exit.", "QUIT!",
+                     "goodbye  jarvis", "bye jarvis!"]
+    INVALID = ["", "   ", "/nope", "/exitnow", "/forgetful", "/unknown thing", "line\nbreak", "esc\x1b[31m"]
+
+    def test_browser_command_policy(self):
+        for line in self.ALLOWED:
+            with self.subTest(allowed=line):
+                self.assertEqual(bridge.browser_command_policy(line), (True, ""))
+        for line in self.TERMINAL_ONLY:
+            with self.subTest(terminal_only=line):
+                self.assertEqual(bridge.browser_command_policy(line), (False, "terminal_only"))
+        for line in self.INVALID:
+            with self.subTest(invalid=line):
+                self.assertEqual(bridge.browser_command_policy(line), (False, "invalid"))
 
 
 if __name__ == "__main__":

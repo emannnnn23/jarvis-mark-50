@@ -36,7 +36,8 @@ import jarvis  # noqa: E402
 import mission_control  # noqa: E402
 from core.events import BUS, EventBus  # noqa: E402
 from core.orchestrator import AgentResult  # noqa: E402
-from mission_control import launch, server  # noqa: E402
+from mission_control import bridge, launch, server  # noqa: E402
+from mission_control import confirm as confirm_module  # noqa: E402
 from mission_control.protocol import validate_event  # noqa: E402
 from mission_control.state import StateTracker  # noqa: E402
 
@@ -552,6 +553,224 @@ class HubLoopTests(AppTestCase):
         self.assertEqual(self.bus._subscribers, [])
 
 
+
+# --- commands, cancel and approvals from the browser ---------------------------------------------------
+
+
+class FakeBridge:
+    """MissionBridge stand-in: records what the server hands over, answers with a scripted result."""
+
+    def __init__(self, result=None):
+        self.result = result if result is not None else bridge.SubmitResult.ACCEPTED
+        self.submitted: list[tuple] = []
+        self.cancels = 0
+        self.answers: list[tuple] = []
+
+    def submit(self, command_id, text):
+        self.submitted.append((command_id, text))
+        return self.result
+
+    def cancel(self):
+        self.cancels += 1
+        return True
+
+    def answer(self, confirm_id, digest, approved):
+        self.answers.append((confirm_id, digest, approved))
+        return "ok"
+
+
+class FakeBroker:
+    def __init__(self, result="ok", pending=None):
+        self.result = result
+        self.pending = pending
+        self.answers: list[tuple] = []
+
+    def answer_from_browser(self, confirm_id, digest, approved):
+        self.answers.append((confirm_id, digest, approved))
+        return self.result
+
+    def pending_payload(self):
+        return None if self.pending is None else json.loads(json.dumps(self.pending))
+
+
+def confirm_payload(confirm_id="c0ffee", digest="d" * 64) -> dict:
+    return {"id": confirm_id, "digest": digest, "tool": "edit_workspace_file", "label": "SENSITIVE ACTION",
+            "operation": "Edit notes.txt", "affected_paths": ["/w/notes.txt"], "reason": "", "hidden": 0,
+            "lines": [{"k": "del", "t": "-helo"}, {"k": "add", "t": "+hello"}], "omitted": 0,
+            "browser_approvable": True, "expires_at": None}
+
+
+class InboundHandlerTests(AppTestCase):
+    async def start_with(self, bridge_=None, broker=None):
+        await self.start()
+        self.hub.bridge, self.hub.broker = bridge_, broker
+
+    async def next_of(self, ws, type_) -> dict:
+        for _ in range(200):  # bounded: the hub's ticks keep frames coming, so a missing one must fail
+            frame = await self.recv(ws)
+            if frame.get("type") == type_:
+                return frame
+        self.fail(f"no {type_} frame")
+
+    async def until_pong(self, ws) -> list[dict]:
+        """Every frame before the reply to a ping sent now (frames are sent in order)."""
+        await ws.send_json({"type": "ping"})
+        frames = []
+        while (frame := await self.recv(ws)) != {"type": "pong"}:
+            frames.append(frame)
+        return frames
+
+    async def test_command_submit_accepted_is_acked_as_an_event(self):
+        fake = FakeBridge()
+        await self.start_with(fake)
+        ws = await self.authed()
+        await self.recv(ws)  # snapshot
+        await ws.send_json({"type": "command.submit", "id": "cmd-1", "text": "what time is it"})
+        ack = await self.next_of(ws, "command.ack")
+        self.assertEqual((ack["command_id"], ack["status"]), ("cmd-1", "accepted"))
+        self.assertEqual(validate_event(ack), [])
+        self.assertEqual(fake.submitted, [("cmd-1", "what time is it")])
+
+    async def test_command_submit_rejections_carry_the_reason(self):
+        fake = FakeBridge()
+        await self.start_with(fake)
+        ws = await self.authed()
+        await self.recv(ws)
+        for result in (r for r in bridge.SubmitResult if r is not bridge.SubmitResult.ACCEPTED):
+            with self.subTest(result=result):
+                fake.result = result
+                await ws.send_json({"type": "command.submit", "id": "cmd-2", "text": "exit"})
+                rejected = await self.next_of(ws, "command.rejected")
+                self.assertEqual((rejected["command_id"], rejected["reason"]), ("cmd-2", result.value))
+                self.assertEqual(validate_event(rejected), [])
+
+    async def test_command_submit_text_is_passed_as_received(self):
+        fake = FakeBridge(bridge.SubmitResult.INVALID)
+        await self.start_with(fake)
+        ws = await self.authed()
+        await self.recv(ws)
+        for text in (None, 42, ["a"], "x" * 5000):
+            await ws.send_json({"type": "command.submit", "id": "c", "text": text})
+            await self.next_of(ws, "command.rejected")
+        await ws.send_json({"type": "command.submit", "id": "c"})
+        await self.next_of(ws, "command.rejected")
+        self.assertEqual([t for _, t in fake.submitted], [None, 42, ["a"], "x" * 5000, None])
+
+    async def test_command_submit_without_a_usable_id_is_invalid(self):
+        fake = FakeBridge()
+        await self.start_with(fake)
+        ws = await self.authed()
+        await self.recv(ws)
+        for bad in (None, 7, "", "x" * 129, ["id"]):
+            with self.subTest(bad=bad):
+                await ws.send_json({"type": "command.submit", "id": bad, "text": "hi"})
+                self.assertEqual(await self.recv(ws), {"type": "error", "code": "invalid"})
+        self.assertEqual(fake.submitted, [])
+
+    async def test_request_cancel_calls_the_bridge(self):
+        fake = FakeBridge()
+        await self.start_with(fake)
+        ws = await self.authed()
+        await self.recv(ws)
+        await ws.send_json({"type": "request.cancel"})
+        await ws.send_json({"type": "ping"})
+        self.assertEqual(await self.recv(ws), {"type": "pong"})  # cancel sends no reply of its own
+        self.assertEqual(fake.cancels, 1)
+
+    async def test_confirm_answer_fields_go_to_the_broker_as_received(self):
+        broker = FakeBroker("digest_mismatch")
+        await self.start_with(FakeBridge(), broker)
+        ws = await self.authed()
+        await self.recv(ws)
+        cases = [
+            ({"id": "abc", "digest": "d1", "approved": True}, ("abc", "d1", True), "abc"),
+            ({"id": "abc", "digest": "d1", "approved": "true"}, ("abc", "d1", "true"), "abc"),
+            ({"id": "abc", "digest": "d1", "approved": 1}, ("abc", "d1", 1), "abc"),
+            ({"id": "abc"}, ("abc", None, None), "abc"),
+            ({"id": 5, "digest": ["x"], "approved": {"a": 1}}, (5, ["x"], {"a": 1}), ""),
+        ]
+        for message, passed, echoed in cases:
+            with self.subTest(message=message):
+                await ws.send_json({"type": "confirm.answer", **message})
+                result = await self.recv(ws)
+                self.assertEqual(result, {"type": "confirm.answer.result", "id": echoed, "result": "digest_mismatch"})
+                self.assertEqual(broker.answers[-1], passed)
+                self.assertIs(type(broker.answers[-1][2]), type(passed[2]))  # never coerced
+
+    async def test_without_a_bridge_the_inbound_types_are_invalid(self):
+        await self.start_with(None, None)
+        ws = await self.authed()
+        await self.recv(ws)
+        for message in ({"type": "command.submit", "id": "c", "text": "hi"}, {"type": "request.cancel"},
+                        {"type": "confirm.answer", "id": "a", "digest": "b", "approved": True}):
+            with self.subTest(message=message["type"]):
+                await ws.send_json(message)
+                self.assertEqual(await self.recv(ws), {"type": "error", "code": "invalid"})
+
+    async def test_replay_also_sends_the_open_confirmation(self):
+        payload = confirm_payload()
+        broker = FakeBroker(pending=None)
+        await self.start_with(FakeBridge(), broker)
+        ws = await self.authed()
+        snap = await self.recv(ws)
+        last_seq = snap["seq"]
+        await ws.close()
+
+        # While the tab is away: a request starts and asks for approval (confirm.request is transient).
+        with self.bus.request_scope("browser"):
+            started = self.bus.publish("request.start", source="browser", text="fix the typo")
+            live = self.bus.publish("confirm.request", _transient=True, **payload)
+        broker.pending = payload
+        await asyncio.sleep(0.05)  # let the hub see both
+
+        back = await self.authed(last_seq=last_seq)
+        replayed = await self.until_pong(back)  # the replay and the resend are queued before the pong
+        self.assertIn(started["seq"], [f.get("seq") for f in replayed])
+        resent = [f for f in replayed if f["type"] == "confirm.request"]
+        self.assertEqual(resent, [live])  # once, the original event: seq and request id included
+        self.assertEqual(validate_event(resent[0]), [])
+        await back.close()
+
+        # Once it is answered, a replaying tab is not shown it again.
+        resolved = self.bus.publish("confirm.resolved", id=payload["id"], approved=True, channel="browser")
+        broker.pending = None
+        await asyncio.sleep(0.05)
+        again = await self.authed(last_seq=last_seq)
+        frames = await self.until_pong(again)
+        self.assertIn(resolved["seq"], [f.get("seq") for f in frames])
+        self.assertNotIn("confirm.request", [f["type"] for f in frames])
+
+    async def test_replay_skips_a_confirmation_the_broker_no_longer_holds(self):
+        payload = confirm_payload()
+        broker = FakeBroker(pending=confirm_payload("other-id"))
+        await self.start_with(FakeBridge(), broker)
+        ws = await self.authed()
+        last_seq = (await self.recv(ws))["seq"]
+        await ws.close()
+        self.bus.publish("notice", level="info", text="away")
+        self.bus.publish("confirm.request", _transient=True, **payload)
+        await asyncio.sleep(0.05)
+        back = await self.authed(last_seq=last_seq)
+        frames = await self.until_pong(back)
+        self.assertIn("notice", [f["type"] for f in frames])
+        self.assertNotIn("confirm.request", [f["type"] for f in frames])
+
+    async def test_resent_confirmation_is_scrubbed(self):
+        payload = confirm_payload()
+        broker = FakeBroker(pending=dict(payload, operation=f"Edit with {SECRET}"))
+        await self.start_with(FakeBridge(), broker)
+        ws = await self.authed()
+        last_seq = (await self.recv(ws))["seq"]
+        await ws.close()
+        self.bus.publish("confirm.request", _transient=True, **payload)
+        await asyncio.sleep(0.05)
+        back = await self.authed(last_seq=last_seq)
+        frames = await self.until_pong(back)
+        self.assertEqual([f["type"] for f in frames], ["confirm.request"])
+        self.assertIn("[REDACTED]", frames[0]["operation"])
+        self.assertNotIn("gsk_Qz7", json.dumps(frames))
+
+
 # --- the real server thread --------------------------------------------------------------------------
 
 
@@ -714,6 +933,53 @@ class StartupWiringTests(BusIsolation, AgentTestCase):
                          {"version": jarvis.VERSION, "provider": "groq", "model": "test-model",
                           "permission_mode": "standard", "voice_enabled": False, "memory_status": "ok",
                           "tasks_status": "disabled", "developer_mode": True})
+        srv.stop()
+
+    def test_start_mission_control_restores_terminal_confirm_on_failure(self):
+        self.policy.confirm = jarvis.terminal_confirm
+        cli = self.make_cli()
+        config = self.make_config(ui_enabled=True, ui_port=0, ui_open_browser=False)
+        for error in (server.MissionControlError("port 1 on 127.0.0.1 is already in use."), RuntimeError("boom")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(server.MissionControlServer, "start", side_effect=error), \
+                        mock.patch("builtins.print") as printed, mock.patch("jarvis.style", side_effect=tagged_style), \
+                        mock.patch("jarvis.log") as logged:
+                    self.assertIsNone(jarvis.start_mission_control(config, cli, self.voice))
+                # An unexpected failure goes to the log file with its traceback; the terminal gets one line.
+                self.assertEqual(logged.warning.called, isinstance(error, RuntimeError))
+                self.assertIs(self.policy.confirm, jarvis.terminal_confirm)
+                self.assertIsNone(cli._bridge)
+                self.assertFalse(BUS.enabled)
+                lines = printed_text(printed).splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertTrue(lines[0].startswith("<yellow>"))
+                with mock.patch("builtins.input", return_value="hi") as typed, \
+                        mock.patch("jarvis.select.select") as selected:
+                    self.assertEqual(cli._read_line(), "hi")
+                typed.assert_called_once()
+                selected.assert_not_called()
+        self.assertEqual(mission_threads(), [])
+
+    def test_start_mission_control_wires_broker_and_bridge(self):
+        self.policy.confirm = jarvis.terminal_confirm
+        cli = self.make_cli()
+        config = self.make_config(ui_enabled=True, ui_port=0, ui_open_browser=False, confirm_timeout=45)
+        with mock.patch("builtins.print"):
+            srv = jarvis.start_mission_control(config, cli, self.voice)
+        self.addCleanup(srv.stop)
+        self.assertIsInstance(srv.broker, confirm_module.ConfirmationBroker)
+        self.assertEqual(srv.broker.timeout, 45)
+        self.assertEqual(self.policy.confirm, srv.broker.confirm)
+        self.assertIsInstance(srv.bridge, bridge.MissionBridge)
+        self.assertIs(cli._bridge, srv.bridge)
+        self.assertIs(cli._inbox, srv.bridge.inbox)
+        self.assertEqual(cli._inbox.maxsize, 1)
+        self.assertIsNot(cli._inbox, cli._wake_events)
+        self.assertIs(srv.bridge.broker, srv.broker)
+        with mock.patch("jarvis.os.kill") as kill, mock.patch.object(self.voice, "stop") as stop:
+            self.assertFalse(srv.bridge.cancel())  # not busy: only stops speaking
+        kill.assert_not_called()
+        stop.assert_called_once_with()
         srv.stop()
 
     def test_session_start_reports_corrupted_stores(self):

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 
 from config.settings import VERSION
 from core.audit import clean_text, log, reveal_invisible, safe_display
-from core.events import BUS, emit, scrub
+from core.events import BUS, SCRUB_INPUT_LIMIT, emit, scrub
 from core.orchestrator import run_agent
 from core.policy import ConfirmationRequest, Permission
 from core.session import Conversation
@@ -33,6 +33,7 @@ from voice.wake import is_stop_phrase
 
 if TYPE_CHECKING:
     from core.orchestrator import AgentContext
+    from mission_control.bridge import MissionBridge
     from memory.json_store import MemoryStore
     from memory.task_store import TaskStore
     from voice.input import SpeechInput
@@ -234,7 +235,7 @@ Commands:
   /dev on|off|auto   developer tools (files, git, edits, tests); auto (the default) switches them on when you ask about code
 Saying "Hey JARVIS" while JARVIS is talking or working interrupts it; "Hey JARVIS, stop" just stops it.
 Press Ctrl+C while JARVIS is working to cancel the current request.
-Confirmation prompts must always be typed; a spoken "yes" cannot approve an action."""
+Confirmation prompts must always be typed in the terminal, or answered in Mission Control; a spoken yes never approves."""
 
 
 def describe_time_since(iso: str, now: dt.datetime | None = None) -> str:
@@ -263,6 +264,39 @@ def greeting() -> str:
     hour = dt.datetime.now().hour
     part = "morning" if 5 <= hour < 12 else "afternoon" if 12 <= hour < 18 else "evening"
     return f"Good {part}, Sir. Systems are ready."
+
+
+# CSI sequences (colours, cursor moves) and two-character escapes, as style() and terminals write them.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
+
+
+class _OutputTee:
+    """stdout for a command sent from Mission Control: everything still reaches the terminal, and a
+    copy (bounded, like scrub's own input) is kept for the browser. isatty and the rest come from the
+    real stream, so style() colours the terminal exactly as before."""
+
+    def __init__(self, target) -> None:
+        self._target = target
+        self._parts: list[str] = []
+        self._size = 0
+
+    def write(self, text: str) -> int:
+        written = self._target.write(text)
+        room = SCRUB_INPUT_LIMIT - self._size
+        if room > 0 and isinstance(text, str):
+            kept = text[:room]
+            self._parts.append(kept)
+            self._size += len(kept)
+        return written if isinstance(written, int) else len(text)
+
+    def flush(self) -> None:
+        self._target.flush()
+
+    def captured(self) -> str:
+        return "".join(self._parts)
+
+    def __getattr__(self, name: str):
+        return getattr(self._target, name)
 
 
 class JarvisCLI:
@@ -294,6 +328,10 @@ class JarvisCLI:
         self._interrupt_lock = threading.Lock()
         # Where the line being handled came from, for Mission Control (set by the voice paths, reset per step).
         self._request_source = "terminal"
+        self._command_id: str | None = None  # Mission Control's id for the browser line being handled
+        # Mission Control's bridge and its inbox (attach_mission); None while Mission Control is off.
+        self._bridge: MissionBridge | None = None
+        self._inbox: queue.Queue | None = None
         # A wake word heard at a confirmation prompt cancels the whole request, not just the prompt.
         ctx.policy.cancel_requested = lambda: self._interrupt_pending
         if listen:
@@ -346,15 +384,33 @@ class JarvisCLI:
             except queue.Empty:
                 break
 
+    def attach_mission(self, bridge: MissionBridge | None) -> None:
+        """Let Mission Control send lines to this loop through `bridge` (None detaches it again).
+
+        Its inbox is a queue of its own: `stop_wake` empties `_wake_events`, and that must never drop
+        (or deliver) a browser command."""
+        self._bridge = bridge
+        self._inbox = bridge.inbox if bridge is not None else None
+
+    def request_cancel(self) -> bool:
+        """Stop speaking, and cancel the request in progress exactly like Ctrl+C. True if one was cancelled.
+
+        For other threads only (the wake-word listener, Mission Control): the SIGINT is delivered to the
+        main thread, wherever the request is, and `_interrupt_pending` tells the loop it was not the user
+        leaving. The main thread itself never calls this."""
+        self.voice.stop()  # barge-in: stop talking at once
+        with self._interrupt_lock:
+            if not self._busy:
+                return False
+            self._interrupt_pending = True
+            os.kill(os.getpid(), signal.SIGINT)
+            return True
+
     def _on_wake(self) -> None:
         """Runs on the listener thread the moment the wake word is heard."""
         interrupted = self.voice.is_speaking
-        self.voice.stop()  # barge-in: stop talking at once
-        with self._interrupt_lock:
-            if self._busy:  # cancel the request in progress, exactly like Ctrl+C
-                self._interrupt_pending = True
-                interrupted = True
-                os.kill(os.getpid(), signal.SIGINT)
+        if self.request_cancel():
+            interrupted = True
         emit("voice.input", mode="wake", phase="wake_detected")
         if self.ctx.config.wake_chime:
             self.voice.chime()
@@ -408,6 +464,8 @@ class JarvisCLI:
     @contextlib.contextmanager
     def _busy_scope(self):
         """Marks work the wake word may interrupt (a request, or transcribing a spoken one)."""
+        if self._bridge is not None:  # Mission Control: commands sent now are refused as busy
+            self._bridge.busy.set()
         with self._interrupt_lock:
             self._busy = True
         try:
@@ -421,14 +479,19 @@ class JarvisCLI:
             self._interrupt_pending = False
 
     def _read_line(self) -> str | None:
-        """Typed input, or (in hands-free mode) whichever comes first: a typed line or a spoken command.
+        """Typed input, or whichever comes first: a typed line, a spoken command (hands-free mode) or a
+        line sent from Mission Control (while it is on).
 
         Returns None when a hands-free turn produced nothing to send, which is distinct from the
         empty line a user types to start push-to-talk.
         """
         prompt = style("You: ", "green")
-        if not self.hands_free and self._wake_events.empty():
+        bridge = self._bridge
+        if bridge is None and not self.hands_free and self._wake_events.empty():
             return clean_text(input(prompt)).strip()
+        listening = self.hands_free  # only a listener that was running can stop while we wait
+        if bridge is not None:
+            bridge.busy.clear()  # back at the prompt: the browser may send a command now
         print(prompt, end="", flush=True)
         while True:
             try:
@@ -446,13 +509,22 @@ class JarvisCLI:
                     if text:
                         self._request_source = "voice"
                     return text or None
-            if not self.hands_free:  # the listener stopped (error or /wake off)
+            if bridge is not None:
+                item = bridge.take()  # marks the bridge busy, so the next browser command is refused
+                if item is not None:
+                    self._command_id, line = item[0], clean_text(item[1]).strip()
+                    self._request_source = "browser"
+                    print(f"\n{style('You (browser):', 'green')} {safe_display(line)}")
+                    return line
+            if not self.hands_free and (bridge is None or listening):  # the listener stopped (error or /wake off)
                 print()
                 return None
             if select.select([sys.stdin], [], [], 0.1)[0]:
                 raw = sys.stdin.readline()
                 if not raw:
                     raise EOFError
+                if bridge is not None:
+                    bridge.busy.set()
                 return clean_text(raw).strip()
 
     def _speech_unavailable(self) -> str | None:
@@ -859,6 +931,7 @@ class JarvisCLI:
         self.voice.stop()
         said = text if said is None else said
         source, self._request_source = self._request_source, "terminal"
+        command_id, self._command_id = self._command_id, None
         if self.tasks is not None and is_resume_phrase(text):
             task = self._shortcut_task()  # otherwise "continue" is an ordinary message
             if task is not None:
@@ -870,7 +943,7 @@ class JarvisCLI:
         self._paused_by_last_request = None
         self._maybe_enter_developer_mode(topic if topic is not None else text)
         print(style("  ...", "dim"))
-        with BUS.request_scope(source), self._request_events(source, said) as outcome:
+        with BUS.request_scope(source), self._request_events(source, said, command_id) as outcome:
             try:
                 result = run_agent(self.ctx, text, self.conversation.messages(), self.conversation.summary,
                                    on_tool=lambda name: print(style(f"  > {name}", "dim")),
@@ -909,15 +982,17 @@ class JarvisCLI:
         emit("task.progress", message=message)
 
     @contextlib.contextmanager
-    def _request_events(self, source: str, said: str):
+    def _request_events(self, source: str, said: str, command_id: str | None = None):
         """Publish request.start, then request.end on every way out of the request (Mission Control only).
 
         The body records how it ended in the yielded dict; anything that escapes still ends the request,
-        so the browser never shows JARVIS "processing" forever."""
+        so the browser never shows JARVIS "processing" forever. `command_id` ties a browser request to
+        the command that started it."""
         started = time.monotonic()
         outcome: dict = {}
         if BUS.enabled:  # scrub before the cut: a key split at 500 characters must not leak its head
-            emit("request.start", source=source, text=scrub(said, max_str=500))
+            extra = {"command_id": command_id} if command_id else {}
+            emit("request.start", source=source, text=scrub(said, max_str=500), **extra)
         try:
             yield outcome
         except KeyboardInterrupt:
@@ -961,6 +1036,33 @@ class JarvisCLI:
         with self._busy_scope():
             self.handle_message(line, **extra)
 
+    def _browser_may_run(self, line: str) -> bool:
+        """The bridge already refused what the browser may not do; checked again here, on the line the
+        loop is about to act on, so nothing that reaches the inbox some other way can slip through."""
+        from mission_control.bridge import browser_command_policy  # only reached with Mission Control on
+
+        allowed, reason = browser_command_policy(line)
+        if allowed:
+            return True
+        print(style("  Not run: that can only be typed in the terminal." if reason == "terminal_only"
+                    else "  Not run: that is not a command Mission Control can send.", "yellow"))
+        emit("command.rejected", command_id=self._command_id or "", reason=reason)
+        self._request_source, self._command_id = "terminal", None
+        return False
+
+    @contextlib.contextmanager
+    def _browser_output(self, command_id: str | None, command: str):
+        """Run a slash command sent from Mission Control: the terminal shows its output as usual, and the
+        browser gets a copy as command.output (escape codes stripped, scrubbed, at most 8000 characters)."""
+        tee = _OutputTee(sys.stdout)
+        try:
+            with contextlib.redirect_stdout(tee):
+                yield
+        finally:
+            if BUS.enabled:  # scrubbed before the cut, like every other text that leaves for the browser
+                emit("command.output", command_id=command_id or "", command=scrub(command, max_str=500),
+                     text=scrub(_ANSI_ESCAPE.sub("", tee.captured()), max_str=8000))
+
     def loop(self) -> int:
         try:
             self.restore_conversation()
@@ -981,7 +1083,8 @@ class JarvisCLI:
 
     def _step(self) -> bool:
         """Read and handle one input. Returns True when the user wants to leave."""
-        self._request_source = "terminal"  # the voice paths below say otherwise
+        self._request_source = "terminal"  # the voice and browser paths below say otherwise
+        self._command_id = None
         try:
             line = self._read_line()
         except KeyboardInterrupt:
@@ -996,6 +1099,9 @@ class JarvisCLI:
             print("  That input could not be decoded as UTF-8; please try again.")
             return False
         if line is None:  # a hands-free turn with nothing to send; never starts push-to-talk
+            return False
+        from_browser = self._request_source == "browser"
+        if from_browser and not self._browser_may_run(line):
             return False
         if (not line and self.listen_mode) or line.lower() == "/talk":
             line = self.voice_turn()
@@ -1015,7 +1121,10 @@ class JarvisCLI:
         if line.lower() == "help":
             line = "/help"
         try:
-            if line.startswith("/"):
+            if line.startswith("/") and from_browser:
+                with self._browser_output(self._command_id, line):
+                    self.handle_command(line)
+            elif line.startswith("/"):
                 self.handle_command(line)
             else:
                 self._run_message(line)

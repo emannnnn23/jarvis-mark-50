@@ -270,7 +270,7 @@ The permission mode decides what happens to each class:
 
 How confirmation works:
 
-- JARVIS itself prints the prompt and reads your answer from the terminal (`input()`). The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths. For a file change it also shows the diff (see [Changing code](#changing-code)).
+- JARVIS itself prints the prompt and reads your answer: typed in the terminal, or answered in Mission Control; a spoken yes never approves. The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths. For a file change it also shows the diff (see [Changing code](#changing-code)).
 - If JARVIS cannot prepare the operation, for example because the text to replace is not in the file, nothing is asked and nothing runs. The model gets status `denied` with the reason `Not done: <why>`, so it can correct the call.
 - Type `yes` (or `y`) to proceed. Anything else cancels: another word, Enter, Ctrl+C or Ctrl+D.
 - Each confirmation covers a single operation. There is no "always allow".
@@ -735,7 +735,7 @@ Push-to-talk speech-to-text. You press a key to start and stop every recording, 
 - **Audio goes to Groq.** Each recording is uploaded to Groq's speech-to-text API (`JARVIS_STT_MODEL`) with your `GROQ_API_KEY`. The local WAV file lives in a `jarvis-stt-*` directory in the system temp folder. It is deleted straight after transcription, and also when a recording is rejected or cancelled. The directory is removed on exit.
 - **One disclosure per session.** Before your first recording in a session, JARVIS prints: `Privacy: Your recording is sent to Groq (<model>) for transcription. JARVIS deletes its local copy straight afterwards.`
 - **The audit log never contains the transcript.** A `speech_input` event records only the mode, the backend, the outcome, the duration in seconds and the number of characters. After transcription, the transcript is your message: like typed text, it goes to the chat model and, with `JARVIS_SAVE_CONVERSATIONS=true`, into the redacted conversation log.
-- **Spoken confirmations are impossible.** Confirmation prompts read only typed input from the terminal. Push-to-talk never records while a prompt waits. In hands-free mode the listener keeps running, but saying "Hey JARVIS" at a prompt cancels the whole request. Saying "yes" cannot approve an action; you must type `yes`.
+- **Spoken confirmations are impossible.** Confirmation prompts are typed in the terminal, or answered in Mission Control; a spoken yes never approves. Push-to-talk never records while a prompt waits. In hands-free mode the listener keeps running, but saying "Hey JARVIS" at a prompt cancels the whole request.
 - **JARVIS does not hear itself during push-to-talk.** It stops speaking before every recording starts.
 
 ### Safety checks
