@@ -331,3 +331,164 @@ describe("reduce", () => {
   });
 });
 
+
+// --- Task 10: commands, replies and approvals ------------------------------------------------------
+
+const confirmRequest = (seq: number, id = "c1", extra: Record<string, unknown> = {}) =>
+  ev("confirm.request", seq, {
+    id, digest: `digest-${id}`, tool: "edit_workspace_file", label: "ACTION", operation: "edit notes.txt",
+    affected_paths: ["notes.txt"], reason: "", hidden: 0, lines: [{ k: "add", t: "+hello" }], omitted: 0,
+    browser_approvable: true, expires_at: null, ...extra,
+  });
+const resolved = (seq: number, id = "c1", approved = true, channel = "browser") =>
+  ev("confirm.resolved", seq, { id, approved, channel });
+const sent = (id: string, text = "what time is it?"): MissionInput => ({ type: "command.sent", id, text, at: 1 });
+const ack = (seq: number, id: string) => ev("command.ack", seq, { command_id: id, status: "accepted" });
+const requestStart = (seq: number, requestId: string, commandId?: string) =>
+  ({ ...ev("request.start", seq, { source: commandId ? "browser" : "terminal", text: "what time is it?",
+    ...(commandId ? { command_id: commandId } : {}) }), request_id: requestId }) as ServerEvent;
+const requestEnd = (seq: number, requestId: string, status = "complete") =>
+  ({ ...ev("request.end", seq, { status, duration_ms: 1200 }), request_id: requestId }) as ServerEvent;
+const command = (state: MissionState, id: string) => state.commands.find((entry) => entry.id === id);
+
+describe("approvals", () => {
+  it("clears the panel and the answer state on confirm.resolved for the open request", () => {
+    const open = run([snapshot(), confirmRequest(51)]);
+    const answering = reduce(open, { type: "confirm.sent", id: "c1", approved: true });
+    expect(answering.confirmAnswer).toEqual({ id: "c1", approved: true, phase: "sending", result: null });
+    const done = reduce(answering, resolved(52));
+    expect(done.pendingConfirmation).toBeNull();
+    expect(done.confirmAnswer).toBeNull();
+  });
+
+  it("keeps the panel when another confirmation id is resolved", () => {
+    const open = run([snapshot(), confirmRequest(51)]);
+    const other = reduce(open, resolved(52, "older"));
+    expect(other.pendingConfirmation?.id).toBe("c1");
+  });
+
+  it("records the server's answer result for the answer this page sent, and ignores others", () => {
+    const open = run([snapshot(), confirmRequest(51), { type: "confirm.sent", id: "c1", approved: false }]);
+    const foreign = reduce(open, { type: "confirm.answer.result", id: "zz", result: "stale" });
+    expect(foreign.confirmAnswer?.phase).toBe("sending");
+    const answered = reduce(open, { type: "confirm.answer.result", id: "c1", result: "digest_mismatch" });
+    expect(answered.confirmAnswer).toEqual({ id: "c1", approved: false, phase: "answered", result: "digest_mismatch" });
+  });
+
+  it("ignores an answer sent for a confirmation that is not the open one", () => {
+    const open = run([snapshot(), confirmRequest(51)]);
+    expect(reduce(open, { type: "confirm.sent", id: "gone", approved: true }).confirmAnswer).toBeNull();
+  });
+
+  it("forgets an unanswered send when the link drops, so the buttons come back after a reconnect", () => {
+    const answering = run([snapshot(), confirmRequest(51), { type: "confirm.sent", id: "c1", approved: true }]);
+    const dropped = reduce(answering, { type: "connection", status: "reconnecting" });
+    expect(dropped.confirmAnswer).toBeNull();
+    expect(dropped.pendingConfirmation?.id).toBe("c1");
+  });
+
+  it("applies a confirmation resent after a replay with its original, older seq", () => {
+    // Live up to 60; the request (seq 55, transient) was missed while the tab was away; the replay brings
+    // 56-60 and then the server resends the open request under its original seq 55.
+    const live = run([snapshot(), notice(51), notice(52)]);
+    const replayed = run([notice(56), notice(57), notice(60)], live);
+    expect(replayed.lastSeq).toBe(60);
+    const resent = reduce(replayed, confirmRequest(55));
+    expect(resent.pendingConfirmation?.id).toBe("c1");
+    expect(resent.pendingConfirmation?.digest).toBe("digest-c1");
+    expect(resent.log.map((event) => event.seq)).toEqual([51, 52, 55, 56, 57, 60]);
+  });
+
+  it("applies a resent confirmation even when its seq is already below the dedupe floor", () => {
+    // A later snapshot (seq 70) raised the floor above the request's seq 55.
+    const past = run([snapshot(), snapshot({ seq: 70 })]);
+    expect(past.seqFloor).toBe(70);
+    const resent = reduce(past, confirmRequest(55));
+    expect(resent.pendingConfirmation?.id).toBe("c1");
+    // Applying it twice changes nothing.
+    expect(reduce(resent, confirmRequest(55))).toBe(resent);
+  });
+
+  it("never reopens a confirmation this page already saw resolved", () => {
+    const done = run([snapshot(), confirmRequest(51), resolved(52)]);
+    expect(reduce(done, confirmRequest(51)).pendingConfirmation).toBeNull();
+    const late = run([snapshot(), resolved(52, "c9")]);
+    expect(reduce(late, confirmRequest(51, "c9")).pendingConfirmation).toBeNull();
+  });
+
+  it("starts a fresh answer state when a different confirmation opens", () => {
+    const first = run([snapshot(), confirmRequest(51), { type: "confirm.sent", id: "c1", approved: true }]);
+    const second = run([resolved(52), confirmRequest(53, "c2")], first);
+    expect(second.pendingConfirmation?.id).toBe("c2");
+    expect(second.confirmAnswer).toBeNull();
+  });
+});
+
+describe("browser commands", () => {
+  it("goes queued, then running on ack, then done on request.end", () => {
+    const queued = run([snapshot(), sent("k1")]);
+    expect(command(queued, "k1")).toMatchObject({ status: "queued", text: "what time is it?" });
+    const acked = reduce(queued, ack(51, "k1"));
+    expect(command(acked, "k1")?.status).toBe("running");
+    const started = reduce(acked, requestStart(52, "r1", "k1"));
+    expect(command(started, "k1")).toMatchObject({ status: "running", requestId: "r1" });
+    const ended = reduce(started, requestEnd(53, "r1"));
+    expect(command(ended, "k1")).toMatchObject({ status: "done", outcome: "complete" });
+  });
+
+  it("tolerates command.ack arriving after request.start, and after request.end", () => {
+    const early = run([snapshot(), sent("k1"), requestStart(51, "r1", "k1"), ack(52, "k1")]);
+    expect(command(early, "k1")).toMatchObject({ status: "running", requestId: "r1" });
+    const late = run([snapshot(), sent("k1"), requestStart(51, "r1", "k1"), requestEnd(52, "r1", "cancelled"), ack(53, "k1")]);
+    expect(command(late, "k1")).toMatchObject({ status: "done", outcome: "cancelled" });
+  });
+
+  it("stays queued on an ack with status queued (never sent today, but allowed)", () => {
+    const queued = run([snapshot(), sent("k1"), ev("command.ack", 51, { command_id: "k1", status: "queued" })]);
+    expect(command(queued, "k1")?.status).toBe("queued");
+  });
+
+  it("is rejected with the server's reason, even after it was accepted (the loop re-checks)", () => {
+    const busy = run([snapshot(), sent("k1"), ev("command.rejected", 51, { command_id: "k1", reason: "busy" })]);
+    expect(command(busy, "k1")).toMatchObject({ status: "rejected", reason: "busy" });
+    const recheck = run([snapshot(), sent("k2", "/memory reset"), ack(51, "k2"),
+      ev("command.rejected", 52, { command_id: "k2", reason: "terminal_only" })]);
+    expect(command(recheck, "k2")).toMatchObject({ status: "rejected", reason: "terminal_only" });
+  });
+
+  it("finishes a slash command on its command.output and shows that output as the latest reply", () => {
+    const output = ev("command.output", 52, { command_id: "k1", command: "/status", text: "<b>Model</b>: llama\n" });
+    const done = run([snapshot(), sent("k1", "/status"), ack(51, "k1"), output]);
+    expect(command(done, "k1")).toMatchObject({ status: "done", outcome: "output" });
+    expect(done.latestReply).toEqual({ kind: "output", command: "/status", text: "<b>Model</b>: llama\n", seq: 52 });
+  });
+
+  it("ignores command events for ids this page did not send (another tab's commands)", () => {
+    const mine = run([snapshot(), sent("k1")]);
+    const after = run([ack(51, "other"), ev("command.rejected", 52, { command_id: "other2", reason: "busy" })], mine);
+    expect(after.commands).toEqual(mine.commands);
+  });
+
+  it("closes a running command with no request of its own once the next request starts", () => {
+    // A plain "continue" with nothing to resume runs no request and prints a reason instead.
+    const stuck = run([snapshot(), sent("k1", "continue"), ack(51, "k1")]);
+    const next = run([sent("k2"), requestStart(52, "r2", "k2")], stuck);
+    expect(command(next, "k1")?.status).toBe("done");
+    expect(command(next, "k2")?.status).toBe("running");
+  });
+
+  it("keeps the newest assistant.message or command.output by seq as the latest reply", () => {
+    const replies = run([
+      snapshot(),
+      ev("assistant.message", 53, { text: "It is 10:42." }),
+      ev("command.output", 52, { command_id: "x", command: "/help", text: "older" }),
+    ]);
+    expect(replies.latestReply).toEqual({ kind: "message", text: "It is 10:42.", seq: 53 });
+  });
+
+  it("keeps at most 20 commands", () => {
+    const many = run([snapshot(), ...Array.from({ length: 25 }, (_, n) => sent(`k${n}`))]);
+    expect(many.commands).toHaveLength(20);
+    expect(many.commands[0]?.id).toBe("k5");
+  });
+});

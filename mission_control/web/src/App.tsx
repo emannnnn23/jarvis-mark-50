@@ -2,10 +2,12 @@ import { useEffect } from "react";
 
 import { Scene } from "./components/scene/Scene";
 import { sidePanelWidth } from "./components/scene/cameraFit";
+import { CommandBar } from "./components/layout/CommandBar";
 import { HudLayout, SceneBoundary } from "./components/layout/HudLayout";
 import { TopBar } from "./components/layout/TopBar";
 import { NodeDetailPanel } from "./components/nodes/NodeDetailPanel";
 import { NodeLabels } from "./components/nodes/NodeLabels";
+import { ConfirmationPanel } from "./components/panels/ConfirmationPanel";
 import { ConnectionBanner } from "./components/panels/ConnectionBanner";
 import { EventStreamPanel } from "./components/panels/EventStreamPanel";
 import { SystemMonitorPanel } from "./components/panels/SystemMonitorPanel";
@@ -42,7 +44,7 @@ function useEscapeToClose() {
 }
 
 export function App({ token }: { token: string | null }) {
-  const { retry } = useMissionSocket(token);
+  const { retry, send } = useMissionSocket(token);
   const performance = usePerformanceMode();
   const narrow = useNarrow();
   const width = useViewportWidth();
@@ -62,6 +64,8 @@ export function App({ token }: { token: string | null }) {
       top={<TopBar performance={performance} narrow={narrow} />}
       banner={<ConnectionBanner onRetry={retry} />}
       center={<ResetViewButton />}
+      dock={<CommandBar send={send} />}
+      approval={<ConfirmationPanel send={send} />}
       left={
         <>
           <NodeDetailPanel />

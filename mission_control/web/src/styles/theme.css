@@ -107,7 +107,10 @@ body {
 .panel,
 .banner,
 .button,
-.node-label {
+.node-label,
+.command-row,
+.command-reply,
+.command-notice {
   pointer-events: auto;
 }
 
@@ -154,16 +157,31 @@ body {
   overflow: hidden;
 }
 
-/* The command bar's place (Task 10), reserved at every size: 64 px tall (cameraFit.ts DOCK_HEIGHT keeps
-   the node ring above it). Until the bar arrives it is an empty, barely visible cradle. */
+/* The command bar's place, at every size: 64 px tall (cameraFit.ts DOCK_HEIGHT keeps the node ring above
+   it). The latest reply and any notice float above the bar without changing the row's height. */
 .hud-dock {
   grid-area: dock;
   justify-self: center;
+  position: relative;
   width: min(640px, 100%);
   min-height: 64px;
-  border: 1px solid rgba(111, 231, 245, 0.07);
-  border-radius: 2px;
-  background: linear-gradient(to top, rgba(111, 231, 245, 0.035), transparent);
+}
+
+/* The open approval: the scene's middle column, resting on the dock. */
+.hud-approval {
+  grid-column: 2;
+  grid-row: 2 / 4;
+  align-self: end;
+  justify-self: center;
+  width: min(680px, 100%);
+  max-height: 100%;
+  min-height: 0;
+  display: flex;
+  z-index: 4;
+}
+
+.hud-approval:empty {
+  display: none;
 }
 
 .scene-fallback {
@@ -195,7 +213,9 @@ body {
 /* An HD 620 pays for every blurred pixel: Low quality draws plain tinted glass. */
 .quality-low .panel,
 .quality-low .banner,
-.quality-low .topbar {
+.quality-low .topbar,
+.quality-low .command-row,
+.quality-low .command-reply {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   background: rgba(9, 17, 25, 0.82);
@@ -1049,6 +1069,369 @@ body {
   color: var(--faint);
 }
 
+/* --- command bar ------------------------------------------------------------------------------ */
+
+.command-bar {
+  height: 100%;
+}
+
+.command-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 0 12px 0 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 2px;
+  background: linear-gradient(to top, rgba(111, 231, 245, 0.05), rgba(9, 17, 25, 0.62) 60%);
+  box-shadow: inset 0 1px 0 var(--glass-hi), 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+/* Typing lights the bar from below, like a reticle taking aim. */
+.command-row:focus-within {
+  border-color: rgba(111, 231, 245, 0.42);
+  box-shadow: inset 0 1px 0 var(--glass-hi), inset 0 -1px 0 var(--holo), 0 -10px 34px -22px var(--holo);
+}
+
+.command-row-offline {
+  opacity: 0.7;
+}
+
+.command-prompt {
+  font-family: var(--font-display);
+  font-size: var(--step-1);
+  color: var(--holo);
+  line-height: 1;
+}
+
+.command-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: var(--step-1);
+  font-weight: 300;
+  color: var(--ice);
+  caret-color: var(--holo);
+  background: none;
+  border: 0;
+  padding: 8px 0;
+  outline: none;
+}
+
+.command-input::placeholder {
+  color: var(--faint);
+}
+
+.command-chip {
+  font-size: 10px;
+  line-height: 1;
+  padding: 4px 6px 3px;
+  border: 1px solid rgba(138, 163, 179, 0.3);
+  border-radius: 2px;
+  color: var(--mist);
+  white-space: nowrap;
+}
+
+.command-chip-active {
+  color: var(--volt-text);
+  border-color: rgba(46, 124, 246, 0.5);
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+.command-chip-attention {
+  color: var(--amber);
+  border-color: rgba(255, 181, 71, 0.5);
+}
+
+.command-cancel:not(:disabled) {
+  border-color: rgba(255, 181, 71, 0.45);
+  color: var(--amber);
+}
+
+.command-cancel:not(:disabled):hover {
+  background: rgba(255, 181, 71, 0.12);
+}
+
+/* Above the bar: the latest reply, then a notice, stacked upward from the dock's top edge. */
+.command-above[hidden] {
+  display: none;
+}
+
+.command-above {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  display: grid;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.command-reply {
+  border: 1px solid var(--glass-edge);
+  border-left: 2px solid var(--holo-dim);
+  border-radius: 2px;
+  background: rgba(9, 17, 25, 0.78);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  padding: 8px 12px 10px 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.command-reply[data-hidden="true"] {
+  justify-self: end;
+  padding: 4px 10px;
+}
+
+.command-reply-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.command-reply-from {
+  font-family: var(--font-display);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  color: var(--holo);
+}
+
+.command-reply-command {
+  color: var(--mist);
+  font-size: var(--step--1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-reply-toggle {
+  font-size: var(--step--1);
+}
+
+/* Text only, never HTML; a whole /resume run fits by scrolling, not by growing over the scene. */
+.command-reply-body {
+  margin: 0;
+  max-height: 128px;
+  overflow: auto;
+  font: inherit;
+  color: var(--ice);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
+.command-reply-body:focus-visible {
+  outline: 1px solid var(--holo);
+  outline-offset: 2px;
+}
+
+.command-notice {
+  justify-self: start;
+  margin: 0;
+  padding: 5px 10px;
+  border-left: 2px solid var(--holo-dim);
+  background: rgba(9, 17, 25, 0.86);
+  color: var(--mist);
+  font-size: var(--step--1);
+}
+
+.command-notice-attention {
+  border-left-color: var(--amber);
+  color: var(--amber);
+}
+
+/* --- approval ---------------------------------------------------------------------------------- */
+
+/* The one panel drawn in amber: JARVIS has stopped and is waiting for a person. */
+.panel.confirm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-height: 100%;
+  min-height: 0;
+  padding: 14px 18px 14px;
+  background: rgba(7, 13, 19, 0.95);
+  border-color: rgba(255, 181, 71, 0.28);
+  border-top: 2px solid var(--amber);
+  box-shadow: inset 0 1px 0 rgba(255, 181, 71, 0.08), 0 28px 60px -30px rgba(255, 138, 61, 0.4);
+}
+
+.confirm-panel:focus {
+  outline: none;
+}
+
+.confirm-panel:focus-visible {
+  outline: 1px solid rgba(255, 181, 71, 0.6);
+  outline-offset: 3px;
+}
+
+.confirm-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.confirm-head h2 {
+  margin: 0;
+  font-size: var(--step-1);
+  font-weight: 400;
+  color: var(--amber);
+}
+
+.confirm-label {
+  color: var(--ice);
+  overflow-wrap: anywhere;
+}
+
+.confirm-countdown {
+  margin-left: auto;
+  color: var(--mist);
+  font-size: var(--step--1);
+}
+
+.confirm-banner {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--amber);
+  background: rgba(255, 181, 71, 0.08);
+  color: var(--amber);
+}
+
+.confirm-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 14px;
+  margin: 0;
+}
+
+.confirm-fact {
+  display: contents;
+}
+
+.confirm-facts dt {
+  color: var(--mist);
+}
+
+.confirm-facts dd {
+  margin: 0;
+  color: var(--ice);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.confirm-hidden {
+  margin: 0;
+  color: var(--amber);
+  font-size: var(--step--1);
+}
+
+.confirm-omitted {
+  margin: 0;
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+/* The review, exactly: one block per line, nothing wrapped or collapsed; scroll for the rest. */
+.review-lines {
+  flex: 1 1 auto;
+  min-height: 3em;
+  margin: 0;
+  padding: 8px 12px;
+  overflow: auto;
+  font-family: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  tab-size: 4;
+  color: var(--mist);
+  background: rgba(4, 7, 11, 0.72);
+  border-left: 1px solid var(--glass-edge);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 181, 71, 0.25) transparent;
+}
+
+.review-lines > span {
+  display: block;
+  min-height: 1.5em;
+  white-space: pre;
+  /* A text-direction character cannot reach past its own line. */
+  unicode-bidi: isolate;
+}
+
+.review-lines > .add {
+  color: #8fe3b0;
+}
+
+.review-lines > .del {
+  color: #ff9c8a;
+}
+
+.review-lines > .hunk {
+  color: var(--holo);
+}
+
+.confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.confirm-status {
+  flex: 1;
+  margin: 0;
+  color: var(--mist);
+  font-size: var(--step--1);
+}
+
+.confirm-status-attention {
+  color: var(--amber);
+}
+
+.confirm-approve {
+  position: relative;
+  border-color: rgba(255, 181, 71, 0.6);
+  color: var(--amber);
+}
+
+.confirm-approve:not(:disabled):hover {
+  background: rgba(255, 181, 71, 0.16);
+}
+
+.confirm-approve:disabled {
+  border-color: rgba(255, 181, 71, 0.2);
+}
+
+/* While Approve arms, a hairline fills beneath it: the moment it can be pressed is visible. */
+.confirm-arming::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--amber);
+  transform-origin: left;
+  animation: arm 600ms linear forwards;
+}
+
+@keyframes arm {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
 /* --- small screens: the core stays centred, panels shrink to the edges --------------------------- */
 
 /* Below 900 px (cameraFit.ts NARROW_MAX_WIDTH): the side columns become overlays opened from the top
@@ -1070,8 +1453,13 @@ body {
 
   .hud-left,
   .hud-right,
-  .hud-center {
+  .hud-center,
+  .hud-approval {
     grid-area: main;
+  }
+
+  .hud-approval {
+    width: 100%;
   }
 
   .hud-left {
@@ -1138,13 +1526,26 @@ body {
   .cpu-trace {
     display: none;
   }
+
+  /* Enter sends; the button would squeeze the input. */
+  .command-send {
+    display: none;
+  }
+
+  .command-row {
+    gap: 8px;
+    padding: 0 8px 0 12px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .link-dot,
   .meter-fill,
   .state-word,
-  .step-mark {
+  .step-mark,
+  .command-chip,
+  .command-row,
+  .confirm-arming::after {
     animation: none !important;
     transition: none !important;
   }

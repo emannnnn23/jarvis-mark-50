@@ -11,15 +11,25 @@
  * Subsystem blocks start from the backend tracker's snapshot and are then folded from live events with
  * the same rules, plus a few browser-only details the node panels show (call in flight, retry reason,
  * active tool status, recalled hits versus the stored fact total).
+ *
+ * The command bar and the approval panel keep their state here too, because it is folded from the same
+ * events: this page's own commands (matched by command_id, since command.ack and command.rejected reach
+ * every tab), the latest reply, and the answer this page sent to the open confirmation. An open
+ * confirmation resent after a replay keeps its original, older seq, so confirm.request is the one event
+ * that is still applied when the seq dedupe would drop it, unless this page already saw it resolved.
  */
 
 import { isConfirmPayload, isServerEvent, isSubsystemStatus, isTaskView } from "../types/guards";
 import type {
   BackendState,
+  CommandRejectedEvent,
+  ConfirmAnswerOutcome,
   ConfirmPayload,
   ConnectionStatus,
+  ConfirmRequestEvent,
   JarvisState,
   NetworkStatusEvent,
+  RequestEndEvent,
   ServerEvent,
   ServerFrame,
   SessionStartEvent,
@@ -40,6 +50,10 @@ const SEEN_LIMIT = 1024;
 /** Meter-like events: they update panels but would drown the log. */
 const UNLOGGED: ReadonlySet<string> = new Set(["system.metrics", "voice.level"]);
 const RECENT_TOOLS = 5;
+/** This page's commands kept for the command bar's chip. */
+export const COMMANDS_KEPT = 20;
+/** Confirmation ids seen resolved, so a late or resent request for one never reopens the panel. */
+const RESOLVED_KEPT = 32;
 
 export const SUBSYSTEM_IDS: readonly SubsystemId[] = ["llm", "memory", "tools", "system", "voice", "network"];
 /** llm error kinds that mean Groq could not be reached at all (mission_control/state.py LLM_OFFLINE_KINDS). */
@@ -84,7 +98,49 @@ export interface ConnectionEvent {
   type: "connection";
   status: ConnectionStatus;
 }
-export type LocalEvent = ConnectionEvent;
+/** This page sent command.submit (dispatched only once the socket took the frame). */
+export interface CommandSentEvent {
+  type: "command.sent";
+  id: string;
+  text: string;
+  at: number;
+}
+/** This page sent confirm.answer for the open confirmation. */
+export interface ConfirmSentEvent {
+  type: "confirm.sent";
+  id: string;
+  approved: boolean;
+}
+export type LocalEvent = ConnectionEvent | CommandSentEvent | ConfirmSentEvent;
+
+/**
+ * One command this page sent. queued: sent, not yet accepted; running: accepted or its request started;
+ * done: its request ended or its output arrived (outcome says how); rejected: refused, with the reason.
+ */
+export type CommandStatus = "queued" | "running" | "done" | "rejected";
+export interface CommandEntry {
+  id: string;
+  text: string;
+  sentAt: number;
+  status: CommandStatus;
+  reason: CommandRejectedEvent["reason"] | null;
+  /** The request it started (request.start with this command_id). */
+  requestId: string | null;
+  outcome: RequestEndEvent["status"] | "output" | null;
+}
+
+/** The newest thing JARVIS said back: an assistant.message, or a browser slash command's output. */
+export type LatestReply =
+  | { kind: "message"; text: string; seq: number }
+  | { kind: "output"; command: string; text: string; seq: number };
+
+/** This page's answer to the open confirmation: on its way, then the server's result. */
+export interface ConfirmAnswer {
+  id: string;
+  approved: boolean;
+  phase: "sending" | "answered";
+  result: ConfirmAnswerOutcome | null;
+}
 export type MissionInput = ServerFrame | LocalEvent;
 
 export interface HeadlineState {
@@ -116,6 +172,12 @@ export interface MissionState {
   voiceLevel: VoiceLevel | null;
   /** The latest task.progress line for the current task. */
   taskProgress: { message: string; at: number } | null;
+  /** This page's recent commands, oldest first. */
+  commands: CommandEntry[];
+  latestReply: LatestReply | null;
+  confirmAnswer: ConfirmAnswer | null;
+  /** Confirmation ids seen resolved (newest last). */
+  resolvedConfirmIds: string[];
   /** Recent events in seq order, newest last, at most LOG_LIMIT. */
   log: ServerEvent[];
   /** Highest seq seen: sent as last_seq when the socket resumes. */
@@ -154,6 +216,10 @@ export function initialMissionState(): MissionState {
     network: null,
     voiceLevel: null,
     taskProgress: null,
+    commands: [],
+    latestReply: null,
+    confirmAnswer: null,
+    resolvedConfirmIds: [],
     log: [],
     lastSeq: 0,
     seqFloor: 0,
@@ -171,13 +237,33 @@ export function displayState(state: MissionState): JarvisState {
 export function reduce(state: MissionState, input: MissionInput): MissionState {
   switch (input.type) {
     case "connection":
-      return input.status === state.connection ? state : { ...state, connection: input.status };
+      if (input.status === state.connection) return state;
+      // An answer still on its way when the link dropped may never get its result: give the buttons back.
+      // If it did reach JARVIS, confirm.resolved arrives with the reconnect and closes the panel.
+      return {
+        ...state,
+        connection: input.status,
+        ...(state.confirmAnswer?.phase === "sending" && input.status !== "open" ? { confirmAnswer: null } : {}),
+      };
+    case "command.sent":
+      return {
+        ...state,
+        commands: [...state.commands, {
+          id: input.id, text: input.text, sentAt: input.at, status: "queued" as const, reason: null, requestId: null,
+          outcome: null,
+        }].slice(-COMMANDS_KEPT),
+      };
+    case "confirm.sent":
+      if (state.pendingConfirmation?.id !== input.id) return state;
+      return { ...state, confirmAnswer: { id: input.id, approved: input.approved, phase: "sending", result: null } };
+    case "confirm.answer.result":
+      if (state.confirmAnswer === null || state.confirmAnswer.id !== input.id) return state;
+      return { ...state, confirmAnswer: { ...state.confirmAnswer, phase: "answered", result: input.result } };
     case "snapshot":
       return applySnapshot(state, input);
     case "auth.ok":
     case "pong":
     case "error":
-    case "confirm.answer.result":
       return state;
     default:
       return applyEvent(state, input);
@@ -248,6 +334,8 @@ function applySnapshot(state: MissionState, snap: Snapshot): MissionState {
     subsystems: withoutReplayedTools(readSubsystems(snap.subsystems), recent),
     task: isTaskView(snap.task) ? snap.task : null,
     pendingConfirmation: isConfirmPayload(snap.pending_confirmation) ? snap.pending_confirmation : null,
+    confirmAnswer: isConfirmPayload(snap.pending_confirmation) && snap.pending_confirmation.id === state.confirmAnswer?.id
+      ? state.confirmAnswer : null,
     metrics,
     network,
     voiceLevel: null,
@@ -292,8 +380,34 @@ function patch(subsystems: Subsystems, id: SubsystemId, fields: Partial<Subsyste
   return { ...subsystems, [id]: { ...subsystems[id], ...fields } };
 }
 
+/**
+ * The server resends an open confirmation to a tab that replayed past it, under the request's original
+ * seq, which may already be covered by this page's dedupe. It is applied anyway, unless this page saw it
+ * resolved or already shows it.
+ */
+function reopenConfirmation(state: MissionState, event: ConfirmRequestEvent): MissionState {
+  if (state.resolvedConfirmIds.includes(event.id) || state.pendingConfirmation?.id === event.id) return state;
+  return { ...state, pendingConfirmation: event, confirmAnswer: null };
+}
+
+function updateCommands(state: MissionState, change: (entry: CommandEntry) => CommandEntry): CommandEntry[] {
+  let changed = false;
+  const commands = state.commands.map((entry) => {
+    const next = change(entry);
+    if (next !== entry) changed = true;
+    return next;
+  });
+  return changed ? commands : state.commands;
+}
+
+function newerReply(state: MissionState, seq: number): boolean {
+  return state.latestReply === null || seq > state.latestReply.seq;
+}
+
 function applyEvent(state: MissionState, event: ServerEvent): MissionState {
-  if (event.seq <= state.seqFloor || state.seen.includes(event.seq)) return state;
+  if (event.seq <= state.seqFloor || state.seen.includes(event.seq)) {
+    return event.type === "confirm.request" ? reopenConfirmation(state, event) : state;
+  }
   const next: MissionState = { ...state, ...remember(state, event.seq) };
   if (!UNLOGGED.has(event.type)) next.log = insertBySeq(state.log, event);
   const newer = (field: keyof FieldSeq) => event.seq > state.fieldSeq[field];
@@ -327,15 +441,54 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       subsystems = patch(subsystems, "voice", { speaking: false });
       subsystems = patch(subsystems, "llm", { in_flight: false });
       break;
-    case "request.start":
+    case "request.start": {
       // A new request cannot still be running a tool from the last one.
       subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
+      const own = event.command_id;
+      const requestId = event.request_id ?? null;
+      next.commands = updateCommands(state, (entry) => {
+        if (own !== undefined && entry.id === own) {
+          return entry.status === "queued" || entry.status === "running" ? { ...entry, status: "running", requestId } : entry;
+        }
+        // An accepted command that ran no request of its own (a "continue" with nothing to resume) is
+        // over once another request starts: the loop handles one line at a time.
+        return entry.status === "running" && entry.requestId === null ? { ...entry, status: "done" } : entry;
+      });
       break;
+    }
     case "request.end":
       // Nor can an ended one still be calling the model: a call cut short (Ctrl-C, cancel) sends no
       // llm.call end, so the request's end is the last word on it.
       subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
       subsystems = patch(subsystems, "llm", { in_flight: false });
+      if (event.request_id !== undefined) {
+        next.commands = updateCommands(state, (entry) =>
+          entry.requestId === event.request_id && entry.status === "running"
+            ? { ...entry, status: "done", outcome: event.status } : entry);
+      }
+      break;
+    case "assistant.message":
+      if (newerReply(state, event.seq)) next.latestReply = { kind: "message", text: event.text, seq: event.seq };
+      break;
+    case "command.ack":
+      // Only ever moves a command forward: the ack may arrive after its request started, or even ended.
+      next.commands = updateCommands(state, (entry) =>
+        entry.id === event.command_id && entry.status === "queued" && event.status === "accepted"
+          ? { ...entry, status: "running" } : entry);
+      break;
+    case "command.rejected":
+      // Also after an ack: the loop checks a browser line again before it runs it.
+      next.commands = updateCommands(state, (entry) =>
+        entry.id === event.command_id && entry.status !== "done"
+          ? { ...entry, status: "rejected", reason: event.reason } : entry);
+      break;
+    case "command.output":
+      next.commands = updateCommands(state, (entry) =>
+        entry.id === event.command_id && entry.status !== "rejected"
+          ? { ...entry, status: "done", outcome: entry.outcome ?? "output" } : entry);
+      if (newerReply(state, event.seq)) {
+        next.latestReply = { kind: "output", command: event.command, text: event.text, seq: event.seq };
+      }
       break;
     case "llm.call":
       subsystems = patch(subsystems, "llm", { model: event.model, attempt: event.attempt, in_flight: event.phase === "start" });
@@ -404,10 +557,15 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       break;
     }
     case "confirm.request":
-      next.pendingConfirmation = event;
+      if (!state.resolvedConfirmIds.includes(event.id)) {
+        if (state.confirmAnswer !== null && state.confirmAnswer.id !== event.id) next.confirmAnswer = null;
+        next.pendingConfirmation = event;
+      }
       break;
     case "confirm.resolved":
+      next.resolvedConfirmIds = [...state.resolvedConfirmIds.filter((id) => id !== event.id), event.id].slice(-RESOLVED_KEPT);
       if (state.pendingConfirmation?.id === event.id) next.pendingConfirmation = null;
+      if (state.confirmAnswer?.id === event.id) next.confirmAnswer = null;
       break;
     case "system.metrics":
       if (newer("metrics")) {

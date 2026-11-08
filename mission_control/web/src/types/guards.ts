@@ -215,8 +215,13 @@ export function isServerError(value: unknown): value is ServerError {
   return isObject(value) && value.type === "error" && typeof value.code === "string";
 }
 
+/** What the broker answers (mission_control/confirm.py answer_from_browser, via server.py). */
+export const CONFIRM_ANSWER_RESULTS = ["ok", "stale", "already_answered", "digest_mismatch", "terminal_only"] as const;
+const answerResult = oneOf(...CONFIRM_ANSWER_RESULTS);
+
+/** {type, id, result}: id is the echoed confirmation id ("" when the one sent was not a string). */
 export function isConfirmAnswerResult(value: unknown): value is ConfirmAnswerResult {
-  return isObject(value) && value.type === "confirm.answer.result" && str(value.id) && str(value.result);
+  return isObject(value) && value.type === "confirm.answer.result" && str(value.id) && answerResult(value.result);
 }
 
 const BACKEND_STATES = EVENT_ENUMS["jarvis.state:state"];

@@ -159,7 +159,7 @@ describe("server-only control frames", () => {
     expect(isAuthOk({ type: "auth.ok", protocol: 1 })).toBe(true);
     expect(isPong({ type: "pong" })).toBe(true);
     expect(isServerError({ type: "error", code: "invalid" })).toBe(true);
-    expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "b7e2", result: "approved" })).toBe(true);
+    expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "b7e2", result: "ok" })).toBe(true);
   });
 
   it("rejects mutated control frames", () => {
@@ -169,6 +169,16 @@ describe("server-only control frames", () => {
     expect(isServerError({ type: "error" })).toBe(false);
     expect(isServerError({ type: "error", code: 4 })).toBe(false);
     expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: 1, result: "x" })).toBe(false);
+  });
+
+  it("accepts exactly the broker's confirm.answer.result values (server.py _on_confirm_answer)", () => {
+    for (const result of ["ok", "stale", "already_answered", "digest_mismatch", "terminal_only"]) {
+      expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "c1", result })).toBe(true);
+    }
+    // The server echoes "" when the id it got was not a string.
+    expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "", result: "stale" })).toBe(true);
+    expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "c1", result: "approved" })).toBe(false);
+    expect(isConfirmAnswerResult({ type: "confirm.answer.result", id: "c1" })).toBe(false);
   });
 
   it("accepts a snapshot and rejects a broken one", () => {

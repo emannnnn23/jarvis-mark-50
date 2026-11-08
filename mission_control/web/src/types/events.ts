@@ -210,10 +210,13 @@ export interface ServerError {
   code: string;
 }
 
+export type ConfirmAnswerOutcome = "ok" | "stale" | "already_answered" | "digest_mismatch" | "terminal_only";
+
+/** The server's reply to this page's confirm.answer (a control frame, sent only to the tab that answered). */
 export interface ConfirmAnswerResult {
   type: "confirm.answer.result";
   id: string;
-  result: string;
+  result: ConfirmAnswerOutcome;
 }
 
 /**
