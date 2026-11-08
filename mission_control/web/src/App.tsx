@@ -10,6 +10,7 @@ import { NodeLabels } from "./components/nodes/NodeLabels";
 import { ConfirmationPanel } from "./components/panels/ConfirmationPanel";
 import { ConnectionBanner } from "./components/panels/ConnectionBanner";
 import { EventStreamPanel } from "./components/panels/EventStreamPanel";
+import { ReplyPanel } from "./components/panels/ReplyPanel";
 import { SystemMonitorPanel } from "./components/panels/SystemMonitorPanel";
 import { TaskPanel } from "./components/panels/TaskPanel";
 import { useMissionSocket } from "./hooks/useMissionSocket";
@@ -29,13 +30,14 @@ function ResetViewButton() {
   );
 }
 
-/** Escape closes the innermost thing that is open: an overlay first, then the node details. */
+/** Escape closes the innermost thing that is open: an overlay first, then the full reply, then the node details. */
 function useEscapeToClose() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
       const ui = useUi.getState();
       if (ui.overlay !== null) ui.closeOverlay();
+      else if (ui.replyOpen) ui.closeReply();
       else if (ui.selected !== null) ui.select(null);
     };
     document.addEventListener("keydown", onKey);
@@ -74,6 +76,7 @@ export function App({ token }: { token: string | null }) {
       }
       right={
         <>
+          <ReplyPanel />
           <TaskPanel />
           <EventStreamPanel />
         </>

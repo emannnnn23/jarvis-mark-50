@@ -7,8 +7,8 @@
  * command is allowed. Every refusal the server sends has a human message here.
  */
 
-import type { CommandRejectedEvent, JarvisState } from "../types/events";
-import type { CommandEntry } from "./reducer";
+import type { CommandRejectedEvent, ConfirmAnswerMessage, ConfirmPayload, JarvisState } from "../types/events";
+import type { CommandEntry, ConfirmAnswer } from "./reducer";
 
 /** bridge.py MAX_TEXT; counted in code points, like Python. */
 export const MAX_COMMAND_LENGTH = 4000;
@@ -140,4 +140,35 @@ export function countdownText(expiresAt: number, now: number): string | null {
   const minutes = Math.floor(left / 60);
   const seconds = left % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+/**
+ * The confirm.answer frame for this request: exactly its id and digest (so the broker approves only what
+ * was shown) and a strict boolean. Nothing else from the payload is echoed back.
+ */
+export function buildAnswer(payload: Pick<ConfirmPayload, "id" | "digest">, approved: boolean): ConfirmAnswerMessage {
+  return { type: "confirm.answer", id: payload.id, digest: payload.digest, approved: approved === true };
+}
+
+export interface AnswerGateInput {
+  payload: ConfirmPayload;
+  answer: ConfirmAnswer | null;
+  /** Epoch ms. */
+  now: number;
+  /** Approve has armed (the short delay after the panel opened has passed). */
+  armed: boolean;
+  connected: boolean;
+}
+
+/**
+ * Which answers may be sent right now. The panel uses it for the buttons' disabled state, and the click
+ * handler checks it again before sending, so a disabled attribute is never the only guard.
+ * - Nothing while an answer is on its way, once one was taken ("ok"), or with no link.
+ * - Approve also needs the panel armed, the request not expired, and the browser allowed to approve.
+ */
+export function answerGate({ payload, answer, now, armed, connected }: AnswerGateInput): { approve: boolean; decline: boolean } {
+  const settled = answer !== null && answer.id === payload.id && (answer.phase === "sending" || answer.result === "ok");
+  const decline = connected && !settled;
+  const expired = payload.expires_at !== null && countdownText(payload.expires_at, now) === null;
+  return { approve: decline && armed && !expired && payload.browser_approvable, decline };
 }

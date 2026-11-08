@@ -11,13 +11,15 @@
  *   for a moment after the panel opens so a click aimed at something else cannot land on it, and
  *   Escape never approves.
  * - After an answer is sent both buttons are off until the server's result or confirm.resolved arrives.
+ * - The click handler checks answerGate again with the latest state before sending, so the disabled
+ *   attribute is never the only guard, and the frame is built by buildAnswer (id, digest, strict boolean).
  * The panel closes when the reducer sees confirm.resolved for its id.
  */
 
 import { useEffect, useRef, useState } from "react";
 import type { Ref } from "react";
 
-import { answerResultMessage, countdownText } from "../../store/commands";
+import { answerGate, answerResultMessage, buildAnswer, countdownText } from "../../store/commands";
 import type { ConfirmAnswer } from "../../store/reducer";
 import { useMission } from "../../store/store";
 import type { ClientMessage, ConfirmPayload } from "../../types/events";
@@ -53,10 +55,10 @@ function statusLine(answer: ConfirmAnswer | null, expired: boolean, connected: b
 export function ConfirmationPanelView({ payload, answer, now, armed, connected, onAnswer, panelRef }: ConfirmationPanelViewProps) {
   const countdown = payload.expires_at === null ? null : countdownText(payload.expires_at, now);
   const expired = payload.expires_at !== null && countdown === null;
-  // The answer is out, or it was taken: nothing more to send for this request.
-  const settled = answer !== null && (answer.phase === "sending" || answer.result === "ok");
-  const declineOff = settled || !connected;
-  const approveOff = declineOff || !armed || expired;
+  // The same gate the click handler checks again before anything is sent.
+  const gate = answerGate({ payload, answer, now, armed, connected });
+  const declineOff = !gate.decline;
+  const approveOff = !gate.approve;
   const status = statusLine(answer, expired, connected);
   return (
     <section
@@ -157,16 +159,24 @@ export function ConfirmationPanel({ send }: { send: (message: ClientMessage) => 
   }, [id]);
 
   if (payload === null) return null;
+  const armed = armedId === payload.id;
   const onAnswer = (approved: boolean) => {
-    const message: ClientMessage = { type: "confirm.answer", id: payload.id, digest: payload.digest, approved };
-    if (send(message)) dispatch({ type: "confirm.sent", id: payload.id, approved });
+    // Defence in depth: re-check against the store as it is now, not as it was at the last render.
+    const current = useMission.getState();
+    if (current.pendingConfirmation?.id !== payload.id) return;
+    const gate = answerGate({
+      payload, answer: current.confirmAnswer, now: Date.now(), armed, connected: current.connection === "open",
+    });
+    if (!(approved === true ? gate.approve : gate.decline)) return;
+    const message = buildAnswer(payload, approved);
+    if (send(message)) dispatch({ type: "confirm.sent", id: payload.id, approved: message.approved });
   };
   return (
     <ConfirmationPanelView
       payload={payload}
       answer={answer}
       now={now}
-      armed={armedId === payload.id}
+      armed={armed}
       connected={connected}
       onAnswer={onAnswer}
       panelRef={panel}

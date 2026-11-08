@@ -1,7 +1,9 @@
 /**
  * Where the camera sits, decided by projecting the real node ring, so every node and its label stays in
- * the free part of the screen: clear of the top bar, of the docked side columns (wide screens) and of the
- * command bar dock at the bottom centre, at every viewport size.
+ * the free part of the screen: clear of the top bar, of the docked side columns (wide screens), and of the
+ * command bar dock and its one-line reply strip at the bottom centre, at every viewport size.
+ *
+ * The command bar's reply strip (replyRect) is reserved with the dock, so a reply never covers a node.
  *
  * - fitView() backs the camera off from the base distance until the ring fits, then shifts the image
  *   vertically (a projection view offset, so nothing tilts) to centre the ring in the free band. The core
@@ -27,6 +29,13 @@ export const CAMERA_HEIGHT = 0.7;
 export const LOOK_AT_Y = -0.05;
 /** The command bar dock's height (theme.css .hud-dock min-height). */
 export const DOCK_HEIGHT = 64;
+/**
+ * The one-line strip above the dock where the command bar previews the latest reply and its notices
+ * (theme.css .command-strip). It is reserved like the dock, so a reply never covers a node.
+ */
+export const REPLY_HEIGHT = 30;
+/** Space between the strip and the dock (theme.css .command-strip bottom offset). */
+export const REPLY_GAP = 8;
 /** Label offset below its marker, in CSS pixels (used by the label projector too). */
 export const LABEL_DROP = 30;
 
@@ -131,6 +140,13 @@ export function dockRect(width: number, height: number): ScreenRect {
   return { left, right: left + dockWidth, top: height - g - DOCK_HEIGHT, bottom: height - g };
 }
 
+/** The reply strip: directly above the dock, exactly as wide. */
+export function replyRect(width: number, height: number): ScreenRect {
+  const dock = dockRect(width, height);
+  const bottom = dock.top - REPLY_GAP;
+  return { left: dock.left, right: dock.right, top: bottom - REPLY_HEIGHT, bottom };
+}
+
 function freeRect(width: number, height: number): ScreenRect {
   const inset = sidePanelInset(width);
   const g = gutter(width);
@@ -138,7 +154,7 @@ function freeRect(width: number, height: number): ScreenRect {
     left: inset + CLEARANCE,
     right: width - inset - CLEARANCE,
     top: topBarBottom(width) + CLEARANCE,
-    bottom: height - g - DOCK_HEIGHT - CLEARANCE,
+    bottom: height - g - DOCK_HEIGHT - REPLY_GAP - REPLY_HEIGHT - CLEARANCE,
   };
 }
 

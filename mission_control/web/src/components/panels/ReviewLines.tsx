@@ -13,7 +13,8 @@ const KINDS: ReadonlySet<string> = new Set(["add", "del", "hunk", "ctx"]);
 
 export function ReviewLines({ lines }: { lines: readonly ReviewLine[] }) {
   return (
-    <pre className="review-lines">
+    // Focusable and labelled, so a long review can be scrolled from the keyboard and is announced.
+    <pre className="review-lines" tabIndex={0} role="region" aria-label="Change to review">
       {lines.map((line, index) => (
         // A kind the page does not know is shown as context, never used as an arbitrary class name.
         <span key={index} className={KINDS.has(line.k) ? line.k : "ctx"}>{line.t}</span>

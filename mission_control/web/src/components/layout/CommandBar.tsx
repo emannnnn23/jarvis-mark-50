@@ -7,12 +7,14 @@
  * - The chip follows this page's latest command: queued, running, done, or why it was refused.
  * - Cancel works like Ctrl+C while JARVIS is working or waiting for an approval.
  * - Up and Down walk through what this page sent (kept in memory only).
- * - Above the bar, the latest reply (assistant.message, or a slash command's output) as plain text in a
- *   height-capped, scrollable area. The reply and any notice are hidden while an approval is open: the
- *   approval takes that space.
+ * - Above the bar, one reserved line (cameraFit.ts replyRect, kept clear of the node ring at every size):
+ *   any notice, then a one-line preview of the latest reply (assistant.message, or a slash command's
+ *   output) as plain text. "Show all" opens the whole reply in the right column (ReplyPanel), never over
+ *   the ring, so a node stays visible and clickable after every reply. The line is hidden while an
+ *   approval is open: the approval takes that space.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, KeyboardEvent, Ref } from "react";
 
 import { browseHistory, cancelAvailable, checkLine, commandChip, pastedProblem, rememberLine } from "../../store/commands";
@@ -20,6 +22,8 @@ import type { Chip } from "../../store/commands";
 import { displayState } from "../../store/reducer";
 import type { LatestReply } from "../../store/reducer";
 import { useMission } from "../../store/store";
+import { useUi } from "../../store/ui";
+import { useNarrow } from "../../hooks/useViewport";
 import type { ClientMessage } from "../../types/events";
 
 export interface CommandBarViewProps {
@@ -29,7 +33,8 @@ export interface CommandBarViewProps {
   /** A message from the page itself (a refused paste, a line too long, no link); beats the chip's. */
   notice: string | null;
   reply: LatestReply | null;
-  replyHidden: boolean;
+  /** The whole reply is open in the right column. */
+  replyOpen: boolean;
   /** An approval is open over this space: show nothing above the bar. */
   aboveHidden?: boolean;
   cancelEnabled: boolean;
@@ -43,30 +48,29 @@ export interface CommandBarViewProps {
 }
 
 export function CommandBarView(props: CommandBarViewProps) {
-  const { value, connected, chip, notice, reply, replyHidden, cancelEnabled } = props;
+  const { value, connected, chip, notice, reply, replyOpen, cancelEnabled } = props;
   const message = notice ?? chip?.message ?? null;
   return (
     <div className="command-bar">
-      <div className="command-above" hidden={props.aboveHidden === true}>
-        {reply !== null && (
-          <section className="command-reply" aria-label="Latest reply from JARVIS" data-hidden={replyHidden}>
-            <header className="command-reply-head">
-              <span className={reply.kind === "message" ? "command-reply-from" : "command-reply-command"}>
-                {reply.kind === "message" ? "JARVIS" : reply.command}
-              </span>
-              <button type="button" className="icon-button command-reply-toggle" onClick={props.onToggleReply}
-                aria-expanded={!replyHidden}>
-                {replyHidden ? "Show reply" : "Hide"}
-              </button>
-            </header>
-            {!replyHidden && <pre className="command-reply-body" tabIndex={0}>{reply.text}</pre>}
-          </section>
-        )}
+      {/* Exactly one line tall (REPLY_HEIGHT); its content is clipped, never grown over the scene. */}
+      <div className="command-strip" hidden={props.aboveHidden === true}>
         {message !== null && (
           <p className={`command-notice${notice !== null || chip?.tone === "attention" ? " command-notice-attention" : ""}`}
             role="status">
             {message}
           </p>
+        )}
+        {reply !== null && (
+          <section className="command-reply" aria-label="Latest reply from JARVIS">
+            <span className={reply.kind === "message" ? "command-reply-from" : "command-reply-command"}>
+              {reply.kind === "message" ? "JARVIS" : reply.command}
+            </span>
+            <span className="command-reply-line">{reply.text}</span>
+            <button type="button" className="icon-button command-reply-toggle" onClick={props.onToggleReply}
+              aria-expanded={replyOpen} aria-controls="hud-right">
+              {replyOpen ? "Hide" : "Show all"}
+            </button>
+          </section>
         )}
       </div>
       <div className={`command-row${connected ? "" : " command-row-offline"}`}>
@@ -110,13 +114,12 @@ export function CommandBar({ send }: { send: (message: ClientMessage) => boolean
 
   const [value, setValue] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
-  const [replyHidden, setReplyHidden] = useState(false);
+  const narrow = useNarrow();
+  const replyOpen = useUi((ui) => ui.replyOpen);
+  const toggleReply = useUi((ui) => ui.toggleReply);
   const history = useRef<string[]>([]);
   const browsing = useRef<{ index: number | null; draft: string }>({ index: null, draft: "" });
 
-  // A new reply is shown even if the person hid the last one.
-  const replySeq = reply?.seq ?? null;
-  useEffect(() => setReplyHidden(false), [replySeq]);
 
   const submit = () => {
     const line = checkLine(value);
@@ -172,7 +175,7 @@ export function CommandBar({ send }: { send: (message: ClientMessage) => boolean
       chip={latest === null ? null : commandChip(latest)}
       notice={notice}
       reply={reply}
-      replyHidden={replyHidden}
+      replyOpen={replyOpen}
       aboveHidden={confirmationOpen}
       cancelEnabled={cancelAvailable(shown, confirmationOpen, connected)}
       onChange={onChange}
@@ -180,7 +183,7 @@ export function CommandBar({ send }: { send: (message: ClientMessage) => boolean
       onPaste={onPaste}
       onSubmit={submit}
       onCancel={() => send({ type: "request.cancel" })}
-      onToggleReply={() => setReplyHidden((hidden) => !hidden)}
+      onToggleReply={() => toggleReply(narrow)}
     />
   );
 }

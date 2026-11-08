@@ -74,6 +74,13 @@ describe("ReviewLines", () => {
     expect(renderToStaticMarkup(<ReviewLines lines={[{ k: "ctx", t: decomposed }]} />)).toContain(decomposed);
   });
 
+  it("is a keyboard-focusable, labelled region, so a long review can be scrolled without a mouse", () => {
+    const html = renderToStaticMarkup(<ReviewLines lines={[{ k: "ctx", t: "x" }]} />);
+    expect(html).toMatch(/^<pre[^>]*tabindex="0"/);
+    expect(html).toMatch(/^<pre[^>]*role="region"/);
+    expect(html).toMatch(/^<pre[^>]*aria-label="Change to review"/);
+  });
+
   it("never uses an unknown kind as a class name", () => {
     const html = renderToStaticMarkup(<ReviewLines lines={[{ k: "panel hud", t: "x" }]} />);
     expect(html).toContain('<span class="ctx">x</span>');

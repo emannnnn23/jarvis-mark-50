@@ -5,6 +5,8 @@ import {
   NARROW_MAX_WIDTH,
   cameraFov,
   dockRect,
+  replyRect,
+  REPLY_HEIGHT,
   fitView,
   focusPose,
   homePose,
@@ -185,6 +187,32 @@ describe("camera framing", () => {
             expect(overlaps(node.label, rect), `focus ${id}: ${node.id} label`).toBe(false);
           }
           expect(node.marker.top, `focus ${id}: ${node.id} under the top bar`).toBeGreaterThanOrEqual(view.free.top);
+        }
+      }
+    });
+  }
+
+  it("reserves a one-line reply strip directly above the dock, as wide as the dock", () => {
+    const dock = dockRect(1366, 768);
+    const reply = replyRect(1366, 768);
+    expect(reply.bottom - reply.top).toBe(REPLY_HEIGHT);
+    expect(REPLY_HEIGHT).toBeGreaterThanOrEqual(28);
+    expect(reply.bottom).toBeLessThanOrEqual(dock.top);
+    expect(dock.top - reply.bottom).toBe(8);
+    expect([reply.left, reply.right]).toEqual([dock.left, dock.right]);
+  });
+
+  // Task 10 fix: the reply shown above the command bar must never cover a node or its label, so a node
+  // stays visible and clickable after every reply, in the home view and with any node focused.
+  for (const [width, height] of [[1366, 768], [1920, 1080], [1280, 800]] as const) {
+    it(`keeps the reply strip clear of every node marker and label at ${width}x${height}, home and focused`, () => {
+      const view = fitView(width, height);
+      const reply = replyRect(width, height);
+      const poses = [homePose(view.distance), ...NODE_LAYOUT.map(({ id }) => focusPose(view, width, height, id))];
+      for (const pose of poses) {
+        for (const node of projectNodes(pose, width, height, view)) {
+          expect(overlaps(node.marker, reply), `${node.id} marker vs reply ${JSON.stringify(reply)}`).toBe(false);
+          expect(overlaps(node.label, reply), `${node.id} label vs reply ${JSON.stringify(reply)}`).toBe(false);
         }
       }
     });

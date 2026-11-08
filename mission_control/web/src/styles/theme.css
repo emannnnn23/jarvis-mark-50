@@ -1155,46 +1155,63 @@ body {
   background: rgba(255, 181, 71, 0.12);
 }
 
-/* Above the bar: the latest reply, then a notice, stacked upward from the dock's top edge. */
-.command-above[hidden] {
-  display: none;
-}
-
-.command-above {
+/* Above the bar: exactly one line (cameraFit.ts REPLY_HEIGHT 30 px, REPLY_GAP 8 px), reserved like the
+   dock so the camera keeps every node clear of it. Content is clipped to the line, never grown. */
+.command-strip {
   position: absolute;
   left: 0;
   right: 0;
   bottom: calc(100% + 8px);
-  display: grid;
+  height: 30px;
+  display: flex;
   gap: 6px;
+  align-items: stretch;
+  overflow: hidden;
   pointer-events: none;
 }
 
+.command-strip[hidden] {
+  display: none;
+}
+
+.command-notice {
+  flex: 0 1 auto;
+  max-width: 62%;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-left: 2px solid var(--holo-dim);
+  background: rgba(9, 17, 25, 0.86);
+  color: var(--mist);
+  font-size: var(--step--1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-notice-attention {
+  border-left-color: var(--amber);
+  color: var(--amber);
+}
+
 .command-reply {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 0 12px;
   border: 1px solid var(--glass-edge);
   border-left: 2px solid var(--holo-dim);
   border-radius: 2px;
   background: rgba(9, 17, 25, 0.78);
   backdrop-filter: blur(10px) saturate(120%);
   -webkit-backdrop-filter: blur(10px) saturate(120%);
-  padding: 8px 12px 10px 14px;
-  display: grid;
-  gap: 4px;
-}
-
-.command-reply[data-hidden="true"] {
-  justify-self: end;
-  padding: 4px 10px;
-}
-
-.command-reply-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
 }
 
 .command-reply-from {
+  flex: none;
   font-family: var(--font-display);
   font-size: 10px;
   letter-spacing: 0.24em;
@@ -1202,6 +1219,8 @@ body {
 }
 
 .command-reply-command {
+  flex: none;
+  max-width: 30%;
   color: var(--mist);
   font-size: var(--step--1);
   overflow: hidden;
@@ -1209,14 +1228,34 @@ body {
   white-space: nowrap;
 }
 
-.command-reply-toggle {
-  font-size: var(--step--1);
+/* The preview: one line of the reply, newlines folded to spaces, the rest behind Show all. */
+.command-reply-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ice);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* Text only, never HTML; a whole /resume run fits by scrolling, not by growing over the scene. */
+.command-reply-toggle {
+  flex: none;
+  font-size: var(--step--1);
+  color: var(--holo);
+}
+
+/* The whole reply, at the top of the right column: text only, never HTML; a /resume run scrolls. */
+.reply-panel {
+  flex: 0 0 auto;
+}
+
+.reply-panel .panel-head h2 {
+  flex: 1;
+}
+
 .command-reply-body {
   margin: 0;
-  max-height: 128px;
+  max-height: min(36vh, 300px);
   overflow: auto;
   font: inherit;
   color: var(--ice);
@@ -1226,24 +1265,10 @@ body {
   scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
 }
 
-.command-reply-body:focus-visible {
+.command-reply-body:focus-visible,
+.review-lines:focus-visible {
   outline: 1px solid var(--holo);
   outline-offset: 2px;
-}
-
-.command-notice {
-  justify-self: start;
-  margin: 0;
-  padding: 5px 10px;
-  border-left: 2px solid var(--holo-dim);
-  background: rgba(9, 17, 25, 0.86);
-  color: var(--mist);
-  font-size: var(--step--1);
-}
-
-.command-notice-attention {
-  border-left-color: var(--amber);
-  color: var(--amber);
 }
 
 /* --- approval ---------------------------------------------------------------------------------- */
