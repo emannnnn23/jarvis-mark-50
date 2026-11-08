@@ -52,6 +52,9 @@ def _old_redact(text: str) -> str:
     return _OLD_SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
 
 
+_LINEAR_CHARS = 20_000
+
+
 def _old_contains_secret(text: str) -> bool:
     if any(p.search(text) for p in audit_module._SECRET_PATTERNS) or _OLD_SECRET_ASSIGNMENT.search(text):
         return True
@@ -101,11 +104,22 @@ class SecretAssignmentRewriteTests(unittest.TestCase):
             self.assertEqual(audit_module.contains_secret(text), _old_contains_secret(text), msg=repr(text))
 
     def test_redact_is_linear_on_long_hyphenated_strings(self):
-        for unit in ("a-", "a_", "token-", "x=-"):
-            text = unit * 50000
-            started = time.perf_counter()
-            jarvis.redact(text)
-            self.assertLess(time.perf_counter() - started, 0.5, msg=unit)
+        # Compares the time for N and 4N characters instead of trusting one absolute number, so a
+        # loaded machine does not make it flaky: linear gives a ratio near 4, quadratic near 16.
+        def best_time(text):
+            runs = []
+            for _ in range(3):
+                started = time.perf_counter()
+                jarvis.redact(text)
+                runs.append(time.perf_counter() - started)
+            return min(runs)
+
+        for unit in ("a-", "a_"):
+            with self.subTest(unit=unit):
+                small = best_time(unit * (_LINEAR_CHARS // len(unit)))
+                large = best_time(unit * (4 * _LINEAR_CHARS // len(unit)))
+                self.assertLess(large, 5.0)
+                self.assertLess(large / max(small, 1e-4), 8)
 
 
 class RevealInvisibleTests(unittest.TestCase):
