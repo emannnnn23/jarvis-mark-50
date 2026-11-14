@@ -198,6 +198,12 @@ body {
   margin: 0;
 }
 
+/* The WebGL context was lost: cover the frozen picture so it is never mistaken for a live one. */
+.scene-lost {
+  background: rgba(4, 7, 11, 0.86);
+  gap: 8px;
+}
+
 /* --- glass ------------------------------------------------------------------------------------- */
 
 .panel,

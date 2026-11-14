@@ -2,13 +2,14 @@
  * The person's quality choice (Low / Balanced / High), remembered in localStorage.
  *
  * prefers-reduced-motion forces Low whatever was chosen: the system setting is the person's stronger
- * wish. Storage can be blocked (private windows, strict settings), so every access is wrapped and the
+ * wish. Auto-degrade (the scene ran too slowly for a sustained period) caps the level for this page
+ * only; it is never stored, and picking a level in the menu lifts the cap. Storage can be blocked (private windows, strict settings), so every access is wrapped and the
  * choice then simply lasts for this page.
  */
 
 import { useCallback, useState, useSyncExternalStore } from "react";
 
-import { isQualityLevel } from "../components/scene/quality";
+import { isQualityLevel, lowerOf, qualityAfterDecline } from "../components/scene/quality";
 import type { QualityLevel } from "../components/scene/quality";
 
 export const QUALITY_STORAGE_KEY = "jarvis.missionControl.quality";
@@ -33,9 +34,12 @@ export function writeStoredQuality(storage: QualityStorage | null, level: Qualit
   }
 }
 
-export function effectiveQuality(chosen: QualityLevel | null, reducedMotion: boolean): QualityLevel {
+export function effectiveQuality(
+  chosen: QualityLevel | null, reducedMotion: boolean, cap: QualityLevel | null = null,
+): QualityLevel {
   if (reducedMotion) return "low";
-  return chosen ?? "balanced";
+  const level = chosen ?? "balanced";
+  return cap === null ? level : lowerOf(level, cap);
 }
 
 function localStore(): QualityStorage | null {
@@ -74,15 +78,27 @@ export interface PerformanceMode {
   chosen: QualityLevel | null;
   /** True while prefers-reduced-motion holds the quality at Low. */
   forcedLow: boolean;
+  /** The level auto-degrade lowered the scene to on this page, or null. */
+  degradedTo: QualityLevel | null;
   setQuality: (level: QualityLevel) => void;
+  /** Sustained low frame rate: drop one level below what is shown now (no-op at Low). */
+  degrade: () => void;
 }
 
 export function usePerformanceMode(): PerformanceMode {
   const reducedMotion = useMediaQuery(REDUCED_MOTION_QUERY);
   const [chosen, setChosen] = useState<QualityLevel | null>(() => readStoredQuality(localStore()));
+  const [cap, setCap] = useState<QualityLevel | null>(null);
+  const quality = effectiveQuality(chosen, reducedMotion, cap);
   const setQuality = useCallback((level: QualityLevel) => {
     setChosen(level);
+    setCap(null);
     writeStoredQuality(localStore(), level);
   }, []);
-  return { quality: effectiveQuality(chosen, reducedMotion), chosen, forcedLow: reducedMotion, setQuality };
+  const degrade = useCallback(() => {
+    const lower = qualityAfterDecline(quality);
+    if (lower !== null) setCap(lower);
+  }, [quality]);
+  const degradedTo = cap !== null && quality === cap && !reducedMotion ? cap : null;
+  return { quality, chosen, forcedLow: reducedMotion, degradedTo, setQuality, degrade };
 }

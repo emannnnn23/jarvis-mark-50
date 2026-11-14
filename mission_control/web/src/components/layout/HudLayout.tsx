@@ -80,7 +80,7 @@ export function HudLayout({
         </aside>
         <div className="hud-approval">{approval}</div>
         {/* The command bar: docked at the bottom centre on every screen size (cameraFit.ts DOCK_HEIGHT). */}
-        <div className="hud-dock" data-slot="command-bar">{dock}</div>
+        <div className="hud-dock" data-slot="command-bar" role="region" aria-label="Command bar">{dock}</div>
       </div>
     </div>
   );

@@ -1,8 +1,9 @@
 /**
  * The six node labels: name, status word and the node's real facts, placed by the scene's projector.
  * Each label is a button that opens the node's detail panel, so every node can be reached by keyboard
- * as well as by clicking its marker. Without a live link the statuses are not known any more, so they
- * say so instead of showing old health.
+ * as well as by clicking its marker (Tab to it, Enter or Space to open). Keyboard focus lights the
+ * node's marker the way hovering does. Without a live link the statuses are not known any more, so
+ * they say so instead of showing old health.
  */
 
 import { displayState } from "../../store/reducer";
@@ -30,7 +31,9 @@ export function NodeLabels() {
             className={`node-label node-${stale ? "unknown" : view.status}${hovered === id ? " node-label-hover" : ""}`}
             aria-pressed={selected === id} aria-controls="node-detail"
             onClick={() => select(selected === id ? null : id)}
-            onPointerEnter={() => hover(id)} onPointerLeave={() => hover(null)}>
+            aria-label={`${label}: ${status}${facts.length > 0 ? `. ${facts.join(". ")}` : ""}. Show details`}
+            onPointerEnter={() => hover(id)} onPointerLeave={() => hover(null)}
+            onFocus={() => hover(id)} onBlur={() => hover(null)}>
             <span className="node-name">{label}</span>
             <span className="node-status">{status}</span>
             {facts.map((fact) => <span key={fact} className="node-fact">{fact}</span>)}

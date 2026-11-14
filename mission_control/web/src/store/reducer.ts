@@ -93,6 +93,18 @@ export interface VoiceLevel {
   at: number;
 }
 
+/** The spoken part playing now (voice.output "chunk"), for the core's speech pulse. */
+export interface SpeechChunk {
+  seq: number;
+  index: number | null;
+  /** [offset_ms, duration_ms] per word, from the start of this part. */
+  words: [number, number][];
+  timing: "exact" | "none";
+  duration_ms: number | null;
+  /** Backend epoch ms: when the part was handed to the player. */
+  timestamp: number;
+}
+
 /** Status changes of the socket, from the browser itself. */
 export interface ConnectionEvent {
   type: "connection";
@@ -170,6 +182,8 @@ export interface MissionState {
   network: NetworkStatusEvent | null;
   /** The latest microphone level while listening for the wake word or collecting speech. */
   voiceLevel: VoiceLevel | null;
+  /** The part of a spoken reply playing now; null when JARVIS is not speaking. */
+  speech: SpeechChunk | null;
   /** The latest task.progress line for the current task. */
   taskProgress: { message: string; at: number } | null;
   /** This page's recent commands, oldest first. */
@@ -215,6 +229,7 @@ export function initialMissionState(): MissionState {
     metrics: null,
     network: null,
     voiceLevel: null,
+    speech: null,
     taskProgress: null,
     commands: [],
     latestReply: null,
@@ -339,6 +354,7 @@ function applySnapshot(state: MissionState, snap: Snapshot): MissionState {
     metrics,
     network,
     voiceLevel: null,
+    speech: null,
     taskProgress: null,
     // The snapshot's state is the tracker's latest, so no jarvis.state at or below its seq may replace it.
     // The task has no seq of its own: recent task.update events, folded in order, end on the newest.
@@ -437,6 +453,7 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
     case "session.end":
       next.sessionEnded = true;
       next.voiceLevel = null;
+      next.speech = null;
       subsystems = patch(subsystems, "tools", { active: [], active_status: {} });
       subsystems = patch(subsystems, "voice", { speaking: false });
       subsystems = patch(subsystems, "llm", { in_flight: false });
@@ -541,6 +558,20 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       next.voiceLevel = { rms: event.rms, phase: event.phase, at: event.timestamp };
       break;
     case "voice.output":
+      if (event.phase === "chunk") {
+        if (state.speech === null || event.seq > state.speech.seq) {
+          next.speech = {
+            seq: event.seq,
+            index: event.index ?? null,
+            words: event.words ?? [],
+            timing: event.timing ?? "none",
+            duration_ms: event.duration_ms ?? null,
+            timestamp: event.timestamp,
+          };
+        }
+      } else {
+        next.speech = null; // a new reply starts, or the speech ended: nothing is playing
+      }
       subsystems = patch(subsystems, "voice",
         event.phase === "start" ? { status: "online", speaking: true }
           : event.phase === "end" ? { status: "online", speaking: false }

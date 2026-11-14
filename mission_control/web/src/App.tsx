@@ -59,7 +59,7 @@ export function App({ token }: { token: string | null }) {
       side={sidePanelWidth(width)}
       scene={
         <SceneBoundary>
-          <Scene quality={performance.quality} narrow={narrow} />
+          <Scene quality={performance.quality} narrow={narrow} calm={performance.forcedLow} onSlow={performance.degrade} />
         </SceneBoundary>
       }
       labels={<NodeLabels />}

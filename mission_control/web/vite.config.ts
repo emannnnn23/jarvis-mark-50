@@ -28,6 +28,8 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
+          // The High-quality glow: its own chunk, fetched only by Scene.tsx's dynamic import at High.
+          if (/node_modules\/(@react-three\/postprocessing|postprocessing|n8ao)\//.test(id)) return "bloom";
           if (id.includes("node_modules/three/")) return "three";
           if (id.includes("node_modules/@react-three/")) return "r3f";
           return undefined;

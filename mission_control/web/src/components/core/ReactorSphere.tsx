@@ -28,8 +28,9 @@ export function ReactorSphere({ live }: { live: CoreLive }) {
     lattice.color.copy(live.color);
     lattice.opacity = 0.025 + 0.05 * live.intensity;
     heart.uniforms.uColor.value.copy(live.color);
-    heart.uniforms.uIntensity.value = 0.3 + 0.7 * live.intensity;
+    heart.uniforms.uIntensity.value = 0.3 + 0.7 * live.intensity + 0.35 * live.pulse;
     if (group.current) {
+      group.current.scale.setScalar(1 + 0.05 * live.pulse); // a word swells the reactor slightly
       group.current.rotation.y += Math.min(delta, 0.1) * live.speed * 0.5;
       group.current.rotation.x = Math.sin(live.time * 0.15) * 0.08;
     }

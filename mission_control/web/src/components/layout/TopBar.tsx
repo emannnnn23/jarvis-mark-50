@@ -53,7 +53,7 @@ function StateReadout() {
 const QUALITY_TEXT: Record<QualityLevel, { name: string; note: string }> = {
   low: { name: "Low", note: "Fewest particles, no glass blur, still when idle" },
   balanced: { name: "Balanced", note: "Smooth on integrated graphics" },
-  high: { name: "High", note: "Most particles and the sharpest image" },
+  high: { name: "High", note: "Most particles, the sharpest image and a soft glow" },
 };
 
 /** The "View" menu: the quality level, remembered on this computer. */
@@ -100,6 +100,12 @@ function ViewMenu({ performance }: { performance: PerformanceMode }) {
           {performance.forcedLow && (
             <p className="panel-note">Your system asks for reduced motion, so Mission Control stays on Low.</p>
           )}
+          {performance.degradedTo !== null && (
+            <p className="panel-note" role="status">
+              The scene was running slowly, so it dropped to {QUALITY_TEXT[performance.degradedTo].name} for this
+              page. Pick a level to try it again.
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -124,7 +130,7 @@ export function TopBar({ performance, narrow }: { performance: PerformanceMode; 
   const session = useMission((s) => s.session);
   const connection = useMission((s) => s.connection);
   return (
-    <header className="topbar">
+    <header className="topbar" aria-label="JARVIS status and view settings">
       <div className="brand">
         <span className="brand-name">JARVIS</span>
         <span className="brand-mark">Mark 50</span>
