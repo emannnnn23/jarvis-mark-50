@@ -116,7 +116,11 @@ def _ticks(value: Any) -> float | None:
     """A WordBoundary offset or duration as a finite, non-negative number of ticks, or None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if math.isfinite(value) and value >= 0 else None
+    try:
+        ticks = float(value)  # an int beyond the float range raises OverflowError here
+    except OverflowError:
+        return None
+    return ticks if math.isfinite(ticks) and ticks >= 0 else None
 
 
 async def _stream_to_file(communicate: Any, path: Path) -> list[tuple[int, int]]:

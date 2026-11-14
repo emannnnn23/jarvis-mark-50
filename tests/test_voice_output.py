@@ -634,6 +634,19 @@ class WordBoundaryTests(BusCaptureMixin, unittest.TestCase):
         self.assertEqual(outputs[1]["words"], [[100, 250], [400, 300]])
         self.assert_valid(events)
 
+    def test_huge_integer_word_boundary_is_skipped_and_speech_still_plays(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"one|"},
+            {"type": "WordBoundary", "offset": 10 ** 400, "duration": 2_000_000, "text": "huge offset"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": -(10 ** 400), "text": "huge negative"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": 2_500_000, "text": "Hello"},
+            {"type": "audio", "data": b"two"},
+        ])
+        self.assertEqual(played, [b"one|two"])
+        chunks = [e for e in events if e["type"] == "voice.output" and e["phase"] == "chunk"]
+        self.assertEqual([c["words"] for c in chunks], [[[100, 250]]])
+        self.assert_valid(events)
+
     def test_audio_without_word_boundaries_sends_a_chunk_without_timings(self):
         events, played = self.speak_with_stream([
             {"type": "audio", "data": b"only-audio"},
