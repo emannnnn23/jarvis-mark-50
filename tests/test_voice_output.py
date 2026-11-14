@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -593,6 +594,56 @@ class WordBoundaryTests(BusCaptureMixin, unittest.TestCase):
         words = asyncio.run(voice._synthesize("Hello there.", path))
         self.assertEqual(words, [(100, 250), (400, 300)])
         self.assertEqual(path.read_bytes(), b"".join(FakeCommunicate.AUDIO))
+
+    def speak_with_stream(self, items: list[dict]) -> tuple[list[dict], list[bytes]]:
+        """Speak "Hello there." with a stream that yields exactly `items`; return the events and played bytes."""
+
+        class ScriptedCommunicate(FakeCommunicate):
+            async def stream(self):
+                self.streamed = True
+                for item in items:
+                    yield item
+
+        sys.modules["edge_tts"].Communicate = ScriptedCommunicate
+        events = self.capture_events()
+        voice = self.make_voice()
+        played: list[bytes] = []
+
+        async def fake_play(path):
+            played.append(Path(path).read_bytes())
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+        return events, played
+
+    def test_malformed_word_boundary_is_skipped_and_speech_still_plays(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"one|"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": 2_500_000, "text": "Hello"},
+            {"type": "WordBoundary", "offset": "soon", "duration": 2_000_000, "text": "bad offset"},
+            {"type": "WordBoundary", "offset": 3_000_000, "text": "no duration"},
+            {"type": "WordBoundary", "offset": None, "duration": True, "text": "not numbers"},
+            {"type": "WordBoundary", "offset": float("nan"), "duration": 1_000_000, "text": "nan"},
+            {"type": "audio", "data": b"two"},
+            {"type": "WordBoundary", "offset": 4_000_000, "duration": 3_000_000, "text": "there"},
+        ])
+        self.assertEqual(played, [b"one|two"])
+        outputs = [e for e in events if e["type"] == "voice.output"]
+        self.assertEqual([e["phase"] for e in outputs], ["start", "chunk", "end"])
+        self.assertEqual(outputs[1]["timing"], "exact")
+        self.assertEqual(outputs[1]["words"], [[100, 250], [400, 300]])
+        self.assert_valid(events)
+
+    def test_audio_without_word_boundaries_sends_a_chunk_without_timings(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"only-audio"},
+        ])
+        self.assertEqual(played, [b"only-audio"])
+        chunks = [e for e in events if e["type"] == "voice.output" and e["phase"] == "chunk"]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["timing"], "none")
+        self.assertEqual(chunks[0]["words"], [])
+        self.assert_valid(events)
 
     def test_save_path_unchanged_when_bus_disabled(self):
         events = self.capture_events()

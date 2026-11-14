@@ -112,8 +112,18 @@ EDGE_TTS_BITRATE_BPS = 48_000
 TICKS_PER_MS = 10_000
 
 
+def _ticks(value: Any) -> float | None:
+    """A WordBoundary offset or duration as a finite, non-negative number of ticks, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
 async def _stream_to_file(communicate: Any, path: Path) -> list[tuple[int, int]]:
-    """Write a Communicate stream's audio to `path` (as `save()` does) and collect its word windows in ms."""
+    """Write a Communicate stream's audio to `path` (as `save()` does) and collect its word windows in ms.
+
+    Word timings only decorate the browser view, so a boundary item that is malformed (missing or
+    non-numeric offset or duration) is skipped: it must never cost the person the spoken reply."""
     words: list[tuple[int, int]] = []
     with open(path, "wb") as audio:
         async for message in communicate.stream():
@@ -121,7 +131,11 @@ async def _stream_to_file(communicate: Any, path: Path) -> list[tuple[int, int]]
             if kind == "audio":
                 audio.write(message["data"])
             elif kind == "WordBoundary":
-                words.append((round(message["offset"] / TICKS_PER_MS), round(message["duration"] / TICKS_PER_MS)))
+                offset, duration = _ticks(message.get("offset")), _ticks(message.get("duration"))
+                if offset is None or duration is None:
+                    log.debug("Skipped a malformed WordBoundary item from edge-tts")
+                    continue
+                words.append((round(offset / TICKS_PER_MS), round(duration / TICKS_PER_MS)))
     return words
 
 

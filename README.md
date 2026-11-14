@@ -936,15 +936,15 @@ If the page is not built yet, the second line is a warning, `[warn] Mission Cont
 
 ### Security
 
-Mission Control is built so that nothing outside your own login session can see it or drive it.
+Mission Control can be reached only from this computer. The page itself (its HTML, scripts and styles) is served to any program on this computer, but nothing live can be read or driven without the per-session token, and other websites open in your browser are refused.
 
 - **Local only.** The server binds `127.0.0.1` and nothing else, so other machines on the network cannot reach it.
-- **A token per session.** Each run makes a new random token. It is in the link's `#token=` part, which a browser never sends to a server. The page sends it in the first WebSocket message, removes it from the address bar at once, and gets nothing until the token matches. A wrong token is refused.
-- **Host and Origin checks.** Requests must name `127.0.0.1:<port>` or `localhost:<port>` as the host (this stops DNS-rebinding tricks from other websites), and a WebSocket must come from this page's own origin, so another site open in your browser cannot connect.
-- **A strict Content Security Policy.** The page may load scripts and styles only from this server, and connect only to this server.
+- **A token per session.** Each run makes a new random token. It is in the link's `#token=` part, which a browser never sends to a server. The page removes it from the address bar at once, keeps it in that tab's session storage, and sends it in the first WebSocket message. Without the right token nothing live is available: the socket is closed after a wrong or missing first message (or 3 s of silence), and `/api/snapshot` answers 401. Only the page files and `/api/health`, which says only that the server is up and which protocol version it speaks, need no token.
+- **Host and Origin checks.** Every request must name `127.0.0.1:<port>` or `localhost:<port>` as the host, which stops DNS-rebinding tricks from other websites. A WebSocket, and any request that carries an Origin, must come from the page's own address (or from the dev server in `JARVIS_UI_DEV_ORIGIN`), so another website open in your browser cannot connect. A program on this computer can claim any Origin it likes; for it, the token is what stands in the way.
+- **A Content Security Policy.** Scripts only from this server (no inline scripts, no eval); inline styles are allowed; images may also be `data:` or `blob:` URLs, and workers `blob:` URLs; connections only to this server (`ws://127.0.0.1:<port>` and `ws://localhost:<port>`); no plugins; and no other site can show the page in a frame.
 - **The token is never logged.** It is printed to the terminal once and appears in no log file and no audit line. The audit trail records only the port.
-- **The token is never on a command line.** To open the tab, JARVIS writes the link into a private temporary file (mode 600, deleted after 10 seconds) and hands the browser that file, not the link. So the token does not show up in `ps` or other process listings.
-- **No secrets reach the page.** Everything JARVIS sends goes through the same secret redaction as the logs, and the Groq key is never sent.
+- **The token is never on a command line.** To open the tab, JARVIS writes the link into a private temporary file (mode 600, in `$XDG_RUNTIME_DIR`, deleted after 10 seconds) and hands the browser that file, not the link. So the token does not show up in `ps` or other process listings.
+- **Secrets are redacted.** Everything JARVIS sends to the page goes through the same pattern-based secret redaction as the logs, and the Groq key is never sent. Like the logs, redaction cannot catch every secret format.
 - Limits: 4 tabs, 20 messages per second per tab, and 64 KiB per message.
 
 ### Approvals in the browser
