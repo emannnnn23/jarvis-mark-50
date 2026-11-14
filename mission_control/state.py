@@ -58,6 +58,9 @@ class StateTracker:
         self._speaking = False
         self._error_until: float | None = None
         self._error_detail: str | None = None
+        # session.start said the memory file was corrupted: activity on the rebuilt store does not
+        # make the node healthy, so it stays "degraded" until a session starts with a sound store.
+        self._memory_corrupted = False
         self._state = "idle"
         self._detail: str | None = None
         self._since = int(self._wall_clock() * 1000)
@@ -163,6 +166,7 @@ class StateTracker:
         memory_status = MEMORY_STATUS.get(ev.get("memory_status"))  # type: ignore[arg-type]
         if memory_status is not None:
             self._subsystems["memory"]["status"] = memory_status
+            self._memory_corrupted = ev.get("memory_status") == "corrupted"
 
     def _on_session_end(self, ev: dict[str, Any]) -> None:
         self._request_active = False
@@ -222,7 +226,7 @@ class StateTracker:
     def _on_memory(self, ev: dict[str, Any]) -> None:
         count = ev.get("count")
         self._subsystems["memory"].update(
-            status="online", last_op=ev.get("op"),
+            status="degraded" if self._memory_corrupted else "online", last_op=ev.get("op"),
             count=count if isinstance(count, int) and not isinstance(count, bool) else None)
 
     def _on_voice_output(self, ev: dict[str, Any]) -> None:

@@ -1273,6 +1273,32 @@ class WakeLevelTests(BusCaptureMixin, TempDirTestCase):
         self.assertTrue(all(e["phase"] == "collecting" and e["rms"] == 0.4 for e in events))
         self.assert_valid(events)
 
+    def test_voice_level_burst_does_not_evict_real_events(self):
+        """Meter levels are transient: minutes of hands-free listening must not push real events out of
+        the replay ring, or a reloaded tab would see an empty Events panel."""
+        events = self.capture_events()
+        saved_ring, saved_seq, saved_evicted = list(BUS._ring), BUS._seq, BUS._evicted_seq
+
+        def restore_ring():
+            BUS._ring.clear()
+            BUS._ring.extend(saved_ring)
+            BUS._seq, BUS._evicted_seq = saved_seq, saved_evicted
+
+        self.addCleanup(restore_ring)
+        clock = {"now": 100.0}
+        BUS._clock = lambda: clock["now"]
+        self.addCleanup(setattr, BUS, "_clock", time.time)
+        BUS.emit("tool.execution", tool="read_file", status="success")
+        real_seq = events[-1]["seq"]
+        for i in range(600):
+            jarvis.publish_voice_level("armed" if i % 2 else "collecting", 0.3)
+            clock["now"] += 0.25
+        self.assertEqual(len([e for e in events if e["type"] == "voice.level"]), 600)
+        recent = BUS.recent()
+        self.assertIn(real_seq, [e["seq"] for e in recent])
+        self.assertNotIn("voice.level", [e["type"] for e in recent])
+        self.assertEqual(BUS.recent(real_seq - 1)[0]["seq"], real_seq)
+
     def test_voice_level_is_clamped_and_silent_when_bus_is_off(self):
         events = self.capture_events()
         jarvis.publish_voice_level("collecting", 7.0)

@@ -455,9 +455,12 @@ VOICE_LEVEL_INTERVAL = {"armed": 0.2, "collecting": 0.1}
 
 
 def publish_voice_level(phase: str, rms: float) -> None:
-    """Wake-listener level callback: a throttled voice.level for the live meter (a no-op when Mission Control is off)."""
+    """Wake-listener level callback: a throttled voice.level for the live meter (a no-op when Mission Control is off).
+
+    Transient: at 5-10 Hz the levels would otherwise fill the replay ring within two minutes and evict
+    the real events a reloaded tab needs; a stale meter level is worthless on replay anyway."""
     emit_throttled(f"voice.level.{phase}", VOICE_LEVEL_INTERVAL.get(phase, 0.2), "voice.level",
-                   rms=min(1.0, max(0.0, float(rms))), phase=phase)
+                   _transient=True, rms=min(1.0, max(0.0, float(rms))), phase=phase)
 
 
 def start_mission_control(config: Config, cli: JarvisCLI, voice: VoiceEngine):

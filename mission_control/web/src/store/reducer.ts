@@ -536,8 +536,10 @@ function applyEvent(state: MissionState, event: ServerEvent): MissionState {
       break;
     case "memory.activity": {
       const count = typeof event.count === "number" ? event.count : null;
+      // Activity on a store the session found corrupted does not make it healthy (state.py does the same).
+      const corrupted = next.session?.memory_status === "corrupted";
       subsystems = patch(subsystems, "memory", {
-        status: "online", last_op: event.op, count,
+        status: corrupted ? "degraded" : "online", last_op: event.op, count,
         ...(event.op === "store"
           ? (count === null ? {} : { facts: count })
           : { recall_op: event.op, recall_count: count }),

@@ -518,6 +518,47 @@ class HubLoopTests(AppTestCase):
         self.assertEqual(snap["subsystems"]["system"]["reason"], "psutil not installed")
         self.assertIsNone(snap["metrics"])
 
+    async def _system_statuses_while_sampling(self, script: list) -> list:
+        """Run the metrics loop with a sampler that follows `script` (first entry: the startup priming
+        call), recording the SYSTEM status the tracker shows at each loop call before it answers."""
+        tracker = self.tracker
+
+        class ScriptedSampler(FakeSampler):
+            def __init__(self):
+                super().__init__(available=True)
+                self.seen: list = []
+
+            def sample(self):
+                self.threads.append(threading.get_ident())
+                system = tracker.snapshot()["subsystems"]["system"]
+                self.seen.append((system["status"], system.get("reason")))
+                index = len(self.threads) - 1
+                return script[index] if index < len(script) else metrics_payload()
+
+        self.sampler = ScriptedSampler()
+        with mock.patch("mission_control.server.METRICS_INTERVAL", 0.01):
+            await self.start()
+            ws = await self.authed()
+            await self.recv(ws)
+            for _ in range(300):
+                if len(self.sampler.threads) > len(script) + 1:
+                    break
+                await asyncio.sleep(0.01)
+            await ws.close()
+        return self.sampler.seen[1:len(script) + 2]  # the loop's calls (index 0 was the priming one)
+
+    async def test_three_failed_samples_mark_system_unavailable_until_a_good_one(self):
+        seen = await self._system_statuses_while_sampling([metrics_payload(), None, None, None])
+        failed = ("unavailable", "system metrics failed")
+        self.assertEqual(seen[:3], [("unknown", None)] * 3)  # one or two failures are not enough
+        self.assertEqual(seen[3], failed)  # after the third in a row
+        self.assertEqual(seen[4][0], "online")  # the next good sample brings it back
+        self.assertEqual(self.tracker.snapshot()["subsystems"]["system"]["status"], "online")
+
+    async def test_failures_that_are_not_consecutive_keep_system_as_it_was(self):
+        seen = await self._system_statuses_while_sampling([metrics_payload(), None, None, metrics_payload(), None, None])
+        self.assertNotIn("unavailable", [status for status, _ in seen])
+
     async def test_probe_on_auth_runs_in_an_executor(self):
         await self.start(probe=True)
         ws = await self.authed()
@@ -552,6 +593,66 @@ class HubLoopTests(AppTestCase):
         await self.client.close()
         self.assertEqual(self.bus._subscribers, [])
 
+
+
+class PassiveNetworkStatusTests(unittest.TestCase):
+    """A finished model call is a free reachability check: Hub._dispatch turns it into network.status
+    (source "passive") but only when the Groq reachability it shows differs from the last known one."""
+
+    def setUp(self):
+        self.bus = EventBus()
+        self.hub = server.Hub(self.bus, StateTracker(), FakeSampler(), TOKEN, 0)
+        self.published: list[dict] = []
+        self.bus.subscribe(self.published.append)
+
+    def feed(self, kind: str, **data) -> None:
+        self.hub._dispatch(self.bus.publish(kind, **data))
+
+    def call_end(self, ok: bool, error_kind: str | None = None) -> None:
+        extra = {} if error_kind is None else {"error_kind": error_kind}
+        self.feed("llm.call", phase="end", model="m", attempt=1, ok=ok, duration_ms=5, **extra)
+
+    def network_events(self) -> list[dict]:
+        return [e for e in self.published if e["type"] == "network.status"]
+
+    def test_successful_call_marks_groq_up_once(self):
+        self.feed("llm.call", phase="start", model="m", attempt=1)
+        self.assertEqual(self.network_events(), [])
+        self.call_end(True)
+        self.call_end(True)  # no change: nothing new
+        events = self.network_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual((events[0]["groq"], events[0]["source"]), ("up", "passive"))
+        self.assertIsInstance(events[0]["checked_at"], int)
+        self.assertEqual(validate_event(events[0]), [])
+        self.assertEqual(self.hub.snapshot()["network"]["groq"], "up")
+
+    def test_network_failure_marks_groq_down_and_recovery_marks_it_up(self):
+        self.call_end(False, "network")
+        self.call_end(False, "network")
+        self.call_end(True)
+        events = self.network_events()
+        self.assertEqual([(e["groq"], e["source"]) for e in events], [("down", "passive"), ("up", "passive")])
+        self.assertTrue(all(validate_event(e) == [] for e in events))
+        self.hub._dispatch(events[-1])  # the event itself coming back changes nothing
+        self.assertEqual(len(self.network_events()), 2)
+
+    def test_other_failures_say_nothing_about_reachability(self):
+        for kind in ("rate_limit", "bad_request", "server", "auth", None):
+            self.call_end(False, kind)
+        self.assertEqual(self.network_events(), [])
+
+    def test_matching_probe_result_is_not_repeated(self):
+        self.feed("network.status", groq="up", checked_at=1, source="probe", latency_ms=12.0)
+        self.call_end(True)
+        self.assertEqual(len(self.network_events()), 1)  # only the probe's own event
+        self.call_end(False, "network")
+        self.assertEqual([e["groq"] for e in self.network_events()], ["up", "down"])
+
+    def test_closed_hub_publishes_nothing(self):
+        self.hub._closed = True
+        self.call_end(True)
+        self.assertEqual(self.network_events(), [])
 
 
 # --- commands, cancel and approvals from the browser ---------------------------------------------------

@@ -59,6 +59,22 @@ describe("command chip", () => {
   });
 });
 
+describe("paste ending in one newline", () => {
+  it("accepts a single line copied with its line ending, and sends it without one", () => {
+    expect(pastedProblem("what time is it?\n")).toBeNull();
+    expect(pastedProblem("what time is it?\r\n")).toBeNull();
+    expect(checkLine("what time is it?\n")).toEqual({ ok: true, text: "what time is it?" });
+    expect(checkLine("what time is it?\r\n")).toEqual({ ok: true, text: "what time is it?" });
+  });
+
+  it("still refuses more than one line, or more than one line ending", () => {
+    expect(pastedProblem("first\nsecond\n")).toMatch(/one line/i);
+    expect(pastedProblem("first\n\n")).toMatch(/one line/i);
+    expect(pastedProblem("first\r\n\r\n")).toMatch(/one line/i);
+    expect(pastedProblem("\nfirst")).toMatch(/one line/i);
+  });
+});
+
 describe("single-line input", () => {
   it("sends one trimmed line and refuses what the server would refuse", () => {
     expect(checkLine("  what time is it?  ")).toEqual({ ok: true, text: "what time is it?" });

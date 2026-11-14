@@ -49,6 +49,54 @@ PUBLISH_MAX_ITEMS = 500
 SCRUB_INPUT_LIMIT = 1_048_576
 
 
+# What redact() puts in place of a secret.
+REDACTED = "[REDACTED]"
+
+
+def _drop_partial_marker(text: str) -> str:
+    """Remove a trailing non-empty, incomplete prefix of REDACTED (a cut landed inside the marker)."""
+    for size in range(len(REDACTED) - 1, 0, -1):
+        if text.endswith(REDACTED[:size]):
+            return text[:-size]
+    return text
+
+
+def _settle(text: str) -> str:
+    """Redact until nothing changes. One more pass is needed when removing control codes joined a
+    credential name together ("pass\x01word=x"), or when a marker glued to the text after it
+    ("secret: [REDACTED]more") is read as part of a value again; almost always one pass confirms it."""
+    for _ in range(4):
+        again = redact(text)
+        if again == text:
+            break
+        text = again
+    return text
+
+
+def _cut(text: str, max_str: int) -> str:
+    """Cut already redacted text to max_str so that redacting it again changes nothing.
+
+    publish re-scrubs every field, so a cut that is not a fixed point of redact() would be rewritten
+    there. Two cuts are not: one inside the marker after a credential name ("password=[RED", which
+    redact() expands back to 19 characters, past the caller's limit; the partial marker is dropped),
+    and one that turns the tail into a match of its own (a key prefix that is now exactly the right
+    length; it is redacted now instead of later). A partial marker that redact() leaves alone
+    ("xxxx[RED") is kept."""
+    cut = text[:max_str]
+    for _ in range(8):
+        again = redact(cut)
+        if again == cut:
+            return cut
+        trimmed = _drop_partial_marker(cut)
+        if trimmed != cut:
+            cut = trimmed
+        elif len(again) > max_str:
+            cut = _drop_partial_marker(again[:max_str])
+        else:
+            cut = again
+    return cut
+
+
 _current_request: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_request_id", default=None)
 
 
@@ -56,9 +104,17 @@ def scrub(value: Any, *, max_str: int = 2000, max_items: int = 200, depth: int =
     """Make any value safe to send to the browser: JSON types only, no secrets, no control codes, bounded.
 
     Redaction runs before the final truncation so a key cut in half can never slip past the patterns;
-    the input is first cut to SCRUB_INPUT_LIMIT so a huge string cannot stall the caller."""
+    the input is first cut to SCRUB_INPUT_LIMIT so a huge string cannot stall the caller.
+
+    The result is a fixed point: scrubbing it again with the same (or a larger) max_str returns it
+    unchanged, so publish re-scrubbing an already scrubbed field can never make it longer: redaction
+    is repeated until it settles (see _settle) and the cut is one redact() leaves alone (see _cut)."""
     if isinstance(value, str):
-        return safe_display(redact(clean_text(value[:SCRUB_INPUT_LIMIT])))[:max_str]
+        cleaned = clean_text(value[:SCRUB_INPUT_LIMIT])
+        text = safe_display(redact(cleaned))
+        if text != cleaned:  # unchanged text is already a fixed point: skip the extra pass
+            text = _settle(text)
+        return text if len(text) <= max_str else _cut(text, max_str)
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
@@ -171,8 +227,12 @@ class EventBus:
         if self.enabled:
             self.publish(type, **data)
 
-    def emit_throttled(self, key: str, interval: float, type: str, **data: Any) -> None:
-        """`emit`, but at most one event per `key` every `interval` seconds (the rest are dropped)."""
+    def emit_throttled(self, key: str, interval: float, type: str, *, _transient: bool = False,
+                       **data: Any) -> None:
+        """`emit`, but at most one event per `key` every `interval` seconds (the rest are dropped).
+
+        High-rate streams (the voice meter) pass `_transient=True`, or minutes of them would push
+        every real event out of the replay ring."""
         if not self.enabled:
             return
         try:
@@ -184,7 +244,7 @@ class EventBus:
                 self._last_emit[key] = now
         except Exception:
             return
-        self.publish(type, **data)
+        self.publish(type, _transient=_transient, **data)
 
 
 BUS = EventBus()
@@ -195,6 +255,6 @@ def emit(type: str, **data: Any) -> None:
     BUS.emit(type, **data)
 
 
-def emit_throttled(key: str, interval: float, type: str, **data: Any) -> None:
+def emit_throttled(key: str, interval: float, type: str, *, _transient: bool = False, **data: Any) -> None:
     """Rate-limited `emit` on the shared bus."""
-    BUS.emit_throttled(key, interval, type, **data)
+    BUS.emit_throttled(key, interval, type, _transient=_transient, **data)

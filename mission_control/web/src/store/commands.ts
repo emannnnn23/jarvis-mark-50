@@ -71,9 +71,18 @@ const MULTI_LINE = "One line at a time: JARVIS takes single-line commands here";
 
 export type LineCheck = { ok: true; text: string } | { ok: false; message: string | null };
 
+/**
+ * `text` without one trailing line ending. A line copied from a terminal or an editor usually carries
+ * its newline; that is still one line, so it is pasted (and sent) without it. A second line ending,
+ * or one anywhere else, still means more than one line.
+ */
+export function withoutLineEnding(text: string): string {
+  return text.replace(/\r?\n$/u, "");
+}
+
 /** The line to send, or why not (message null: nothing to send, say nothing). */
 export function checkLine(value: string): LineCheck {
-  const text = value.trim();
+  const text = withoutLineEnding(value).trim();
   if (text === "") return { ok: false, message: null };
   if (LINE_BREAKING.test(text)) return { ok: false, message: MULTI_LINE };
   if ([...text].length > MAX_COMMAND_LENGTH) return { ok: false, message: TOO_LONG };
@@ -82,7 +91,7 @@ export function checkLine(value: string): LineCheck {
 
 /** Why a paste is refused instead of pasted (null: paste it). */
 export function pastedProblem(text: string): string | null {
-  return LINE_BREAKING.test(text) ? MULTI_LINE : null;
+  return LINE_BREAKING.test(withoutLineEnding(text)) ? MULTI_LINE : null;
 }
 
 /** The history with `line` added last (not twice in a row), at most HISTORY_KEPT lines. */

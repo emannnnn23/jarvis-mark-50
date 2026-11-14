@@ -29,6 +29,7 @@ import logging
 import secrets
 import socket
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,8 @@ SNAPSHOT_DEPTH = 6  # a bus event (scrubbed at depth 4) sits two levels down in 
 
 TICK_INTERVAL = 1.0
 METRICS_INTERVAL = 2.0
+# Consecutive empty samples from an available sampler after which SYSTEM shows "unavailable".
+METRICS_FAILURES_UNAVAILABLE = 3
 PROBE_INTERVAL = 60.0
 PROBE_MAX_AGE = 30.0  # a client that connects gets a fresh probe unless the last one is younger
 PROBE_TIMEOUT = 3.0
@@ -363,6 +366,8 @@ class Hub:
         elif kind == "confirm.resolved" and self._confirm_event is not None \
                 and self._confirm_event.get("id") == event.get("id"):
             self._confirm_event = None
+        elif kind == "llm.call":
+            self._passive_network(event)
         change = self.tracker.apply(event)
         if change is not None:
             self.bus.publish("jarvis.state", **change)  # comes back through _dispatch like any event
@@ -376,6 +381,29 @@ class Hub:
             return
         for client in receivers:
             client.send_event(event, text)
+
+    def _passive_network(self, event: dict[str, Any]) -> None:
+        """Turn a finished model call into network.status (source "passive"): a call that worked
+        proves Groq is reachable, one that failed with a network error proves it is not; other
+        failures (rate limit, bad request) say nothing about reachability and are ignored.
+
+        Published only when the answer differs from the last known status, so a busy session does
+        not spam the stream. The envelope is kept at once rather than when it comes back through
+        _dispatch, so two calls ending before that cannot both publish."""
+        if event.get("phase") != "end" or not isinstance(event.get("ok"), bool):
+            return
+        if event["ok"]:
+            groq = "up"
+        elif event.get("error_kind") == "network":
+            groq = "down"
+        else:
+            return
+        if self._network is not None and self._network.get("groq") == groq:
+            return
+        published = self.bus.publish("network.status", groq=groq, source="passive",
+                                     checked_at=int(time.time() * 1000))
+        if published is not None:
+            self._network = published
 
     # --- snapshot ---------------------------------------------------------------------------------
 
@@ -554,14 +582,22 @@ class Hub:
     async def _metrics_loop(self) -> None:
         if not self.sampler_available:
             return
+        failures = 0  # consecutive samples that came back empty
         while True:
             await asyncio.sleep(METRICS_INTERVAL)
             if not self._watched():
                 continue  # nobody is looking: do not spend CPU measuring the CPU
             sample = self.sampler.sample()  # always on this thread (see MetricsSampler)
             if sample:
+                failures = 0
                 # Transient: metrics every 2 s would otherwise push real events out of the replay ring.
                 self.bus.publish("system.metrics", _transient=True, **sample)
+            else:
+                failures += 1
+                if failures == METRICS_FAILURES_UNAVAILABLE:
+                    # psutil is there but keeps failing: say so instead of leaving SYSTEM "unknown".
+                    # The next good sample's system.metrics turns it back to online in the tracker.
+                    self.tracker.set_subsystem("system", status="unavailable", reason="system metrics failed")
 
     async def _probe_loop(self) -> None:
         while True:

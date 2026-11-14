@@ -267,6 +267,31 @@ describe("reduce", () => {
     expect(ended.taskProgress).toBeNull();
   });
 
+  it("keeps a memory store the session found corrupted degraded after memory activity", () => {
+    const corruptSession = (seq: number, memory_status: string) => ev("session.start", seq, {
+      version: "0.5.0", provider: "groq", model: "llama-3.3-70b-versatile", permission_mode: "ask",
+      voice_available: true, voice_enabled: false, mic_available: true, wake_available: false,
+      memory_status, tasks_status: "ok", developer_mode: false,
+    });
+    // Live: session.start, then the first request reads and writes the rebuilt store.
+    const live = run([snapshot(), corruptSession(51, "corrupted"), ev("memory.activity", 52, { op: "search", count: 1 }),
+      ev("memory.activity", 53, { op: "store", count: 4 })]);
+    expect(live.subsystems.memory.status).toBe("degraded");
+    expect(live.subsystems.memory.facts).toBe(4);
+    // From a snapshot whose session said corrupted.
+    const fromSnapshot = run([
+      snapshot({
+        session: corruptSession(3, "corrupted") as Snapshot["session"],
+        subsystems: { memory: { status: "degraded" } },
+      }),
+      ev("memory.activity", 51, { op: "retrieve", count: 0 }),
+    ]);
+    expect(fromSnapshot.subsystems.memory.status).toBe("degraded");
+    // A session with a sound store turns healthy on activity as before.
+    const healed = run([corruptSession(54, "ok"), ev("memory.activity", 55, { op: "search", count: 1 })], live);
+    expect(healed.subsystems.memory.status).toBe("online");
+  });
+
   it("keeps recalled hits and the stored fact total apart (memory node wording)", () => {
     const recalled = run([snapshot(), ev("memory.activity", 51, { op: "search", count: 2 })]);
     expect(nodeFacts("memory", recalled.subsystems.memory, null)).toEqual(["Recalled 2"]);

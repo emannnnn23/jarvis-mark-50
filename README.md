@@ -888,7 +888,7 @@ Two things that look like the same problem but are not:
 
 ## Mission Control
 
-Mission Control is a live 3D view of JARVIS in your browser. A holographic core shows what JARVIS is doing right now (idle, listening, thinking, running a tool, speaking, an error, or offline when the link is gone), and while JARVIS speaks the core brightens on each word. Six nodes around it show the language model, memory, tools, the system (real CPU, memory and disk figures), voice and the network. Panels show an event stream, the current multi-step task and the latest reply. You can also type commands, approve or decline confirmations, and cancel a request from the page. Everything comes from real events inside JARVIS; nothing is simulated.
+Mission Control is a live 3D view of JARVIS in your browser. A holographic core shows what JARVIS is doing right now (idle, listening, thinking, running a tool, speaking, an error, or offline when the link is gone), and while JARVIS speaks the core brightens on each word. Six nodes around it show the language model, memory, tools, the system (real CPU, memory and disk figures), voice and the network (whether Groq can be reached, from a periodic connection check and from the outcome of JARVIS's own model calls). Panels show an event stream, the current multi-step task and the latest reply. You can also type commands, approve or decline confirmations, and cancel a request from the page. Everything comes from real events inside JARVIS; nothing is simulated.
 
 It is **off by default**. With it off, JARVIS behaves exactly as described in the rest of this README.
 

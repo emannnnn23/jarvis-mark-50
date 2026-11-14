@@ -8,7 +8,8 @@ import unittest
 
 from core import events
 from core.audit import clean_text, redact, safe_display
-from core.events import BUS, EventBus, PROTOCOL_VERSION, emit, emit_throttled, scrub
+from core.events import BUS, EventBus, PROTOCOL_VERSION, PUBLISH_MAX_STR, emit, emit_throttled, scrub
+from mission_control.protocol import validate_event
 
 
 class FakeClock:
@@ -213,6 +214,32 @@ class TestEventBus(BusTestCase):
         bus.emit_throttled("other", 0.2, "voice.level", level=0.4)
         self.assertEqual([e["level"] for e in bus.recent()], [0.1, 0.3, 0.4])
 
+    def test_emit_throttled_transient_reaches_subscribers_but_not_the_ring(self) -> None:
+        clock = FakeClock()
+        bus = EventBus(clock=clock, history=3)
+        bus.enabled = True
+        seen: list[dict] = []
+        bus.subscribe(seen.append)
+        bus.emit("tool.execution", tool="read_file", status="success")
+        for i in range(10):
+            bus.emit_throttled("level", 0.2, "voice.level", _transient=True, rms=0.1, phase="armed")
+            clock.now += 0.3
+        self.assertEqual(len(seen), 11)
+        self.assertNotIn("_transient", seen[-1])
+        self.assertEqual([e["type"] for e in bus.recent()], ["tool.execution"])
+        self.assertEqual(bus.recent(0)[0]["type"], "tool.execution")
+
+    def test_module_emit_throttled_passes_transient_through(self) -> None:
+        self._guard_singleton()
+        BUS.enabled = True
+        BUS._last_emit.clear()
+        before = BUS.recent()
+        seen: list[dict] = []
+        BUS.subscribe(seen.append)
+        emit_throttled("unit-test-transient", 60.0, "voice.level", _transient=True, rms=0.2, phase="armed")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(BUS.recent(), before)
+
     def test_module_emit_throttled_uses_the_singleton(self) -> None:
         self._guard_singleton()
         BUS.enabled = True
@@ -277,6 +304,62 @@ class TestScrub(unittest.TestCase):
         out = scrub({"password": "hunter2", "note": "token=abc123"})
         self.assertNotIn("hunter2", str(out))
         self.assertNotIn("abc123", str(out))
+
+    def test_cut_inside_redacted_marker_stays_within_the_protocol_limit(self) -> None:
+        """A first cut at 500 that lands inside [REDACTED] ("password=[RED") used to be expanded again
+        by publish's own scrub to 506 characters, and the browser dropped the request.start."""
+        said = "x" * 486 + " password=hunter2 and more"
+        first = scrub(said, max_str=500)
+        self.assertLessEqual(len(first), 500)
+        self.assertFalse(first.endswith("[RED"))
+        self.assertNotIn("hunter2", first)
+        event = EventBus().publish("request.start", source="terminal", text=first)
+        self.assertLessEqual(len(event["text"]), 500)
+        self.assertEqual(validate_event(event), [])
+
+    def test_partial_marker_standing_for_a_secret_value_is_removed_after_a_cut(self) -> None:
+        marker = "[REDACTED]"
+        for keep in range(1, len(marker)):
+            with self.subTest(keep=keep):
+                head = "x" * (40 - keep) + " password="
+                out = scrub(head + "hunter2 and more", max_str=len(head) + keep)
+                self.assertEqual(out, head)
+                self.assertEqual(scrub(out, max_str=PUBLISH_MAX_STR), out)
+        whole = scrub("x" * 30 + " password=hunter2 and more", max_str=50)
+        self.assertEqual(whole, "x" * 30 + " password=" + marker)  # a complete marker is kept
+
+    def test_partial_marker_that_cannot_grow_again_is_left_alone(self) -> None:
+        # Not after a credential name, so a second scrub leaves "[RED" as it is; nothing to remove.
+        out = scrub("x" * 46 + "gsk_" + "k" * 30 + " tail", max_str=50)
+        self.assertEqual(out, "x" * 46 + "[RED")
+        self.assertEqual(scrub(out, max_str=50), out)
+
+    def test_scrub_is_idempotent_and_never_grows_past_the_first_cut(self) -> None:
+        secrets = [
+            "password=hunter2", "password = hunter2 more", 'token: "a b c"', "api_key=abc",
+            "gsk_" + "k" * 30, "my pin is 1234", "Bearer " + "t" * 20, "x-auth-token=zz",
+            "sk-" + "s" * 20, '"api_key": "v"', "secret=a", "pin code is 12",
+        ]
+        for max_str in (20, 64, 500):
+            for secret in secrets:
+                for offset in range(-len(secret) - 12, 13):
+                    prefix = max(0, max_str + offset)
+                    text = "x" * prefix + " " + secret + " and more text after it"
+                    with self.subTest(max_str=max_str, secret=secret, offset=offset):
+                        first = scrub(text, max_str=max_str)
+                        self.assertLessEqual(len(first), max_str)
+                        self.assertLessEqual(len(scrub(first, max_str=PUBLISH_MAX_STR)), max_str)
+                        self.assertEqual(scrub(first, max_str=max_str), first)
+
+    def test_scrub_is_idempotent_when_control_codes_split_a_secret_name(self) -> None:
+        """Removing control codes can join "pass\x01word" into a credential name; the second scrub
+        (publish) must not find a new secret in the first one's output."""
+        for text in ("pass\x01word=hunter2", "my\x01password=hunter2", "password\x01=hunter2",
+                     "token\x1b: abc"):
+            with self.subTest(text=text):
+                first = scrub(text)
+                self.assertEqual(scrub(first), first)
+                self.assertNotIn("hunter2", first)
 
     def test_scrub_survives_cycles(self) -> None:
         loop: list = []

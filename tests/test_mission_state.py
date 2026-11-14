@@ -465,6 +465,22 @@ class SubsystemTests(unittest.TestCase):
                 tracker.apply(session)
                 self.assertEqual(self.sub(tracker, "memory")["status"], expected)
 
+    def test_corrupted_memory_stays_degraded_after_memory_activity(self) -> None:
+        """A request still reads and writes the (rebuilt) store, but the corrupted file the session
+        started with is not fixed by that: the node must not turn healthy on the first request."""
+        tracker = StateTracker(clock=FakeClock())
+        session = copy.deepcopy(next(e for e in load_fixtures() if e["type"] == "session.start"))
+        session["memory_status"] = "corrupted"
+        tracker.apply(session)
+        for op in ("retrieve", "search", "store"):
+            tracker.apply(ev("memory.activity", op=op, count=2))
+            memory = self.sub(tracker, "memory")
+            self.assertEqual((memory["status"], memory["last_op"]), ("degraded", op))
+        session["memory_status"] = "ok"  # a new session with a healthy store
+        tracker.apply(session)
+        tracker.apply(ev("memory.activity", op="search", count=1))
+        self.assertEqual(self.sub(tracker, "memory")["status"], "online")
+
     def test_voice_follows_input_and_output(self) -> None:
         tracker = StateTracker(clock=FakeClock())
         tracker.apply(ev("voice.input", mode="wake", phase="armed"))
