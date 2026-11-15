@@ -19,19 +19,25 @@ tests, patch a function in the module that defines it (e.g. "ui.terminal.run_age
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
+import importlib.util
 import os
 import platform
+import queue
 import shlex
 import shutil
 import sys
 
 from config.settings import Config, ConfigError, SCRIPT_DIR, VERSION, load_env_file, validate_api_key
 from core.audit import audit, setup_logging
+from core.events import BUS, emit, emit_throttled
 from core.orchestrator import AgentContext
 from core.policy import PermissionPolicy
 from intelligence.groq_client import JarvisAPIError, groq, initialize_client, list_model_ids, verify_model
 from memory.json_store import MemoryStore, MemoryStoreError, load_memory
 from memory.task_store import TaskStore
+from mission_control import BUILD_COMMAND as MISSION_BUILD_COMMAND, DIST_DIR as MISSION_DIST_DIR
+from mission_control.launch import open_browser_securely
 from tools.catalog import JarvisTools, build_registry
 from ui.terminal import JarvisCLI, style, terminal_confirm
 from voice.input import GroqTranscriber, RECORDER_INSTALL_HINT, SpeechInput, detect_recorder
@@ -233,10 +239,12 @@ __all__ = [
     "safe_display",
     "select",
     "serialize_tool_result",
+    "session_start_payload",
     "setup_logging",
     "shutil",
     "signal",
     "split_into_chunks",
+    "start_mission_control",
     "strip_wake_phrase",
     "style",
     "subprocess",
@@ -301,6 +309,17 @@ def run_checks(config: Config) -> int:
     report(True if recorder else None, "microphone recorder", recorder[0] if recorder else RECORDER_INSTALL_HINT)
     wake_ok, wake_detail = wake_engine_available()
     report(True if wake_ok else None, "wake-word engine", wake_detail + (f" ({config.wake_model})" if wake_ok else ""))
+    # Found without importing it: aiohttp is only ever imported by mission_control/server.py.
+    if importlib.util.find_spec("aiohttp") is not None:
+        try:
+            aiohttp_version = importlib.metadata.version("aiohttp")
+        except importlib.metadata.PackageNotFoundError:
+            aiohttp_version = "version unknown"
+        report(True, "Mission Control server", f"aiohttp {aiohttp_version}")
+    else:
+        report(None, "Mission Control server", "aiohttp is not installed (pip install -r requirements.txt)")
+    ui_built = (MISSION_DIST_DIR / "index.html").is_file()
+    report(True if ui_built else None, "Mission Control UI", "built" if ui_built else f"not built: {MISSION_BUILD_COMMAND}")
     if config.permissions_file.exists():
         kinds = [spec.kind for spec in config.commands.values()]
         report(True, "permissions file", f"{config.permissions_file} ({kinds.count('tests')} test and "
@@ -403,6 +422,101 @@ def run_wake_test(config: Config, seconds: float = 20, detector=None, stream_fac
     return 1
 
 
+def session_start_payload(config: Config, cli: JarvisCLI, voice: VoiceEngine) -> dict:
+    """The facts Mission Control shows about this session (no secrets: the key is never included)."""
+    def store_status(store) -> str:
+        if store is None:
+            return "disabled"
+        return "corrupted" if getattr(store, "corruption_error", None) else "ok"
+
+    def available(component) -> bool:
+        try:
+            return component is not None and bool(component.availability()[0])
+        except Exception:  # noqa: BLE001 - a probe failure means "not available", never a crash
+            return False
+
+    return {
+        "version": VERSION,
+        "provider": "groq",
+        "model": config.model,
+        "permission_mode": cli.ctx.policy.mode,
+        "voice_available": available(voice),
+        "voice_enabled": bool(voice.enabled),
+        "mic_available": available(cli.speech),
+        "wake_available": cli.wake_factory is not None and bool(wake_engine_available()[0]),
+        "memory_status": store_status(cli.memory),
+        "tasks_status": store_status(cli.tasks),
+        "developer_mode": bool(cli.developer_mode),
+    }
+
+
+# Seconds between voice.level events per phase: 5 Hz while armed, 10 Hz while collecting a command.
+VOICE_LEVEL_INTERVAL = {"armed": 0.2, "collecting": 0.1}
+
+
+def publish_voice_level(phase: str, rms: float) -> None:
+    """Wake-listener level callback: a throttled voice.level for the live meter (a no-op when Mission Control is off).
+
+    Transient: at 5-10 Hz the levels would otherwise fill the replay ring within two minutes and evict
+    the real events a reloaded tab needs; a stale meter level is worthless on replay anyway."""
+    emit_throttled(f"voice.level.{phase}", VOICE_LEVEL_INTERVAL.get(phase, 0.2), "voice.level",
+                   _transient=True, rms=min(1.0, max(0.0, float(rms))), phase=phase)
+
+
+def start_mission_control(config: Config, cli: JarvisCLI, voice: VoiceEngine):
+    """Start the Mission Control server and turn the event bus on. Returns the server, or None.
+
+    While it runs, confirmations go through a ConfirmationBroker (typed in the terminal, or answered in
+    Mission Control) and the browser can send lines to the loop through a MissionBridge. Any failure
+    (aiohttp missing, port in use) is one yellow line, and the terminal works exactly as before: the
+    previous confirm callable (terminal_confirm) is put back and the bridge detached. The tokenised
+    link goes to the terminal only, never to the log or the audit trail, and the browser is opened
+    through a private redirect file so the token is not on any command line."""
+    try:
+        from mission_control.bridge import MissionBridge
+        from mission_control.confirm import ConfirmationBroker
+        from mission_control.server import MissionControlError, MissionControlServer
+    except ImportError as exc:
+        print(style(f"Mission Control is unavailable ({exc}); pip install -r requirements.txt. "
+                    "The terminal works as usual.", "yellow"))
+        return None
+    policy = cli.ctx.policy
+    previous_confirm = policy.confirm
+    broker = ConfirmationBroker(timeout=config.confirm_timeout)
+    # One slot: a browser command waits for the loop, never a queue of them.
+    bridge = MissionBridge(queue.Queue(maxsize=1), cli.request_cancel, broker)
+    server = MissionControlServer(BUS, port=config.ui_port, dist_dir=MISSION_DIST_DIR,
+                                  dev_origin=config.ui_dev_origin, bridge=bridge, broker=broker)
+    # In place before the server listens, so no browser can ever meet the terminal-only prompt.
+    policy.confirm = broker.confirm
+    cli.attach_mission(bridge)
+    try:
+        url = server.start()
+    except BaseException as exc:
+        policy.confirm = previous_confirm
+        cli.attach_mission(None)
+        if not isinstance(exc, Exception):
+            raise  # Ctrl+C during startup still leaves; the terminal state is already restored
+        if isinstance(exc, MissionControlError):
+            print(style(f"Mission Control could not start: {exc} The terminal works as usual.", "yellow"))
+        else:
+            log.warning("Mission Control failed to start", exc_info=True)
+            server.stop()
+            print(style(f"Mission Control could not start ({type(exc).__name__}). The terminal works as usual.",
+                        "yellow"))
+        return None
+    BUS.enabled = True
+    emit("session.start", **session_start_payload(config, cli, voice))
+    if cli.tasks is not None:  # a task left unfinished from last time is shown from the first frame
+        cli.tasks.publish_current()
+    link = f"{url}/#token={server.token}"
+    print(f"Mission Control: {link}")
+    audit({"event": "mission_control_start", "port": server.port})
+    if config.ui_open_browser and not open_browser_securely(link):
+        print(style("  Could not open a browser; open the link above yourself.", "dim"))
+    return server
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="JARVIS MARK 50 - personal AI assistant for Linux.")
     parser.add_argument("--text", action="store_true", help="text-only mode (no speech)")
@@ -412,6 +526,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="push-to-talk: press Enter on an empty line to speak (audio is sent to Groq)")
     parser.add_argument("--wake", action="store_true",
                         help='hands-free: say "Hey JARVIS" (detected locally), then your request')
+    parser.add_argument("--mission-control", action="store_true",
+                        help="open Mission Control, the live 3D view of JARVIS in your browser (local only)")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="with Mission Control: print its link instead of opening a browser")
     parser.add_argument("--check", action="store_true", help="check the environment and exit")
     parser.add_argument("--wake-test", action="store_true",
                         help='test "Hey JARVIS" detection with your microphone (local only) and exit')
@@ -431,6 +549,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.read_only:
         config.permission_mode = "read_only"
+    if args.mission_control:
+        config.ui_enabled = True
+    if args.no_browser:
+        config.ui_open_browser = False
     setup_logging(config)
     if args.check:
         return run_checks(config)
@@ -466,15 +588,23 @@ def main(argv: list[str] | None = None) -> int:
             threshold=config.wake_threshold, speaking_threshold=config.wake_speaking_threshold,
             end_silence=config.wake_end_silence, max_seconds=min(config.stt_max_seconds, WAKE_MAX_SECONDS),
             ignore_after_wake=CHIME_IGNORE_SECONDS if config.wake_chime and voice.player else 0.0,
+            on_level=publish_voice_level,
         )
 
     cli = JarvisCLI(AgentContext(client, config, registry, policy, memory, tasks), voice, memory,
                     speech=speech, listen=config.stt_enabled or args.listen,
                     wake_factory=make_wake_listener, wake=config.wake_enabled or args.wake)
     audit({"event": "session_start", "model": config.model, "permission_mode": config.permission_mode})
+    mission = None
     try:
+        if config.ui_enabled:
+            mission = start_mission_control(config, cli, voice)
         return cli.loop()
     finally:
+        if mission is not None:  # before voice.shutdown, so the browser sees the session end
+            emit("session.end")
+            BUS.enabled = False
+            mission.stop()
         voice.shutdown()
         speech.shutdown()
         audit({"event": "session_end"})

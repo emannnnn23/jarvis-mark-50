@@ -32,3 +32,8 @@ jarvis-tts-*/
 
 # Superpowers plan workspaces (scratch: ledgers, briefs, review packages)
 .superpowers/
+
+# Mission Control frontend: installed packages and build output (run npm ci && npm run build)
+mission_control/web/node_modules/
+mission_control/web/dist/
+*.tsbuildinfo

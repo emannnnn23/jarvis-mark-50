@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -14,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
+from helpers import BusCaptureMixin  # noqa: E402
 from voice import output  # noqa: E402
 
 
@@ -405,6 +408,276 @@ class ShutdownCancelsPendingTasksTests(unittest.TestCase):
         finally:
             loop.close()
         self.assertTrue(sleeper.cancelled())
+
+
+class VoiceOutputEventTests(BusCaptureMixin, unittest.TestCase):
+    def setUp(self):
+        self.voices: list[jarvis.VoiceEngine] = []
+
+    def tearDown(self):
+        for voice in self.voices:
+            voice.shutdown()
+
+    def make_voice(self, **kwargs) -> jarvis.VoiceEngine:
+        kwargs.setdefault("player", ["fake-player"])
+        kwargs.setdefault("notify", lambda message: None)
+        voice = jarvis.VoiceEngine(**kwargs)
+        self.voices.append(voice)
+        return voice
+
+    @staticmethod
+    def phases(events):
+        return [e["phase"] for e in events if e["type"] == "voice.output"]
+
+    def test_voice_output_start_end_events(self):
+        events = self.capture_events()
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def fake_play(path):
+            pass
+
+        voice._play = fake_play
+        voice.say("First sentence. Second sentence.").result(timeout=5)
+        outputs = [e for e in events if e["type"] == "voice.output"]
+        # one start and one end per spoken reply (not per chunk); each played part is announced as a chunk
+        self.assertEqual([e["phase"] for e in outputs], ["start", "chunk", "end"])
+        self.assertTrue(all(e["timing"] == "none" for e in outputs))
+        self.assertIsInstance(outputs[-1]["duration_ms"], int)
+        self.assert_valid(events)
+
+    def test_voice_output_error_event_when_synthesis_fails(self):
+        events = self.capture_events()
+
+        def failing(text, name, path):
+            raise RuntimeError("tts service down")
+
+        voice = self.make_voice(enabled=True, synthesize=failing)
+        voice.say("Hello there.").result(timeout=5)
+        self.assertEqual(self.phases(events), ["start", "error"])
+        self.assert_valid(events)
+
+    def test_interrupted_speech_still_ends(self):
+        events = self.capture_events()
+        playing = threading.Event()
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def endless_play(path):
+            playing.set()
+            await asyncio.sleep(30)
+
+        voice._play = endless_play
+        voice.say("Hello there.")
+        self.assertTrue(playing.wait(5))
+        voice.stop()
+        deadline = time.monotonic() + 5
+        while "end" not in self.phases(events) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.phases(events), ["start", "chunk", "end"])
+
+    def test_no_events_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def fake_play(path):
+            pass
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+        self.assertEqual(events, [])
+
+    def test_override_synthesis_sends_a_chunk_without_timings(self):
+        events = self.capture_events()
+        voice = self.make_voice(enabled=True, synthesize=lambda text, name, path: None)
+
+        async def fake_play(path):
+            pass
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+        chunks = [e for e in events if e["type"] == "voice.output" and e["phase"] == "chunk"]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["index"], 0)
+        self.assertEqual(chunks[0]["timing"], "none")
+        self.assertEqual(chunks[0]["words"], [])
+        self.assertNotIn("duration_ms", chunks[0])
+        self.assert_valid(events)
+
+
+class FakeCommunicate:
+    """Stands in for edge_tts.Communicate: records how it was built and what was called on it.
+
+    `stream()` yields what the real service sends: audio frames and, when asked for word boundaries,
+    WordBoundary items whose offset and duration are in 100 ns ticks."""
+
+    instances: list["FakeCommunicate"] = []
+    AUDIO = (b"ID3-frame-one|", b"frame-two|", b"frame-three")
+    # (offset, duration) in ticks: 100 ms + 250 ms, 400 ms + 300 ms.
+    BOUNDARIES = ((1_000_000, 2_500_000), (4_000_000, 3_000_000))
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.saved_to: str | None = None
+        self.streamed = False
+        FakeCommunicate.instances.append(self)
+
+    async def stream(self):
+        self.streamed = True
+        yield {"type": "audio", "data": self.AUDIO[0]}
+        yield {"type": "WordBoundary", "offset": self.BOUNDARIES[0][0], "duration": self.BOUNDARIES[0][1],
+               "text": "Hello"}
+        yield {"type": "audio", "data": self.AUDIO[1]}
+        yield {"type": "WordBoundary", "offset": self.BOUNDARIES[1][0], "duration": self.BOUNDARIES[1][1],
+               "text": "there"}
+        yield {"type": "audio", "data": self.AUDIO[2]}
+
+    async def save(self, path):
+        self.saved_to = path
+        Path(path).write_bytes(b"saved-audio")
+
+
+class WordBoundaryTests(BusCaptureMixin, unittest.TestCase):
+    """The real edge-tts path, with a fake edge_tts module: word timings only while Mission Control runs."""
+
+    def setUp(self):
+        FakeCommunicate.instances = []
+        fake_module = mock.MagicMock()
+        fake_module.Communicate = FakeCommunicate
+        patcher = mock.patch.dict("sys.modules", {"edge_tts": fake_module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.voices: list[jarvis.VoiceEngine] = []
+
+    def tearDown(self):
+        for voice in self.voices:
+            voice.shutdown()
+
+    def make_voice(self) -> jarvis.VoiceEngine:
+        voice = jarvis.VoiceEngine(enabled=True, player=["fake-player"], notify=lambda message: None)
+        self.voices.append(voice)
+        return voice
+
+    def test_word_boundaries_streamed_when_bus_enabled(self):
+        events = self.capture_events()
+        voice = self.make_voice()
+        played: list[tuple[bytes, list[str]]] = []
+
+        async def fake_play(path):
+            played.append((Path(path).read_bytes(), [e["phase"] for e in events if e["type"] == "voice.output"]))
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+
+        self.assertEqual(len(FakeCommunicate.instances), 1)
+        communicate = FakeCommunicate.instances[0]
+        self.assertEqual(communicate.args, ("Hello there.", voice.voice))
+        self.assertEqual(communicate.kwargs, {"boundary": "WordBoundary"})
+        self.assertTrue(communicate.streamed)
+        self.assertIsNone(communicate.saved_to)
+        audio = b"".join(FakeCommunicate.AUDIO)
+        self.assertEqual(played, [(audio, ["start", "chunk"])])  # the chunk is announced right before playing
+
+        outputs = [e for e in events if e["type"] == "voice.output"]
+        self.assertEqual([e["phase"] for e in outputs], ["start", "chunk", "end"])
+        chunk = outputs[1]
+        self.assertEqual(chunk["index"], 0)
+        self.assertEqual(chunk["timing"], "exact")
+        self.assertEqual(chunk["words"], [[100, 250], [400, 300]])  # 100 ns ticks -> ms
+        self.assertEqual(chunk["duration_ms"], round(len(audio) * 8 / output.EDGE_TTS_BITRATE_BPS * 1000))
+        self.assert_valid(events)
+
+    def test_synthesize_returns_word_timings_in_ms(self):
+        self.capture_events()
+        voice = self.make_voice()
+        path = voice._tmpdir / "direct.mp3"
+        words = asyncio.run(voice._synthesize("Hello there.", path))
+        self.assertEqual(words, [(100, 250), (400, 300)])
+        self.assertEqual(path.read_bytes(), b"".join(FakeCommunicate.AUDIO))
+
+    def speak_with_stream(self, items: list[dict]) -> tuple[list[dict], list[bytes]]:
+        """Speak "Hello there." with a stream that yields exactly `items`; return the events and played bytes."""
+
+        class ScriptedCommunicate(FakeCommunicate):
+            async def stream(self):
+                self.streamed = True
+                for item in items:
+                    yield item
+
+        sys.modules["edge_tts"].Communicate = ScriptedCommunicate
+        events = self.capture_events()
+        voice = self.make_voice()
+        played: list[bytes] = []
+
+        async def fake_play(path):
+            played.append(Path(path).read_bytes())
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+        return events, played
+
+    def test_malformed_word_boundary_is_skipped_and_speech_still_plays(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"one|"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": 2_500_000, "text": "Hello"},
+            {"type": "WordBoundary", "offset": "soon", "duration": 2_000_000, "text": "bad offset"},
+            {"type": "WordBoundary", "offset": 3_000_000, "text": "no duration"},
+            {"type": "WordBoundary", "offset": None, "duration": True, "text": "not numbers"},
+            {"type": "WordBoundary", "offset": float("nan"), "duration": 1_000_000, "text": "nan"},
+            {"type": "audio", "data": b"two"},
+            {"type": "WordBoundary", "offset": 4_000_000, "duration": 3_000_000, "text": "there"},
+        ])
+        self.assertEqual(played, [b"one|two"])
+        outputs = [e for e in events if e["type"] == "voice.output"]
+        self.assertEqual([e["phase"] for e in outputs], ["start", "chunk", "end"])
+        self.assertEqual(outputs[1]["timing"], "exact")
+        self.assertEqual(outputs[1]["words"], [[100, 250], [400, 300]])
+        self.assert_valid(events)
+
+    def test_huge_integer_word_boundary_is_skipped_and_speech_still_plays(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"one|"},
+            {"type": "WordBoundary", "offset": 10 ** 400, "duration": 2_000_000, "text": "huge offset"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": -(10 ** 400), "text": "huge negative"},
+            {"type": "WordBoundary", "offset": 1_000_000, "duration": 2_500_000, "text": "Hello"},
+            {"type": "audio", "data": b"two"},
+        ])
+        self.assertEqual(played, [b"one|two"])
+        chunks = [e for e in events if e["type"] == "voice.output" and e["phase"] == "chunk"]
+        self.assertEqual([c["words"] for c in chunks], [[[100, 250]]])
+        self.assert_valid(events)
+
+    def test_audio_without_word_boundaries_sends_a_chunk_without_timings(self):
+        events, played = self.speak_with_stream([
+            {"type": "audio", "data": b"only-audio"},
+        ])
+        self.assertEqual(played, [b"only-audio"])
+        chunks = [e for e in events if e["type"] == "voice.output" and e["phase"] == "chunk"]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["timing"], "none")
+        self.assertEqual(chunks[0]["words"], [])
+        self.assert_valid(events)
+
+    def test_save_path_unchanged_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        voice = self.make_voice()
+        played: list[bytes] = []
+
+        async def fake_play(path):
+            played.append(Path(path).read_bytes())
+
+        voice._play = fake_play
+        voice.say("Hello there.").result(timeout=5)
+
+        self.assertEqual(len(FakeCommunicate.instances), 1)
+        communicate = FakeCommunicate.instances[0]
+        self.assertEqual(communicate.args, ("Hello there.", voice.voice))
+        self.assertEqual(communicate.kwargs, {})  # exactly Communicate(text, voice), as before
+        self.assertFalse(communicate.streamed)
+        self.assertIsNotNone(communicate.saved_to)
+        self.assertEqual(played, [b"saved-audio"])
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from core.audit import clean_text, contains_secret, log, redact, safe_display
+from core.events import BUS, emit
 
 
 MAX_FACTS = 500
@@ -167,6 +168,8 @@ class MemoryStore:
                 save_memory(self.data, self.path)
             except (OSError, UnicodeError, ValueError, TypeError) as exc:
                 raise MemoryStoreError(f"Could not save memory to {self.path}: {exc}") from exc
+            if BUS.enabled:  # every committed write: the browser pulses the memory node
+                emit("memory.activity", op="store", count=len(self.data["facts"]))
 
     def reset_corrupted(self) -> Path:
         """Move a corrupted memory file aside and start fresh. Returns the backup path."""
@@ -276,7 +279,9 @@ class MemoryStore:
         with self._lock:
             facts = list(self.data["facts"])
         if not query.strip():
-            return [dict(f) for f in reversed(facts)][:limit]
+            found = [dict(f) for f in reversed(facts)][:limit]
+            emit("memory.activity", op="search", count=len(found))
+            return found
         wanted = _tokens(query)
         lowered = query.lower().strip()
         scored = []
@@ -285,7 +290,9 @@ class MemoryStore:
             if overlap or lowered in fact["text"].lower():
                 scored.append((overlap, position, fact))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [dict(item[2]) for item in scored[:limit]]
+        found = [dict(item[2]) for item in scored[:limit]]
+        emit("memory.activity", op="search", count=len(found))
+        return found
 
     def get_relevant_memories(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         """Up to `limit` facts for the prompt: relevant first, then high-priority, then recent."""
@@ -298,7 +305,9 @@ class MemoryStore:
             priority = 1 if fact.get("priority") == "high" else 0
             scored.append((relevance, priority, position, fact))
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        return [dict(item[3]) for item in scored[:limit]]
+        found = [dict(item[3]) for item in scored[:limit]]
+        emit("memory.activity", op="retrieve", count=len(found))
+        return found
 
     # -- profile and conversations -----------------------------------------
     def profile(self) -> dict[str, Any]:

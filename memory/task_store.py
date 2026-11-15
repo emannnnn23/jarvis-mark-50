@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from core.audit import clean_text, log, redact
+from core.events import BUS, emit
 from memory.json_store import _now_iso, save_memory
 
 
@@ -155,6 +156,22 @@ def count_done_steps(task: dict[str, Any]) -> int:
     return sum(1 for step in task["steps"] if step.get("status") in ("done", "skipped"))
 
 
+def task_view(task: dict[str, Any]) -> dict[str, Any]:
+    """The part of a task the browser may see: goal, steps and status, never actions, evidence or errors.
+
+    Pure, so it is safe to call on any copy. Step numbers are 1-based, like `update_task` uses them."""
+    return {
+        "id": task["id"],
+        "goal": task["goal"],
+        "status": task["status"],
+        "steps": [{"n": number, "text": step["text"], "status": step["status"]}
+                  for number, step in enumerate(task["steps"], start=1)],
+        "updated_at": task["updated_at"] or "",
+        "paused_reason": task["paused_reason"],
+        "untrusted_plan": bool(task["untrusted_plan"]),
+    }
+
+
 class TaskStore:
     """JSON-backed task records. Every method returns copies, never the live stored dicts."""
 
@@ -235,7 +252,8 @@ class TaskStore:
             self.corruption_error = None
             self.data = {"tasks": []}
             self.save()
-            return backup
+        self.publish_current()
+        return backup
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -249,6 +267,24 @@ class TaskStore:
             except BaseException:
                 self.data = snapshot
                 raise
+        self.publish_current()  # only a committed save gets here; a rollback re-raised above
+
+    def current_view(self) -> dict[str, Any] | None:
+        """The task Mission Control shows: the active one, else the most recently updated unfinished one."""
+        task = self.active()
+        if task is None:
+            unfinished = self.unfinished()
+            task = unfinished[0] if unfinished else None
+        return task_view(task) if task is not None else None
+
+    def publish_current(self) -> None:
+        """Tell Mission Control the task changed. Never raises: telemetry must not undo a saved change."""
+        if not BUS.enabled:
+            return
+        try:
+            emit("task.update", task=self.current_view())
+        except Exception:  # noqa: BLE001
+            log.debug("could not publish the task update", exc_info=True)
 
     def _trim(self) -> None:
         """Keep at most MAX_TASKS tasks, dropping the oldest finished ones. Unfinished are never dropped."""

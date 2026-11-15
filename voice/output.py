@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import wave
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Callable
 
 from config.settings import DEFAULT_VOICE
 from core.audit import log
+from core.events import BUS, emit
 
 
 AUDIO_PLAYERS = (
@@ -104,6 +106,43 @@ def split_into_chunks(text: str, max_chars: int = 350) -> list[str]:
     return chunks
 
 
+# edge-tts always sends "audio-24khz-48kbitrate-mono-mp3": constant 48 kbps, so bytes give the length.
+EDGE_TTS_BITRATE_BPS = 48_000
+# WordBoundary offsets and durations are in 100 ns ticks.
+TICKS_PER_MS = 10_000
+
+
+def _ticks(value: Any) -> float | None:
+    """A WordBoundary offset or duration as a finite, non-negative number of ticks, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        ticks = float(value)  # an int beyond the float range raises OverflowError here
+    except OverflowError:
+        return None
+    return ticks if math.isfinite(ticks) and ticks >= 0 else None
+
+
+async def _stream_to_file(communicate: Any, path: Path) -> list[tuple[int, int]]:
+    """Write a Communicate stream's audio to `path` (as `save()` does) and collect its word windows in ms.
+
+    Word timings only decorate the browser view, so a boundary item that is malformed (missing or
+    non-numeric offset or duration) is skipped: it must never cost the person the spoken reply."""
+    words: list[tuple[int, int]] = []
+    with open(path, "wb") as audio:
+        async for message in communicate.stream():
+            kind = message.get("type")
+            if kind == "audio":
+                audio.write(message["data"])
+            elif kind == "WordBoundary":
+                offset, duration = _ticks(message.get("offset")), _ticks(message.get("duration"))
+                if offset is None or duration is None:
+                    log.debug("Skipped a malformed WordBoundary item from edge-tts")
+                    continue
+                words.append((round(offset / TICKS_PER_MS), round(duration / TICKS_PER_MS)))
+    return words
+
+
 async def _cancel_pending_tasks() -> None:
     tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
     for task in tasks:
@@ -170,15 +209,26 @@ class VoiceEngine:
             self._thread.start()
         return self._loop
 
-    async def _synthesize(self, text: str, path: Path) -> None:
+    async def _synthesize(self, text: str, path: Path) -> list[tuple[int, int]] | None:
+        """Write `text` as MP3 to `path`; return its word timings as (offset_ms, duration_ms), or None.
+
+        Word timings are only worth asking for while Mission Control is running (they drive the core's
+        speech pulse), so only then is the stream read item by item. Otherwise the call is exactly the
+        long-standing `Communicate(text, voice).save(path)`. An override (tests, other engines) has no
+        timings: None tells `speak` to send the chunk with timing "none".
+        """
         if self._synthesize_override is not None:
             result = self._synthesize_override(text, self.voice, path)
             if asyncio.iscoroutine(result):
                 await result
-            return
+            return None
         import edge_tts
-        communicate = edge_tts.Communicate(text, self.voice)
-        await asyncio.wait_for(communicate.save(str(path)), timeout=30)
+        if not BUS.enabled:
+            communicate = edge_tts.Communicate(text, self.voice)
+            await asyncio.wait_for(communicate.save(str(path)), timeout=30)
+            return None
+        communicate = edge_tts.Communicate(text, self.voice, boundary="WordBoundary")
+        return await asyncio.wait_for(_stream_to_file(communicate, path), timeout=30)
 
     async def _play(self, path: Path) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -207,19 +257,51 @@ class VoiceEngine:
             self._lock = asyncio.Lock()
         async with self._lock:
             paths = [self._tmpdir / f"{uuid.uuid4().hex}.mp3" for _ in chunks]
+            started = time.monotonic()
+            emit("voice.output", phase="start", timing="none")
             pending = asyncio.ensure_future(self._synthesize(chunks[0], paths[0]))
+            outcome = "end"
             try:
                 for index in range(len(chunks)):
-                    await pending
+                    words = await pending
                     if index + 1 < len(chunks):
                         pending = asyncio.ensure_future(self._synthesize(chunks[index + 1], paths[index + 1]))
+                    if BUS.enabled:  # announced right before playing, so the browser can line the pulse up
+                        self._emit_chunk(index, words, paths[index])
                     await self._play(paths[index])
                     paths[index].unlink(missing_ok=True)
+            except asyncio.CancelledError:
+                raise  # an interruption (barge-in, /voice off) still ends the speech below
+            except BaseException:
+                outcome = "error"
+                raise
             finally:
                 if not pending.done():
                     pending.cancel()
                 for path in paths:
                     path.unlink(missing_ok=True)
+                if BUS.enabled:  # always closes the start above, or the browser would show JARVIS speaking forever
+                    emit("voice.output", phase=outcome, timing="none",
+                         duration_ms=round((time.monotonic() - started) * 1000))
+
+    @staticmethod
+    def _emit_chunk(index: int, words: list[tuple[int, int]] | None, path: Path) -> None:
+        """Publish `voice.output` chunk: the word windows of the part about to play, when known.
+
+        edge-tts sends constant-bitrate MP3, so the part's length follows from its size; an override's
+        file format is unknown, so it gets no duration and timing "none". A stream that reported no
+        word at all is also "none", so the browser falls back to its plain speaking breath.
+        """
+        if not words:
+            emit("voice.output", phase="chunk", index=index, words=[], timing="none")
+            return
+        payload: dict[str, Any] = {"index": index, "words": [[offset, duration] for offset, duration in words],
+                                   "timing": "exact"}
+        try:
+            payload["duration_ms"] = round(path.stat().st_size * 8 / EDGE_TTS_BITRATE_BPS * 1000)
+        except OSError:
+            pass
+        emit("voice.output", phase="chunk", **payload)
 
     async def _speak_safely(self, text: str) -> None:
         try:

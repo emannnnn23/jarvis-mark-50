@@ -1,0 +1,1603 @@
+/*
+ * JARVIS Mission Control: a holographic instrument, not a dashboard.
+ * Near-black void, cyan and electric-blue light, amber only where a person's attention is needed.
+ * Glass panels sit at the edges; the centre belongs to the core.
+ * Fonts come from the system (the page's CSP allows no font CDN): Michroma for the few engraved names,
+ * Inter at light weights for everything read.
+ */
+
+:root {
+  --void: #04070b;
+  --glass: rgba(9, 17, 25, 0.58);
+  --glass-edge: rgba(111, 231, 245, 0.16);
+  --glass-hi: rgba(196, 247, 255, 0.06);
+  --holo: #6fe7f5;
+  --holo-dim: #3f8b98;
+  --volt: #2e7cf6;
+  --amber: #ffb547;
+  --amber-deep: #ff8a3d;
+  --ice: #ddf3fa;
+  --mist: #8aa3b3;
+  --faint: #536877;
+
+  --font-display: "Michroma", "Inter", "DejaVu Sans", system-ui, sans-serif;
+  --font-text: "Inter", "Lato", "DejaVu Sans", system-ui, sans-serif;
+
+  --step--1: 0.6875rem; /* 11px: units, meta */
+  --step-0: 0.8125rem;  /* 13px: HUD text */
+  --step-1: 0.9375rem;  /* 15px */
+  --step-3: 1.625rem;   /* 26px: the state word */
+
+  --gutter: 20px;
+  --side: 252px;
+  --volt-text: #8db9ff;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--void);
+  color: var(--ice);
+  font-family: var(--font-text);
+  font-size: var(--step-0);
+  font-weight: 300;
+  line-height: 1.45;
+  font-feature-settings: "tnum" 1, "cv11" 1;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* --- frame ------------------------------------------------------------------------------------- */
+
+.hud {
+  position: fixed;
+  inset: 0;
+}
+
+.hud-scene,
+.hud-vignette,
+.hud-overlay {
+  position: absolute;
+  inset: 0;
+}
+
+.scene-canvas {
+  display: block;
+}
+
+.hud-vignette {
+  pointer-events: none;
+  background: radial-gradient(ellipse 75% 70% at 50% 48%, transparent 55%, rgba(2, 4, 7, 0.72) 100%);
+}
+
+/*
+ * Wide screens: a column docked on each side (width --side, from cameraFit.ts so the camera frames the
+ * node ring between them), the scene's top centre for view controls, and the bottom centre reserved
+ * for the command bar dock. Columns let the pointer through to the scene; only their panels catch it.
+ */
+.hud-overlay {
+  pointer-events: none;
+  display: grid;
+  grid-template-columns: var(--side) minmax(0, 1fr) var(--side);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "top top top"
+    "left center banner"
+    "left center right"
+    "left dock right";
+  padding: var(--gutter);
+  gap: 14px;
+}
+
+.topbar {
+  grid-area: top;
+}
+
+.topbar,
+.panel,
+.banner,
+.button,
+.node-label,
+.command-row,
+.command-reply,
+.command-notice {
+  pointer-events: auto;
+}
+
+/* Top right, above the task and the events: clear of the core and of the LLM CORE node. */
+.hud-banner {
+  grid-area: banner;
+  min-width: 0;
+}
+
+.hud-banner:empty {
+  display: none;
+}
+
+/* Top left of the scene's middle: clear of LLM CORE above the core and of MEMORY to the left. */
+.hud-center {
+  grid-area: center;
+  justify-self: start;
+  align-self: start;
+}
+
+.hud-left,
+.hud-right {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
+.hud-left {
+  grid-area: left;
+}
+
+/* The system monitor keeps its place at the bottom left; node details open above it. */
+.hud-left > .system-panel {
+  margin-top: auto;
+}
+
+.hud-right {
+  grid-area: right;
+  overflow: hidden;
+}
+
+/* The command bar's place, at every size: 64 px tall (cameraFit.ts DOCK_HEIGHT keeps the node ring above
+   it). The latest reply and any notice float above the bar without changing the row's height. */
+.hud-dock {
+  grid-area: dock;
+  justify-self: center;
+  position: relative;
+  width: min(640px, 100%);
+  min-height: 64px;
+}
+
+/* The open approval: the scene's middle column, resting on the dock. */
+.hud-approval {
+  grid-column: 2;
+  grid-row: 2 / 4;
+  align-self: end;
+  justify-self: center;
+  width: min(680px, 100%);
+  max-height: 100%;
+  min-height: 0;
+  display: flex;
+  z-index: 4;
+}
+
+.hud-approval:empty {
+  display: none;
+}
+
+.scene-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  color: var(--mist);
+  gap: 4px;
+}
+
+.scene-fallback p {
+  margin: 0;
+}
+
+/* The WebGL context was lost: cover the frozen picture so it is never mistaken for a live one. */
+.scene-lost {
+  background: rgba(4, 7, 11, 0.86);
+  gap: 8px;
+}
+
+/* --- glass ------------------------------------------------------------------------------------- */
+
+.panel,
+.banner,
+.topbar {
+  background: var(--glass);
+  border: 1px solid var(--glass-edge);
+  box-shadow: inset 0 1px 0 var(--glass-hi), 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+}
+
+/* An HD 620 pays for every blurred pixel: Low quality draws plain tinted glass. */
+.quality-low .panel,
+.quality-low .banner,
+.quality-low .topbar,
+.quality-low .command-row,
+.quality-low .command-reply {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(9, 17, 25, 0.82);
+}
+
+/* --- top bar ----------------------------------------------------------------------------------- */
+
+.topbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 24px;
+  min-height: 56px;
+  padding: 8px 18px;
+  border-radius: 2px;
+  border-width: 0 0 1px;
+  background: linear-gradient(to bottom, rgba(9, 17, 25, 0.66), rgba(9, 17, 25, 0.36));
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: var(--step-1);
+  letter-spacing: 0.32em;
+  color: var(--holo);
+}
+
+.brand-mark {
+  font-weight: 200;
+  font-size: var(--step-1);
+  color: var(--ice);
+  letter-spacing: 0.04em;
+}
+
+.brand-version {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.state-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 12px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.state-word {
+  font-size: var(--step-3);
+  font-weight: 200;
+  letter-spacing: 0.01em;
+  color: var(--ice);
+  transition: color 400ms ease;
+}
+
+.state-processing .state-word,
+.state-tool .state-word {
+  color: #8db9ff;
+}
+
+.state-error .state-word,
+.state-attention .state-word {
+  color: var(--amber);
+}
+
+.state-offline .state-word {
+  color: var(--faint);
+}
+
+.state-detail {
+  color: var(--holo);
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.state-error .state-detail {
+  color: var(--amber);
+}
+
+.state-since {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.session {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 18px;
+  min-width: 0;
+}
+
+.session-facts {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: auto auto;
+  column-gap: 16px;
+  margin: 0;
+  min-width: 0;
+}
+
+.session-facts dt {
+  grid-row: 1;
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.session-facts dd {
+  grid-row: 2;
+  margin: 0;
+  color: var(--mist);
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--mist);
+  white-space: nowrap;
+}
+
+.link-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.link-open .link-dot {
+  background: var(--holo);
+  box-shadow: 0 0 8px var(--holo);
+}
+
+.link-open {
+  color: var(--ice);
+}
+
+.link-reconnecting .link-dot,
+.link-connecting .link-dot {
+  background: var(--holo-dim);
+  animation: blink 1.2s ease-in-out infinite;
+}
+
+.link-auth_failed .link-dot,
+.link-too_many_clients .link-dot,
+.link-no_token .link-dot {
+  background: var(--amber);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* --- banner ------------------------------------------------------------------------------------ */
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 16px;
+  border-radius: 2px;
+  border-left: 2px solid var(--holo-dim);
+}
+
+.banner-attention {
+  border-left-color: var(--amber);
+}
+
+.banner-text {
+  display: grid;
+  gap: 2px;
+  flex: 1;
+}
+
+.banner-text strong {
+  font-weight: 500;
+  font-size: var(--step-1);
+}
+
+.banner-attention strong {
+  color: var(--amber);
+}
+
+.banner-text span {
+  color: var(--mist);
+}
+
+.button {
+  font: inherit;
+  font-weight: 400;
+  color: var(--ice);
+  background: rgba(111, 231, 245, 0.08);
+  border: 1px solid var(--glass-edge);
+  border-radius: 2px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.button:hover {
+  background: rgba(111, 231, 245, 0.16);
+}
+
+.button:focus-visible,
+.icon-button:focus-visible,
+.select:focus-visible,
+.event-line:focus-visible,
+.node-label:focus-visible,
+.quality-option input:focus-visible {
+  outline: 1px solid var(--holo);
+  outline-offset: 2px;
+}
+
+.button:disabled {
+  color: var(--faint);
+  cursor: default;
+  background: transparent;
+}
+
+.button[aria-pressed="true"],
+.button[aria-expanded="true"] {
+  border-color: rgba(111, 231, 245, 0.45);
+  background: rgba(111, 231, 245, 0.14);
+}
+
+.button-small {
+  padding: 3px 10px;
+  font-size: var(--step--1);
+}
+
+.icon-button {
+  font: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--mist);
+  background: none;
+  border: 0;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: var(--ice);
+}
+
+.select {
+  font: inherit;
+  font-size: var(--step--1);
+  color: var(--ice);
+  background: rgba(9, 17, 25, 0.9);
+  border: 1px solid var(--glass-edge);
+  border-radius: 2px;
+  padding: 2px 4px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.reset-view {
+  margin-top: 2px;
+}
+
+/* --- panels ------------------------------------------------------------------------------------ */
+
+.panel {
+  border-radius: 2px;
+  padding: 14px 16px 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.panel-stale {
+  opacity: 0.6;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: var(--step-1);
+  font-weight: 400;
+  color: var(--ice);
+}
+
+.panel-meta {
+  color: var(--faint);
+  font-size: var(--step--1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-note {
+  margin: 0;
+  color: var(--mist);
+}
+
+.metric {
+  display: grid;
+  gap: 4px;
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+}
+
+.metric-label {
+  color: var(--mist);
+}
+
+.metric-value {
+  color: var(--ice);
+  font-weight: 400;
+}
+
+.metric-detail {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.meter {
+  height: 3px;
+  background: rgba(111, 231, 245, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--holo);
+  border-radius: 2px;
+  transition: width 600ms ease;
+}
+
+.meter-high .meter-fill {
+  background: var(--amber);
+}
+
+.cpu-trace {
+  width: 100%;
+  height: 30px;
+  margin-top: -4px;
+}
+
+.cpu-trace-mid {
+  stroke: rgba(111, 231, 245, 0.1);
+  stroke-width: 1;
+  stroke-dasharray: 2 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.cpu-trace-line {
+  fill: none;
+  stroke: var(--holo);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 14px;
+  margin: 2px 0 0;
+}
+
+.facts dt {
+  color: var(--mist);
+}
+
+.facts dd {
+  margin: 0;
+  text-align: right;
+  white-space: pre;
+}
+
+/* --- node details -------------------------------------------------------------------------------- */
+
+.node-detail .panel-head {
+  align-items: center;
+}
+
+.node-detail-name {
+  font-family: var(--font-display);
+  font-size: 11px !important;
+  letter-spacing: 0.24em;
+  flex: 1;
+}
+
+.node-detail-status {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  color: var(--holo);
+}
+
+.node-detail.node-degraded .node-detail-status {
+  color: var(--amber);
+}
+
+.node-detail.node-offline .node-detail-status {
+  color: var(--amber-deep);
+}
+
+.node-detail.node-unknown .node-detail-status,
+.node-detail.node-unavailable .node-detail-status {
+  color: var(--faint);
+}
+
+.facts-detail dd {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.detail-subhead {
+  margin: 4px 0 0;
+  font-size: var(--step--1);
+  font-weight: 400;
+  color: var(--mist);
+}
+
+.tool-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.tool-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tool-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-result {
+  color: var(--mist);
+  white-space: nowrap;
+}
+
+.tool-error .tool-result,
+.tool-denied .tool-result {
+  color: var(--amber);
+}
+
+.meter-live .meter-fill {
+  transition: width 120ms linear;
+}
+
+/* --- task -------------------------------------------------------------------------------------- */
+
+.task-panel {
+  flex: 0 0 auto;
+  max-height: 44%;
+  overflow-y: auto;
+}
+
+.task-goal {
+  margin: 0;
+  font-size: var(--step-1);
+  font-weight: 300;
+  color: var(--ice);
+}
+
+.task-warning {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--amber);
+  background: rgba(255, 181, 71, 0.07);
+  color: var(--amber);
+}
+
+.task-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.task-step {
+  display: grid;
+  grid-template-columns: 12px 1fr;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--mist);
+}
+
+.step-mark {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--holo-dim);
+  transform: translateY(-1px);
+}
+
+.step-in_progress {
+  color: var(--ice);
+}
+
+.step-in_progress .step-mark {
+  border-color: var(--holo);
+  box-shadow: 0 0 6px var(--holo), inset 0 0 0 2px var(--void);
+  background: var(--holo);
+}
+
+.step-done .step-mark {
+  background: var(--holo-dim);
+  border-color: var(--holo-dim);
+}
+
+.step-done .step-text,
+.step-skipped .step-text {
+  color: var(--faint);
+}
+
+.step-skipped .step-mark {
+  border-style: dashed;
+}
+
+.step-failed {
+  color: var(--amber);
+}
+
+.step-failed .step-mark {
+  border-color: var(--amber);
+}
+
+.task-progress {
+  margin: 0;
+  color: var(--holo);
+  font-size: var(--step--1);
+}
+
+/* --- event stream ------------------------------------------------------------------------------ */
+
+.stream-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 180px;
+  position: relative;
+  padding-bottom: 8px;
+}
+
+.stream-head {
+  align-items: center;
+}
+
+.stream-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.stream-paused {
+  margin: 0;
+  color: var(--holo);
+  font-size: var(--step--1);
+}
+
+.event-list {
+  list-style: none;
+  margin: 0 -8px;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
+.event-line {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 8px;
+  font: inherit;
+  text-align: left;
+  color: var(--ice);
+  background: none;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.event-line:hover,
+.event-line[aria-expanded="true"] {
+  background: rgba(111, 231, 245, 0.06);
+}
+
+.event-time {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+/* Two lines at most in the list; the whole line once the row is expanded. */
+.event-status {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.event-line[aria-expanded="true"] .event-status {
+  display: block;
+}
+
+/* Category chips: hue carries the family (thinking and acting in electric blue, what JARVIS keeps in
+   cyan, the plumbing in grey); amber is reserved for rows that need attention. */
+.chip {
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 4px 2px;
+  border: 1px solid rgba(138, 163, 179, 0.3);
+  border-radius: 2px;
+  color: var(--mist);
+  min-width: 4.4em;
+  text-align: center;
+  transform: translateY(-1px);
+}
+
+.chip-llm,
+.chip-tool,
+.chip-request {
+  color: var(--volt-text);
+  border-color: rgba(46, 124, 246, 0.45);
+}
+
+.chip-memory,
+.chip-task {
+  color: var(--holo);
+  border-color: rgba(111, 231, 245, 0.35);
+}
+
+.chip-notice {
+  color: var(--ice);
+}
+
+.event-attention .chip {
+  color: var(--amber);
+  border-color: rgba(255, 181, 71, 0.5);
+}
+
+.event-attention .event-status {
+  color: var(--amber);
+}
+
+.event-detail {
+  margin: 2px 8px 8px;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  font: inherit;
+  font-size: var(--step--1);
+  color: var(--mist);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: rgba(4, 7, 11, 0.55);
+  border-left: 1px solid var(--glass-edge);
+}
+
+.stream-empty {
+  align-self: start;
+}
+
+.jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  background: rgba(9, 17, 25, 0.95);
+}
+
+/* --- view menu --------------------------------------------------------------------------------- */
+
+.view-menu {
+  position: relative;
+}
+
+.view-menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 10px);
+  z-index: 5;
+  width: 260px;
+  background: rgba(9, 17, 25, 0.94);
+}
+
+.quality-choice {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.quality-choice legend {
+  padding: 0;
+  margin-bottom: 6px;
+  color: var(--ice);
+  font-weight: 400;
+}
+
+.quality-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  cursor: pointer;
+}
+
+.quality-option input {
+  grid-row: span 2;
+  accent-color: var(--holo);
+  margin: 3px 0 0;
+}
+
+.quality-note {
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+.quality-choice:disabled .quality-option {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.overlay-toggles {
+  display: flex;
+  gap: 6px;
+}
+
+/* --- node labels (DOM, positioned by the scene's projector) ------------------------------------- */
+
+.node-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+/* Positioned by the scene every frame (transform); hidden until the first projection. */
+.node-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  white-space: nowrap;
+  text-shadow: 0 0 10px rgba(4, 7, 11, 0.9);
+  will-change: transform;
+  /* A button that looks like an engraved label. */
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  border-radius: 2px;
+  padding: 2px 8px 3px;
+  cursor: pointer;
+}
+
+.node-label-hover .node-name,
+.node-label:hover .node-name {
+  color: var(--holo);
+}
+
+/* The selected node: a hairline bracket under its name. */
+.node-label[aria-pressed="true"] .node-name {
+  color: var(--holo);
+  box-shadow: 0 1px 0 var(--holo);
+}
+
+.node-name {
+  font-family: var(--font-display);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  color: var(--ice);
+}
+
+.node-status {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  color: var(--holo);
+}
+
+.node-fact {
+  font-size: var(--step--1);
+  color: var(--mist);
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-degraded .node-status {
+  color: var(--amber);
+}
+
+.node-offline .node-status {
+  color: var(--amber-deep);
+}
+
+.node-unknown .node-status {
+  color: var(--holo-dim);
+}
+
+.node-labels-stale .node-label {
+  opacity: 0.55;
+}
+
+.node-unavailable .node-name,
+.node-unavailable .node-status,
+.node-unavailable .node-fact {
+  color: var(--faint);
+}
+
+/* --- command bar ------------------------------------------------------------------------------ */
+
+.command-bar {
+  height: 100%;
+}
+
+.command-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 0 12px 0 16px;
+  border: 1px solid var(--glass-edge);
+  border-radius: 2px;
+  background: linear-gradient(to top, rgba(111, 231, 245, 0.05), rgba(9, 17, 25, 0.62) 60%);
+  box-shadow: inset 0 1px 0 var(--glass-hi), 0 18px 40px -24px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+/* Typing lights the bar from below, like a reticle taking aim. */
+.command-row:focus-within {
+  border-color: rgba(111, 231, 245, 0.42);
+  box-shadow: inset 0 1px 0 var(--glass-hi), inset 0 -1px 0 var(--holo), 0 -10px 34px -22px var(--holo);
+}
+
+.command-row-offline {
+  opacity: 0.7;
+}
+
+.command-prompt {
+  font-family: var(--font-display);
+  font-size: var(--step-1);
+  color: var(--holo);
+  line-height: 1;
+}
+
+.command-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: var(--step-1);
+  font-weight: 300;
+  color: var(--ice);
+  caret-color: var(--holo);
+  background: none;
+  border: 0;
+  padding: 8px 0;
+  outline: none;
+}
+
+.command-input::placeholder {
+  color: var(--faint);
+}
+
+.command-chip {
+  font-size: 10px;
+  line-height: 1;
+  padding: 4px 6px 3px;
+  border: 1px solid rgba(138, 163, 179, 0.3);
+  border-radius: 2px;
+  color: var(--mist);
+  white-space: nowrap;
+}
+
+.command-chip-active {
+  color: var(--volt-text);
+  border-color: rgba(46, 124, 246, 0.5);
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+.command-chip-attention {
+  color: var(--amber);
+  border-color: rgba(255, 181, 71, 0.5);
+}
+
+.command-cancel:not(:disabled) {
+  border-color: rgba(255, 181, 71, 0.45);
+  color: var(--amber);
+}
+
+.command-cancel:not(:disabled):hover {
+  background: rgba(255, 181, 71, 0.12);
+}
+
+/* Above the bar: exactly one line (cameraFit.ts REPLY_HEIGHT 30 px, REPLY_GAP 8 px), reserved like the
+   dock so the camera keeps every node clear of it. Content is clipped to the line, never grown. */
+.command-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  height: 30px;
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.command-strip[hidden] {
+  display: none;
+}
+
+.command-notice {
+  flex: 0 1 auto;
+  max-width: 62%;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-left: 2px solid var(--holo-dim);
+  background: rgba(9, 17, 25, 0.86);
+  color: var(--mist);
+  font-size: var(--step--1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-notice-attention {
+  border-left-color: var(--amber);
+  color: var(--amber);
+}
+
+.command-reply {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 0 12px;
+  border: 1px solid var(--glass-edge);
+  border-left: 2px solid var(--holo-dim);
+  border-radius: 2px;
+  background: rgba(9, 17, 25, 0.78);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+}
+
+.command-reply-from {
+  flex: none;
+  font-family: var(--font-display);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  color: var(--holo);
+}
+
+.command-reply-command {
+  flex: none;
+  max-width: 30%;
+  color: var(--mist);
+  font-size: var(--step--1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The preview: one line of the reply, newlines folded to spaces, the rest behind Show all. */
+.command-reply-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--ice);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-reply-toggle {
+  flex: none;
+  font-size: var(--step--1);
+  color: var(--holo);
+}
+
+/* The whole reply, at the top of the right column: text only, never HTML; a /resume run scrolls. */
+.reply-panel {
+  flex: 0 0 auto;
+}
+
+.reply-panel .panel-head h2 {
+  flex: 1;
+}
+
+.command-reply-body {
+  margin: 0;
+  max-height: min(36vh, 300px);
+  overflow: auto;
+  font: inherit;
+  color: var(--ice);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(111, 231, 245, 0.2) transparent;
+}
+
+.command-reply-body:focus-visible,
+.review-lines:focus-visible {
+  outline: 1px solid var(--holo);
+  outline-offset: 2px;
+}
+
+/* --- approval ---------------------------------------------------------------------------------- */
+
+/* The one panel drawn in amber: JARVIS has stopped and is waiting for a person. */
+.panel.confirm-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  max-height: 100%;
+  min-height: 0;
+  padding: 14px 18px 14px;
+  background: rgba(7, 13, 19, 0.95);
+  border-color: rgba(255, 181, 71, 0.28);
+  border-top: 2px solid var(--amber);
+  box-shadow: inset 0 1px 0 rgba(255, 181, 71, 0.08), 0 28px 60px -30px rgba(255, 138, 61, 0.4);
+}
+
+.confirm-panel:focus {
+  outline: none;
+}
+
+.confirm-panel:focus-visible {
+  outline: 1px solid rgba(255, 181, 71, 0.6);
+  outline-offset: 3px;
+}
+
+.confirm-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.confirm-head h2 {
+  margin: 0;
+  font-size: var(--step-1);
+  font-weight: 400;
+  color: var(--amber);
+}
+
+.confirm-label {
+  color: var(--ice);
+  overflow-wrap: anywhere;
+}
+
+.confirm-countdown {
+  margin-left: auto;
+  color: var(--mist);
+  font-size: var(--step--1);
+}
+
+.confirm-banner {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--amber);
+  background: rgba(255, 181, 71, 0.08);
+  color: var(--amber);
+}
+
+.confirm-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 14px;
+  margin: 0;
+}
+
+.confirm-fact {
+  display: contents;
+}
+
+.confirm-facts dt {
+  color: var(--mist);
+}
+
+.confirm-facts dd {
+  margin: 0;
+  color: var(--ice);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.confirm-hidden {
+  margin: 0;
+  color: var(--amber);
+  font-size: var(--step--1);
+}
+
+.confirm-omitted {
+  margin: 0;
+  color: var(--faint);
+  font-size: var(--step--1);
+}
+
+/* The review, exactly: one block per line, nothing collapsed. Long lines wrap like the terminal's,
+   never scroll sideways, so no part of a line can sit out of sight; scroll down for the rest. */
+.review-lines {
+  flex: 1 1 auto;
+  min-height: 3em;
+  margin: 0;
+  padding: 8px 12px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  font-family: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  tab-size: 4;
+  color: var(--mist);
+  background: rgba(4, 7, 11, 0.72);
+  border-left: 1px solid var(--glass-edge);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 181, 71, 0.25) transparent;
+}
+
+.review-lines > span {
+  display: block;
+  min-height: 1.5em;
+  /* Every space kept, and the line wrapped anywhere it must, even inside a long word. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* A text-direction character cannot reach past its own line. */
+  unicode-bidi: isolate;
+}
+
+/* A character the backend revealed as \u{...}, set apart from the same text typed in the file. */
+.invisible-char {
+  color: var(--amber);
+  background: rgba(255, 181, 71, 0.16);
+  outline: 1px solid rgba(255, 181, 71, 0.45);
+  border-radius: 2px;
+}
+
+/* Text from JARVIS cannot carry a text-direction override past its own element. */
+.event-status,
+.event-detail,
+.command-reply-line,
+.command-reply-body,
+.confirm-facts dd {
+  unicode-bidi: isolate;
+}
+
+.review-lines > .add {
+  color: #8fe3b0;
+}
+
+.review-lines > .del {
+  color: #ff9c8a;
+}
+
+.review-lines > .hunk {
+  color: var(--holo);
+}
+
+.confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.confirm-status {
+  flex: 1;
+  margin: 0;
+  color: var(--mist);
+  font-size: var(--step--1);
+}
+
+.confirm-status-attention {
+  color: var(--amber);
+}
+
+.confirm-approve {
+  position: relative;
+  border-color: rgba(255, 181, 71, 0.6);
+  color: var(--amber);
+}
+
+.confirm-approve:not(:disabled):hover {
+  background: rgba(255, 181, 71, 0.16);
+}
+
+.confirm-approve:disabled {
+  border-color: rgba(255, 181, 71, 0.2);
+}
+
+/* While Approve arms, a hairline fills beneath it: the moment it can be pressed is visible. */
+.confirm-arming::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 1px;
+  background: var(--amber);
+  transform-origin: left;
+  animation: arm 600ms linear forwards;
+}
+
+@keyframes arm {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* --- small screens: the core stays centred, panels shrink to the edges --------------------------- */
+
+/* Below 900 px (cameraFit.ts NARROW_MAX_WIDTH): the side columns become overlays opened from the top
+   bar, over the scene and above the command bar dock; the core stays centred. */
+@media (max-width: 899px) {
+  :root {
+    --gutter: 12px;
+  }
+
+  .hud-overlay {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "top"
+      "banner"
+      "main"
+      "dock";
+  }
+
+  .hud-left,
+  .hud-right,
+  .hud-center,
+  .hud-approval {
+    grid-area: main;
+  }
+
+  .hud-approval {
+    width: 100%;
+  }
+
+  .hud-left {
+    justify-self: start;
+    width: min(340px, 100%);
+    z-index: 2;
+  }
+
+  .hud-right {
+    justify-self: end;
+    width: min(360px, 100%);
+    z-index: 3;
+  }
+
+  .hud-left[data-open="false"],
+  .hud-right[data-open="false"] {
+    display: none;
+  }
+
+  .hud-narrow .hud-left .panel,
+  .hud-narrow .hud-right .panel {
+    background: rgba(9, 17, 25, 0.92);
+  }
+
+  .session {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+  }
+
+  .topbar {
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+  }
+
+  .state-readout {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+  }
+
+  .session-facts {
+    display: none;
+  }
+
+  .state-word {
+    font-size: 1.25rem;
+  }
+
+}
+
+@media (max-width: 560px) {
+  .hud-left,
+  .hud-right {
+    width: 100%;
+  }
+
+  .brand-mark,
+  .brand-version {
+    display: none;
+  }
+
+  .system-panel .facts,
+  .system-panel .metric-detail,
+  .cpu-trace {
+    display: none;
+  }
+
+  /* Enter sends; the button would squeeze the input. */
+  .command-send {
+    display: none;
+  }
+
+  .command-row {
+    gap: 8px;
+    padding: 0 8px 0 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .link-dot,
+  .meter-fill,
+  .state-word,
+  .step-mark,
+  .command-chip,
+  .command-row,
+  .confirm-arming::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

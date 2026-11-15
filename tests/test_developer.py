@@ -1856,7 +1856,7 @@ class ChangeWarningTests(DeveloperTestCase):
         self.assertEqual(developer.change_warnings("src/app.py", "+x = 1"), "")
 
     def test_invisible_characters_are_warned_about(self):
-        diff = "+if user == 'admin‮ ⁦':  # ​"
+        diff = "+if user == 'admin‮ ⁦':  # \u200b"
         warning = developer.change_warnings("src/app.py", diff)
         self.assertIn("WARNING: the change contains 3 invisible or text-direction character(s)", warning)
         (self.workspace / "auth.py").write_text("ok = False\n", encoding="utf-8")

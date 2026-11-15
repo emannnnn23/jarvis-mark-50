@@ -11,6 +11,7 @@ from typing import Callable
 from typing import TYPE_CHECKING
 
 from core.audit import audit, log, redact
+from core.events import BUS, emit, scrub
 from core.policy import Permission
 from memory.json_store import MemoryStoreError
 
@@ -195,6 +196,17 @@ def _summarize_result(result: dict[str, Any]) -> str:
     return str(data)[:160]
 
 
+def _event_target(raw_arguments: Any) -> str | None:
+    """Where a tool call points (path, project, url or name), built like the orchestrator's progress
+    events and scrubbed before the cut, because a URL or path can carry a key (`?api_key=...`)."""
+    try:
+        args = parse_arguments(raw_arguments)
+    except ToolValidationError:
+        return None
+    target = args.get("path") or args.get("project") or args.get("url") or args.get("name")
+    return scrub(target, max_str=120) if isinstance(target, str) else None
+
+
 def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, raw_arguments: Any,
                  tainted: bool = False) -> dict[str, Any]:
     """Validate, authorize and run one tool call. Always returns a status dict; never raises
@@ -202,8 +214,20 @@ def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, ra
     started = time.monotonic()
     tool = registry.get(name)
     allowed: bool | None = None
+    target = _event_target(raw_arguments) if BUS.enabled else None
+    permission: str | None = None
+
+    def publish(status: str, **extra: Any) -> None:
+        fields: dict[str, Any] = {"tool": name, "status": status, **extra}
+        if target:
+            fields["target"] = target
+        if permission:
+            fields["permission"] = permission
+        emit("tool.execution", **fields)
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
+        if BUS.enabled:
+            publish(result["status"], duration_ms=round((time.monotonic() - started) * 1000))
         audit({
             "event": "tool_call",
             "tool": name,
@@ -214,6 +238,8 @@ def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, ra
         })
         return result
 
+    if BUS.enabled:
+        publish("requested")
     if tool is None:
         return finish({
             "status": STATUS_ERROR,
@@ -233,6 +259,7 @@ def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, ra
         level = tool.permission_for(args)
     except Exception:  # noqa: BLE001 - evaluate() succeeded a moment ago; assume the worst
         level = Permission.SENSITIVE_ACTION
+    permission = level.value
 
     def cancel_tool() -> None:
         if tool.cancel is not None:
@@ -241,6 +268,8 @@ def execute_tool(registry: ToolRegistry, policy: PermissionPolicy, name: str, ra
             except Exception:  # noqa: BLE001 - cancelling must not mask the interruption
                 log.exception("Cancelling %s failed", name)
 
+    if BUS.enabled:
+        publish("running")
     future = _tool_executor.submit(tool.handler, **args)
     try:
         data = future.result(timeout=tool.timeout)

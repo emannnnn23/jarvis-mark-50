@@ -7,9 +7,11 @@ import unittest
 from unittest import mock
 
 from helpers import (  # noqa: E402 - sets up sys.path for the project imports
+    BusCaptureMixin,
     TempDirTestCase,
 )
 import jarvis  # noqa: E402
+from core.events import BUS  # noqa: E402
 
 
 class MemoryStoreTests(TempDirTestCase):
@@ -241,6 +243,40 @@ class MemoryStoreTests(TempDirTestCase):
         self.assertEqual(self.memory_path.read_bytes(), before)
         self.assertEqual([f["text"] for f in store.list_facts()], ["I like apples"])
         self.assertEqual([p.name for p in self.memory_path.parent.iterdir()], [self.memory_path.name])
+
+
+class MemoryEventTests(BusCaptureMixin, TempDirTestCase):
+    def test_memory_activity_events(self):
+        store = self.make_memory()
+        events = self.capture_events()
+        store.remember_fact("I like green tea")
+        store.remember_fact("My dog is called Max")
+        activity = [e for e in events if e["type"] == "memory.activity"]
+        self.assertEqual([(e["op"], e["count"]) for e in activity], [("store", 1), ("store", 2)])
+
+        del events[:]
+        self.assertEqual(len(store.get_relevant_memories("tea", limit=5)), 2)
+        self.assertEqual(len(store.search_memory("dog")), 1)
+        self.assertEqual(len(store.search_memory("")), 2)
+        self.assertEqual([(e["op"], e["count"]) for e in events], [("retrieve", 2), ("search", 1), ("search", 2)])
+        self.assert_valid(events)
+
+    def test_failed_save_publishes_no_store_event(self):
+        store = self.make_memory()
+        events = self.capture_events()
+        with mock.patch("memory.json_store.save_memory", side_effect=OSError("disk full")):
+            with self.assertRaises(jarvis.MemoryStoreError):
+                store.remember_fact("I like green tea")
+        self.assertEqual([e for e in events if e["type"] == "memory.activity"], [])
+
+    def test_no_events_when_bus_disabled(self):
+        store = self.make_memory()
+        events = self.capture_events()
+        BUS.enabled = False
+        store.remember_fact("I like green tea")
+        store.get_relevant_memories("tea")
+        store.search_memory("tea")
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

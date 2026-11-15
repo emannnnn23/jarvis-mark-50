@@ -24,6 +24,7 @@ JARVIS MARK 50 is a personal assistant for the Linux terminal, written in Python
 | Hands-free: end to end | Verified on 2026-10-17 with the real model and real Groq Whisper, on generated audio. (1) "Hey Jarvis, what is the weather like in Manila today?" from idle: one detection, transcript "what is the weather like in Manila today?". (2) "Hey Jarvis, stop" mixed over JARVIS's own voice while it was speaking: one detection, transcript "stop.", handled as a stop phrase. (3) JARVIS's voice alone: 0 detections. (4) Ordinary chatter without the wake word: 0 detections. |
 | Hands-free: microphone | Real microphone, local only (nothing was transcribed): 6.1 s processed, maximum wake score 0.047 in a quiet room, no false triggers. The estimated room noise RMS was 0.0045, giving a speech threshold of 0.013. The push-to-talk recorder could open the microphone at the same time (PipeWire allows several capture clients). |
 | Hands-free: real spoken "Hey JARVIS" | **Failed on 2026-10-23, cause found.** A real "Hey Jarvis" got no response. A 150 s local measurement showed the voice clipping (RMS 0.97-1.0) and a best wake score of 0.45 against the 0.6 needed. The cause was the microphone's hardware gain, not the model (see [No response to "Hey JARVIS"](#case-no-response-to-hey-jarvis-2026-10-23)). A wake-up with a real voice after lowering the gain is not recorded here yet, so interruption and end-of-request detection with a real voice are still unverified. |
+| Mission Control | Automated tests on both sides (Python and vitest). Checked in headless Chrome against the real server: live states, the event stream, node details, commands, browser approvals (including Decline-only for a secret), cancel, the speech pulse following the word timings, the High-quality glow loading only at High, and recovery from a lost WebGL context. **Not measured yet on the laptop itself:** the frame rate on the Intel HD 620, and a full spoken run (`--mission-control --wake`). |
 | Hands-free: `--wake-test` | `python jarvis.py --wake-test` listens locally for 20 s, shows the live level and wake score, and says what to change (see [Testing the microphone](#testing-the-microphone-and-wake-word---wake-test)). Covered by the automated tests with a fake detector and microphone. |
 | Project tests: results | Verified on 2026-10-21 with real runs on temporary demo projects. A passing pytest project gave `passed=true`. A failing one gave `passed=false` and exit code 1, and the output named the failing test. |
 | Project tests: environment | Verified on 2026-10-21: `GROQ_API_KEY` was absent in the child process. |
@@ -147,9 +148,14 @@ nano .env                       # set GROQ_API_KEY=gsk_...
 .venv/bin/pip install -r requirements-wake.txt
 .venv/bin/python jarvis.py --wake-test     # 20 s local microphone and wake-word check
 .venv/bin/python jarvis.py --wake
+
+# 8. Optional: Mission Control, the live 3D view in your browser. Build the page once
+#    (needs Node.js 20.19 or newer), then start JARVIS with it.
+(cd mission_control/web && npm ci && npm run build)
+.venv/bin/python jarvis.py --mission-control
 ```
 
-`--check` reports on the Python version, the required modules (`groq`, `ddgs`), the optional modules (`edge_tts`, `psutil`), the audio player, the API key, the model, the speech model (`JARVIS_STT_MODEL`), the microphone recorder (`arecord` or `pw-record`), the wake-word engine (with the configured `JARVIS_WAKE_MODEL`), the permissions file, the memory file, the workspace and the editor. The permissions-file line shows the file's path and how many test commands, lint commands and project rules it defines, for example `permissions file: .../config/permissions.toml (4 test and 1 lint commands, 0 project rules)`. If the file does not exist, it warns `... not found; no project commands are allowed`. If a key is set, it makes live calls to list the models available to your account. The speech model is checked only when a key is set. A missing speech model, recorder, wake-word engine or permissions file is a warning, not a failure. An invalid permissions file is a configuration error, so `--check` stops before the report (see [Permissions file](#permissions-file)). Exit code 0 means all required checks passed, and 1 means at least one failed.
+`--check` reports on the Python version, the required modules (`groq`, `ddgs`), the optional modules (`edge_tts`, `psutil`), the audio player, the API key, the model, the speech model (`JARVIS_STT_MODEL`), the microphone recorder (`arecord` or `pw-record`), the wake-word engine (with the configured `JARVIS_WAKE_MODEL`), the Mission Control server and page (see [Mission Control](#mission-control)), the permissions file, the memory file, the workspace and the editor. The permissions-file line shows the file's path and how many test commands, lint commands and project rules it defines, for example `permissions file: .../config/permissions.toml (4 test and 1 lint commands, 0 project rules)`. If the file does not exist, it warns `... not found; no project commands are allowed`. If a key is set, it makes live calls to list the models available to your account. The speech model is checked only when a key is set. A missing speech model, recorder, wake-word engine, Mission Control page or permissions file is a warning, not a failure. An invalid permissions file is a configuration error, so `--check` stops before the report (see [Permissions file](#permissions-file)). Exit code 0 means all required checks passed, and 1 means at least one failed.
 
 ### Command-line options
 
@@ -160,6 +166,8 @@ nano .env                       # set GROQ_API_KEY=gsk_...
 | `--read-only` | Forces permission mode `read_only` for this run. |
 | `--listen` | Starts with push-to-talk on (see [Voice input](#voice-input)). Audio is sent to Groq. Can be combined with `--text`. |
 | `--wake` | Starts with hands-free mode on (see [Hands-free mode](#hands-free-mode-wake-word)). Detection is local; the request after the wake word is sent to Groq. Can be combined with `--text` and `--listen`. |
+| `--mission-control` | Starts [Mission Control](#mission-control), the live 3D view in your browser, for this run. Local only (`127.0.0.1`). |
+| `--no-browser` | With `--mission-control`: prints the link instead of opening a browser tab. |
 | `--check` | Runs the environment diagnostics and exits. No API key is needed to start it. |
 | `--wake-test` | Listens locally for 20 s for "Hey JARVIS", shows the live microphone level and wake score, then says what to change, and exits (see [Testing the microphone](#testing-the-microphone-and-wake-word---wake-test)). Nothing is recorded or sent anywhere, and no API key is needed. Exit code 0 if the wake word was heard, otherwise 1. |
 | `--version` | Prints the version and exits. |
@@ -205,6 +213,11 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_WAKE_SPEAKING_THRESHOLD` | `0.75` | 0.1-0.99. Score needed while JARVIS is speaking, that is, to interrupt it. |
 | `JARVIS_WAKE_END_SILENCE` | `1.0` | 0.4-3.0 seconds of quiet that end a hands-free request. |
 | `JARVIS_WAKE_CHIME` | `true` | `true/false` etc. Plays a short two-tone chime when the wake word is heard. It plays in text-only mode too, if an audio player is found. |
+| `JARVIS_UI_ENABLED` | `false` | `true/false` etc. Starts [Mission Control](#mission-control) with every run, like `--mission-control`. |
+| `JARVIS_UI_PORT` | `8765` | 1024-65535. Mission Control's port, always on `127.0.0.1`. A port in use gives one warning; the terminal works as usual. |
+| `JARVIS_UI_OPEN_BROWSER` | `true` | `true/false` etc. `false`, like `--no-browser`, only prints the Mission Control link. |
+| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for working on the page with `npm run dev`: `http://127.0.0.1:5173`. Must be `http://127.0.0.1:<port>`; anything else, `localhost` included, is a configuration error. |
+| `JARVIS_CONFIRM_TIMEOUT` | `600` | 0-3600. Seconds a confirmation waits while Mission Control is on before it is cancelled; `0` waits forever. Without Mission Control the prompt waits as before. |
 
 An invalid value, such as a number out of range, an unknown mode, a malformed `JARVIS_APPS` entry or an invalid permissions file, stops startup with `Configuration error: ...` and exit code 2. `NO_COLOR` disables coloured output, and `XDG_DATA_HOME` moves the default log directory.
 
@@ -270,7 +283,7 @@ The permission mode decides what happens to each class:
 
 How confirmation works:
 
-- JARVIS itself prints the prompt and reads your answer from the terminal (`input()`). The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths. For a file change it also shows the diff (see [Changing code](#changing-code)).
+- JARVIS itself prints the prompt and reads your answer: typed in the terminal, or answered in Mission Control; a spoken yes never approves. The model has no part in it. The prompt shows the tool, the exact operation (for example, which memory will be deleted and its current text) and the affected paths. For a file change it also shows the diff (see [Changing code](#changing-code)).
 - If JARVIS cannot prepare the operation, for example because the text to replace is not in the file, nothing is asked and nothing runs. The model gets status `denied` with the reason `Not done: <why>`, so it can correct the call.
 - Type `yes` (or `y`) to proceed. Anything else cancels: another word, Enter, Ctrl+C or Ctrl+D.
 - Each confirmation covers a single operation. There is no "always allow".
@@ -703,6 +716,7 @@ To pick a task up:
 - edge-tts produces MP3. JARVIS plays it with the first player it finds, in this order: `mpv`, `ffplay`, `mpg123`, `gst-play-1.0`. Zorin OS ships `gst-play-1.0`, so voice usually works out of the box. Otherwise run `sudo apt install mpv`.
 - Replies are cleaned up before speaking. Code blocks become "I've put the code on screen", URLs become "the link on screen", and Markdown symbols are dropped. Long replies are split into chunks of about 350 characters, and the next chunk is synthesised while the current one plays.
 - A new reply, starting a new request or, in hands-free mode, saying "Hey JARVIS" interrupts speech. `/stop` stops it.
+- With [Mission Control](#mission-control) on, JARVIS also asks edge-tts for the timing of each word (nothing extra is sent: the same text goes to the same service) and passes the timings to the page, which makes the core pulse on each word. With Mission Control off, speech is synthesised exactly as before.
 - **Fallback**: text is always printed. Voice failures never stop the assistant. The first failure prints a notice. After 3 consecutive failures JARVIS switches to text-only, and `/voice on` retries. If edge-tts is not installed or no player is found, JARVIS starts text-only and says why.
 - Error replies from Groq are printed but not spoken. Temporary MP3 files live in a `jarvis-tts-*` directory in the system temp folder and are deleted on exit.
 
@@ -735,7 +749,7 @@ Push-to-talk speech-to-text. You press a key to start and stop every recording, 
 - **Audio goes to Groq.** Each recording is uploaded to Groq's speech-to-text API (`JARVIS_STT_MODEL`) with your `GROQ_API_KEY`. The local WAV file lives in a `jarvis-stt-*` directory in the system temp folder. It is deleted straight after transcription, and also when a recording is rejected or cancelled. The directory is removed on exit.
 - **One disclosure per session.** Before your first recording in a session, JARVIS prints: `Privacy: Your recording is sent to Groq (<model>) for transcription. JARVIS deletes its local copy straight afterwards.`
 - **The audit log never contains the transcript.** A `speech_input` event records only the mode, the backend, the outcome, the duration in seconds and the number of characters. After transcription, the transcript is your message: like typed text, it goes to the chat model and, with `JARVIS_SAVE_CONVERSATIONS=true`, into the redacted conversation log.
-- **Spoken confirmations are impossible.** Confirmation prompts read only typed input from the terminal. Push-to-talk never records while a prompt waits. In hands-free mode the listener keeps running, but saying "Hey JARVIS" at a prompt cancels the whole request. Saying "yes" cannot approve an action; you must type `yes`.
+- **Spoken confirmations are impossible.** Confirmation prompts are typed in the terminal, or answered in Mission Control; a spoken yes never approves. Push-to-talk never records while a prompt waits. In hands-free mode the listener keeps running, but saying "Hey JARVIS" at a prompt cancels the whole request.
 - **JARVIS does not hear itself during push-to-talk.** It stops speaking before every recording starts.
 
 ### Safety checks
@@ -872,6 +886,129 @@ Two things that look like the same problem but are not:
 - **Audit events never contain audio or transcripts.** Each detection writes a `wake_word` event with the model name and the score. Each request writes a `speech_input` event with `mode` `wake` and outcome `transcribed` or `silent`.
 - The startup line shown above is the session's privacy disclosure; the push-to-talk disclosure is not repeated after it.
 
+## Mission Control
+
+Mission Control is a live 3D view of JARVIS in your browser. A holographic core shows what JARVIS is doing right now (idle, listening, thinking, running a tool, speaking, an error, or offline when the link is gone), and while JARVIS speaks the core brightens on each word. Six nodes around it show the language model, memory, tools, the system (real CPU, memory and disk figures), voice and the network (whether Groq can be reached, from a periodic connection check and from the outcome of JARVIS's own model calls). Panels show an event stream, the current multi-step task and the latest reply. You can also type commands, approve or decline confirmations, and cancel a request from the page. Everything comes from real events inside JARVIS; nothing is simulated.
+
+It is **off by default**. With it off, JARVIS behaves exactly as described in the rest of this README.
+
+### Starting it
+
+```bash
+.venv/bin/python jarvis.py --mission-control                 # opens a browser tab by itself
+.venv/bin/python jarvis.py --mission-control --no-browser    # only prints the link
+```
+
+`JARVIS_UI_ENABLED=true` in `.env` starts it with every run, like `--mission-control`. JARVIS prints one line with the link:
+
+```text
+Mission Control: http://127.0.0.1:8765/#token=...
+```
+
+**Always use the printed `http://127.0.0.1:<port>/#token=...` link as it is. Do not change it to a `localhost` address: Mission Control refuses it.** The server listens on `127.0.0.1` only, and `localhost` can resolve to the IPv6 address `::1`, where another program could be listening, so a page that names `localhost` is answered `421 Misdirected Request`.
+
+- If the port is taken (a second JARVIS, another app), JARVIS prints one yellow line, `Mission Control could not start: port 8765 on 127.0.0.1 is already in use (another JARVIS or another app?). Set JARVIS_UI_PORT to a free port. The terminal works as usual.`, and carries on in the terminal.
+- A tab left open from an earlier run cannot connect, because every run has a new token. It says `Open the link printed in the terminal.` and stops trying.
+- Reloading the tab keeps working: the token is kept in that tab's session storage until the tab closes.
+- At most 4 tabs can be connected at once. A fifth says `Too many Mission Control tabs are open.` and has a Retry button. Connections that have not sent the token yet are limited separately (8 at a time, 3 seconds each), so they cannot take a tab's place.
+- When JARVIS quits, the page says `JARVIS has shut down.` and the core goes dim.
+
+### Building the page
+
+The page is a React and three.js app in `mission_control/web/`. Its build output, `mission_control/web/dist/`, is not in git, so build it once after cloning, and again after each update that changes the page:
+
+```bash
+cd mission_control/web && npm ci && npm run build
+```
+
+- **Use `npm ci`, never `npm install` or `npm update`.** `npm ci` installs exactly the versions in `package-lock.json`; the others may pull newer releases, which have not been reviewed. `package.json` also pins `n8ao` (a dependency of the bloom effect) to 2.0.1 through `overrides`.
+- This needs **Node.js 20.19 or newer** (vite 7 and vitest 4 require it; `package.json` says so under `engines`). Zorin OS 18's own `nodejs` package is version 18, which is too old. Install a newer Node with nvm (`nvm install 20`, then `nvm use 20`). The page was built and tested with Node 20.20.2.
+- The build takes about 10 seconds and needs no network after `npm ci` has downloaded the packages once.
+- Until the page is built, the server still runs, and the link shows a plain page, `Mission Control is not built yet`, with the exact build command. Build, then reload the tab.
+
+`--check` reports both parts, without starting anything:
+
+```text
+  [ok  ] Mission Control server: aiohttp 3.14.5
+  [ok  ] Mission Control UI: built
+```
+
+If the page is not built yet, the second line is a warning, `[warn] Mission Control UI: not built: cd mission_control/web && npm ci && npm run build`. If aiohttp is missing, the first line says `aiohttp is not installed (pip install -r requirements.txt)`. Neither is a failure: JARVIS runs without Mission Control.
+
+### Security
+
+Mission Control can be reached only from this computer. The page itself (its HTML, scripts and styles) is served to any program on this computer, but nothing live can be read or driven without the per-session token, and other websites cannot open the live connection, read the snapshot or send commands.
+
+- **Local only.** The server binds `127.0.0.1` and nothing else, so other machines on the network cannot reach it.
+- **A token per session.** Each run makes a new random token. It is in the link's `#token=` part, which a browser never sends to a server. The page removes it from the address bar at once, keeps it in that tab's session storage, and sends it in the first WebSocket message. Without the right token nothing live is available: the socket is closed after a wrong or missing first message (or 3 s of silence), and `/api/snapshot` answers 401. Only the page files and `/api/health`, which says only that the server is up and which protocol version it speaks, need no token.
+- **Host and Origin checks.** Every request the server answers must name `127.0.0.1:<port>` as the host (`localhost` is refused too, see above), which stops DNS-rebinding tricks from other websites; a request too malformed to read at all is turned away by the HTTP parser before these checks. A WebSocket, and any request that carries an Origin, must come from the page's own address (or from the dev server in `JARVIS_UI_DEV_ORIGIN`), so another website open in your browser cannot open the live connection. A program on this computer can claim any Origin it likes; for it, the token is what stands in the way.
+- **A Content Security Policy.** Scripts only from this server (no inline scripts, no eval); inline styles are allowed; images may also be `data:` URLs; workers only from this server; connections only to this server (`ws://127.0.0.1:<port>`); no plugins; no form submissions; and no other site can show the page in a frame. Responses also carry `Cross-Origin-Resource-Policy: same-origin` and `Cross-Origin-Opener-Policy: same-origin`, so other sites can neither embed them nor keep a handle on the Mission Control window. Files under `/assets` whose name starts with a dot are never served.
+- **The token is never logged.** It is printed to the terminal once and appears in no log file and no audit line. The audit trail records only the port.
+- **The token is never on a command line.** To open the tab, JARVIS writes the link into a private temporary file (mode 600, in `$XDG_RUNTIME_DIR` when it is set, otherwise the system temp directory, deleted after 10 seconds) and hands the browser that file, not the link. So the token does not show up in `ps` or other process listings.
+- **Secrets are redacted.** Everything JARVIS sends to the page goes through the same pattern-based secret redaction as the logs (key formats, `password=...`-style assignments, the `user:password@` part of URLs), and the Groq key is never sent. Before redacting, both remove control codes and redact again when that joins a credential name back together (`pass\x01word=...`). The page goes further: it also removes zero-width and other format characters first (so `pass\u200bword=...` is redacted), and any value stored under a credential-like name (`{"password": [...]}`) is hidden whatever its type. The log files keep zero-width characters as they are, so a name split by one is not redacted there. Redaction is pattern-based: it cannot catch every secret format.
+- Limits: 4 tabs (plus 8 connections still waiting to send the token), 20 messages per second per tab, 64 KiB per message, and one `/api/snapshot` answer per second (`429` otherwise).
+
+### Approvals in the browser
+
+When a tool needs your confirmation, the terminal shows the usual prompt (it ends `Type 'yes' to proceed (or answer in Mission Control), anything else cancels:`) and the page shows the same review in an amber panel: the same operation, paths and diff lines, with invisible and blank-looking characters (zero-width and non-ASCII spaces, Hangul fillers, variation selectors, text-direction controls) shown as `\u{...}` exactly as in the terminal. Long lines wrap in the page, as they do in the terminal, rather than scroll sideways. In the page, each revealed `\u{...}` is highlighted; when the text itself contains typed `\u{` sequences, both the terminal and the page say `!! N literal \u{...} sequence(s) in the text itself, not hidden characters`.
+
+- **The first answer wins.** Type `yes` in the terminal or click Approve or Decline in the page; whichever comes first counts, and the other side shows the result (`Approved in Mission Control.` or `Declined in Mission Control.` in the terminal).
+- **Decline only, when the review looks like it contains a secret or is too long to show in full.** If redaction changed anything in the review, a line had to be cut short, or a line holds a run of 40 or more blanks (which could push the rest of the line out of sight), the page shows only Decline, with `This looks like it contains a secret or is too long to show in full: answer in the terminal`. Approving is then possible only by typing `yes` in the terminal, which shows the full review.
+- **An answer is bound to what was shown.** Each confirmation has a single-use id and a keyed checksum of its exact content. An answer for an old confirmation, or for content that changed, is refused.
+- **A spoken yes never approves**, in the terminal or in the browser.
+- **No answer means no.** While Mission Control is on, a confirmation waits `JARVIS_CONFIRM_TIMEOUT` seconds (default 600, that is 10 minutes) and is then cancelled with `No answer within 600 s: cancelled.` Set it to `0` to wait forever. Without Mission Control, the terminal prompt waits as long as it always has.
+- Approve is disabled for the first 0.6 s after the panel opens, so a click aimed at something else cannot approve by accident. Enter and Escape never approve.
+- Cancelling the request (Ctrl+C, or Cancel in the page) while a confirmation is open declines it.
+
+### Commands from the browser
+
+The command bar at the bottom of the page sends a line to JARVIS as if you had typed it in the terminal: it runs through the same loop, permission policy, tools and confirmations. The terminal shows it as `You (browser): ...`.
+
+- **One line at a time**, up to 4,000 characters. A multi-line paste is refused rather than flattened.
+- **Some things can only be done in the terminal**, by the person at the keyboard: `/forget`, `/memory reset`, `/tasks reset`, turning a microphone on (`/wake on`, `/listen on`, `/talk`), and quitting (`exit`, `quit`, `goodbye` and the rest). The page answers `Type this in the terminal`. Turning things off (`/wake off`, `/listen off`, `/voice off`, `/stop`) works from the page.
+- An unknown slash command is refused (`Not a command JARVIS accepts here`).
+- While JARVIS is working, a new command is refused (`JARVIS is busy — cancel or wait`) instead of queued.
+- **Cancel** in the page works like Ctrl+C in the terminal: the request stops, and steps that already finished are not undone.
+- **With Mission Control on, the terminal prompt loses line editing.** To listen to the browser and the keyboard at once, JARVIS reads the terminal with a plain line reader, so the arrow keys and input history do not work at the `You:` prompt while Mission Control runs. Without Mission Control, nothing changes.
+
+### Performance modes
+
+The **Quality** menu at the top right sets how much the scene draws. Your choice is remembered in this browser.
+
+| Mode | Particles | Pixel density | Other |
+| --- | --- | --- | --- |
+| Low | 400 | 1x | No glass blur; the scene stands still while JARVIS is idle |
+| Balanced (default) | 1,200 | up to 1.25x | Smooth on integrated graphics |
+| High | 3,000 | up to 1.75x | Adds a soft glow (bloom), downloaded only when you pick High |
+
+- The scene draws continuously only while JARVIS is working, speaking or listening, or while you move the camera. When JARVIS is idle it redraws 15 times a second for a slow breath (not at all in Low), and not at all while the tab is hidden.
+- **Auto-degrade.** If the scene stays below 24 frames per second for about 6 seconds while it animates, it drops one level (High to Balanced, Balanced to Low) for this page, and the Quality menu says so. It never raises the level by itself; pick a level in the menu to try again.
+- **Reduced motion.** If your system or browser asks for reduced motion (the `prefers-reduced-motion` setting), Mission Control stays on Low, the Quality menu says why, and the speech pulse is gentler.
+- Below 900 px wide, the particle count is halved and the side panels become overlays opened from the top bar.
+- If the graphics driver resets the 3D view, the page says `The graphics card reset the 3D view.` with a **Restart 3D view** button; the panels keep updating.
+- The six node labels are buttons: Tab to one and press Enter or Space to open its details. Escape closes them.
+
+### Working on the page (dev mode)
+
+Only needed to change the page itself. Run JARVIS with the dev server's address allowed, then start the dev server, which reloads the page as you edit:
+
+```bash
+JARVIS_UI_DEV_ORIGIN=http://127.0.0.1:5173 .venv/bin/python jarvis.py --mission-control --no-browser
+cd mission_control/web && npm run dev
+```
+
+Open `http://127.0.0.1:5173/#token=<token>`, with the token from the printed link. The dev server listens on `127.0.0.1` only and passes `/ws` and `/api` on to JARVIS at `127.0.0.1:8765` (or at `JARVIS_UI_PORT`, if you set it in the shell that runs `npm run dev`). `JARVIS_UI_DEV_ORIGIN` accepts only `http://127.0.0.1:<port>`; anything else, `localhost` included, stops startup with a configuration error.
+
+### Settings
+
+| Variable | Default | Allowed values / notes |
+| --- | --- | --- |
+| `JARVIS_UI_ENABLED` | `false` | `true/false` etc. Starts Mission Control with every run, like `--mission-control`. |
+| `JARVIS_UI_PORT` | `8765` | 1024-65535. Always on `127.0.0.1`. |
+| `JARVIS_UI_OPEN_BROWSER` | `true` | `true/false` etc. `false`, like `--no-browser`, only prints the link. |
+| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for `npm run dev`: `http://127.0.0.1:5173`. |
+| `JARVIS_CONFIRM_TIMEOUT` | `600` | 0-3600 seconds a confirmation waits while Mission Control is on; `0` waits forever. |
+
 ## Logging and audit trail
 
 | File | Contents | Rotation |
@@ -912,8 +1049,21 @@ The test suite lives in `tests/`, one file per area:
 | `test_voice_output.py` | Spoken output: text cleanup, the voice engine and the chime |
 | `test_speech_input.py` | Push-to-talk recording and transcription |
 | `test_wake.py` | Hands-free mode, voice interruption and `--wake-test` |
+| `test_terminal.py` | The terminal: confirmation prompts, developer-mode switching, restoring the last conversation, browser commands and the Mission Control events |
+| `test_events.py` | The Mission Control event bus: never raising, redaction, the replay ring |
+| `test_mission_state.py` | How JARVIS's state and the node health are worked out |
+| `test_mission_server.py` | The Mission Control server: token, Host and Origin checks, limits, the page and the "not built" page |
+| `test_mission_metrics.py` | System metrics with a fake psutil, and the Groq probe |
+| `test_confirm_broker.py` | Browser approvals: first answer wins, the checksum, timeouts and cancel |
+| `test_mission_e2e.py` | One full run: a browser command, a tool, a browser approval and the reply |
 | `helpers.py` | Shared fakes and base test cases |
 | `conftest.py` | Makes the project packages importable |
+
+The Mission Control page has its own tests (vitest: the store, the socket, the type checks, escaping, the approval panel, the speech pulse and the quality rules), plus a type check and the build. They need Node.js 20.19 or newer:
+
+```bash
+cd mission_control/web && npm test && npm run typecheck && npm run build
+```
 
 The tools, voice output and permission policy accept injected fakes (browser opener, search client, speech synthesiser, confirmation callback), so the tests run without a network, a Groq key, a browser, a microphone or audio.
 
@@ -971,7 +1121,7 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **One wake phrase, English only.** Only "Hey JARVIS" is removed from transcripts. The other built-in openWakeWord models (all English) and custom `.onnx` models work for detection, but their wake phrase stays in the transcript.
 - **The pre-roll can include JARVIS's own speech** during an interruption. That audio is uploaded to Groq with the request, and if Whisper does not write the wake phrase, it can end up in the transcript.
 - **A cancelled tool that was already running may finish**, whether you cancel with Ctrl+C or with the wake word (see the tool-timeout item below).
-- **Hands-free typing uses a plain line reader**, so there is no line-editing history.
+- **Hands-free typing uses a plain line reader**, so there is no line-editing history. The same is true while Mission Control is on.
 - **The hands-free listener uses `arecord` only.** `pw-record` is not used for streaming.
 - **Recognition quality depends on the laptop microphone**, its gain and room noise. Push-to-talk transcription has not been tested with a real voice yet, and the one recorded real "Hey Jarvis" failed because the gain was far too high (see [Status](#status--verification)). Check yours with `--wake-test`.
 - **Rate limits are noticeable on the free tier.** Rapid tool-heavy questions can wait 10-15 s each for Groq's per-minute token budget, and a multi-step fix (look, test, edit, re-test) takes minutes: the verified one took about 3.5 minutes.
@@ -990,6 +1140,13 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **Project commands run your project's code.** Approving a test run is approving whatever that code does, with your user's rights. Only the Groq key and JARVIS's own settings are kept out of its environment.
 - **App launches cannot be confirmed visually.** JARVIS checks that the process did not exit straight away, but it cannot see whether a window appeared.
 - Memory retrieval is keyword-based, not semantic.
+- **Mission Control frame rate on integrated graphics varies.** Balanced is meant to stay smooth on an Intel HD 620, but this has only been checked in a headless browser, not measured on the laptop. Auto-degrade drops a level after a sustained slow period, and Low always works.
+- **Mission Control needs a Node.js build.** The page is not in git; it must be built with Node.js 20.19 or newer (`cd mission_control/web && npm ci && npm run build`), once and after updates that change it.
+- **The first Mission Control link may stay in Chrome's history.** The page removes `#token=...` from the address bar at once, but Chrome can keep the URL it first loaded in its history. The token stops working when that JARVIS session ends.
+- **The Mission Control token is as good as the keyboard.** Whoever holds it can send commands, approve what the browser may approve, and start approved test runs. Keep the link to yourself.
+- **An old Mission Control tab trusts whatever answers on `127.0.0.1:8765`.** After JARVIS quits, a tab left open keeps its token in session storage and reconnects to that address; if another program takes the port, the tab talks to it (it cannot learn anything from the old token, which no longer works). Close Mission Control tabs when you quit JARVIS.
+- **Typing `yes` ahead approves.** A `yes` typed in the terminal before a confirmation appears is read as the answer, as it always has been; the browser cannot type ahead.
+- **The browser's speech pulse is aligned by estimate.** The page assumes the audio player starts about 150 ms after a spoken part is announced; a slower player makes the pulse run slightly ahead of the voice.
 - **Tainting is per request.** If a reply repeats text from a web page or file, the next message you send starts untainted. Redaction is pattern-based and cannot catch every secret format, so keep real credentials out of the workspace.
 
 ## Roadmap
@@ -1014,6 +1171,7 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `config/settings.py` | Environment variables, `.env` loading, validated settings, and loading the permissions file |
 | `config/permissions.toml` | Approved apps, project commands and project rules (see [Permissions file](#permissions-file)) |
 | `core/audit.py` | Logging, secret redaction and the audit trail |
+| `core/events.py` | The event bus Mission Control listens to (does nothing while Mission Control is off) |
 | `core/context.py` | The JARVIS persona and the prompt built for each request |
 | `core/orchestrator.py` | The request lifecycle: the bounded model/tool loop |
 | `core/policy.py` | Permission classes and the policy that decides whether a tool call may run |
@@ -1034,6 +1192,14 @@ The developer-assistant work follows the phases of the architecture blueprint. P
 | `voice/input.py` | Push-to-talk recording and Groq Whisper transcription |
 | `voice/wake.py` | Hands-free mode: wake word and voice interruption |
 | `ui/terminal.py` | The terminal interface: chat loop, commands, confirmations and voice turns |
+| `mission_control/server.py` | The Mission Control server: local web server and WebSocket, token, Host and Origin checks |
+| `mission_control/state.py` | Works out JARVIS's state and each node's health from the events |
+| `mission_control/protocol.py`, `protocol_fixtures.json` | The event contract shared by the server and the page |
+| `mission_control/metrics.py` | CPU, memory and disk figures, and the Groq reachability check |
+| `mission_control/confirm.py` | Confirmations answered in the terminal or the browser, first answer wins |
+| `mission_control/bridge.py` | Commands and cancel from the browser into the terminal's own loop |
+| `mission_control/launch.py` | Opens the browser without putting the token on a command line |
+| `mission_control/web/` | The page: React, three.js and React Three Fiber, built with Vite into `dist/` (not in git) |
 | `tests/` | The pytest suite (see [Running tests](#running-tests)) |
 | `requirements.txt` | Pinned Python dependencies |
 | `requirements-wake.txt` | Optional runtime dependencies for the wake-word engine (install `openwakeword` itself with `--no-deps`, see [Hands-free mode](#hands-free-mode-wake-word)) |

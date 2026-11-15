@@ -8,10 +8,11 @@ import stat
 import unittest
 from unittest import mock
 
-from helpers import FAKE_KEY, TempDirTestCase  # noqa: E402 - sets up sys.path for the project imports
+from helpers import FAKE_KEY, BusCaptureMixin, TempDirTestCase  # noqa: E402 - sets up sys.path for the project imports
+from core.events import BUS  # noqa: E402
 from memory import task_store  # noqa: E402
 from memory.task_store import (  # noqa: E402
-    MAX_ACTIONS, MAX_TASKS, TaskStore, TaskStoreError,
+    MAX_ACTIONS, MAX_TASKS, TaskStore, TaskStoreError, task_view,
 )
 
 
@@ -798,6 +799,76 @@ class PromptSummaryTests(TaskStoreTestCase):
         text = self.store.summary_for_prompt(task["id"])
         self.assertIn("(+4 more)", text)
         self.assertNotIn("f13.py", text.split("Last actions")[0])
+
+
+class TaskViewTests(BusCaptureMixin, TaskStoreTestCase):
+    def updates(self, events):
+        return [e for e in events if e["type"] == "task.update"]
+
+    def test_task_view_shape(self):
+        task = self.store.start("Fix the build", ["inspect", "patch"], untrusted=True)
+        self.store.set_step(task["id"], 1, "done", "looked")
+        view = task_view(self.store.get(task["id"]))
+        self.assertEqual(set(view), {"id", "goal", "status", "steps", "updated_at", "paused_reason", "untrusted_plan"})
+        self.assertEqual(view["id"], task["id"])
+        self.assertEqual((view["goal"], view["status"]), ("Fix the build", "active"))
+        self.assertEqual(view["steps"], [{"n": 1, "text": "inspect", "status": "done"},
+                                         {"n": 2, "text": "patch", "status": "pending"}])
+        self.assertIsInstance(view["updated_at"], str)
+        self.assertIsNone(view["paused_reason"])
+        self.assertIs(view["untrusted_plan"], True)
+        self.assertNotIn("evidence", json.dumps(view))  # step evidence and actions stay in the terminal
+        paused = task_view(self.store.pause(task["id"], "stopped for lunch"))
+        self.assertEqual((paused["status"], paused["paused_reason"]), ("paused", "stopped for lunch"))
+
+    def test_task_view_does_not_change_its_input(self):
+        task = self.store.start("Fix the build", ["inspect"])
+        before = json.dumps(task, sort_keys=True)
+        task_view(task)
+        self.assertEqual(json.dumps(task, sort_keys=True), before)
+
+    def test_task_update_published_after_each_committed_change(self):
+        events = self.capture_events()
+        task = self.store.start("Fix the build", ["inspect", "patch"])
+        self.store.set_step(task["id"], 1, "done", "looked")
+        updates = self.updates(events)
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[0]["task"]["steps"][0]["status"], "pending")
+        self.assertEqual(updates[1]["task"]["steps"][0]["status"], "done")
+        self.assert_valid(events)
+
+    def test_task_update_after_commit_not_after_rollback(self):
+        task = self.store.start("Fix the build", ["inspect"])
+        events = self.capture_events()
+        with mock.patch.object(task_store, "save_memory", side_effect=OSError("disk full")):
+            with self.assertRaises(TaskStoreError):
+                self.store.set_step(task["id"], 1, "done", "looked")
+        self.assertEqual(self.updates(events), [])
+        self.assertEqual(self.store.get(task["id"])["steps"][0]["status"], "pending")  # rolled back too
+        self.store.set_step(task["id"], 1, "done", "looked")
+        self.assertEqual(len(self.updates(events)), 1)
+
+    def test_task_update_is_the_active_task_else_newest_unfinished_else_null(self):
+        first = self.store.start("First", ["a"])
+        events = self.capture_events()
+        self.store.start("Second", ["b"])  # pauses the first, becomes active
+        self.assertEqual(self.updates(events)[-1]["task"]["goal"], "Second")
+        second = self.store.active()
+        self.store.pause(second["id"], "later")  # nothing active: the most recently updated unfinished one
+        shown = self.updates(events)[-1]["task"]
+        self.assertEqual((shown["goal"], shown["status"]), ("Second", "paused"))
+        self.store.abandon(second["id"])
+        self.assertEqual(self.updates(events)[-1]["task"]["goal"], "First")
+        self.store.abandon(first["id"])
+        self.assertIsNone(self.updates(events)[-1]["task"])
+        self.assert_valid(events)
+
+    def test_no_events_when_bus_disabled(self):
+        events = self.capture_events()
+        BUS.enabled = False
+        with mock.patch.object(TaskStore, "current_view", side_effect=AssertionError("built while off")):
+            self.store.start("Fix the build", ["inspect"])
+        self.assertEqual(events, [])
 
 
 if __name__ == "__main__":

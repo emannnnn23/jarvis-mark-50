@@ -38,13 +38,69 @@ _SECRET_PATTERNS = [
 ]
 
 
+# The user:password part of a URL (https://user:pass@host, postgres://app:pw@db). Only the credentials
+# go; the scheme and host stay, so the log still says where. The scheme is capped at 32 characters
+# (real ones are short) so a long run like "a.a.a...://" is not rescanned from each position: the
+# match stays linear. User and password stop at "/" and whitespace, so a path is never taken for them.
+_URL_CREDENTIALS = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,31}://)[^\s/@:]+:[^\s/@]+@")
+
+
 # Matches DB_PASSWORD=x, "api_key": "x", AWS_SECRET_ACCESS_KEY: x, "my password is x", ...
-_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_-])*"
-    r"(?:api[_ -]?key|secret|token|password|passwd|pwd|passphrase|access[_-]?key|private[_-]?key|pin(?: code| number)?)"
-    r"(?:[_-][A-Za-z0-9]+)*)"
-    r"([\"']?\s*[:=]\s*|\s+is\s+)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+#
+# The obvious single regex, ((?:\w+[_-])*KEYWORD(?:[_-]\w+)*)SEP VALUE, backtracks quadratically on a
+# long run like "a-a-a-..." (the prefix is retried from every segment). Redaction runs on every
+# string the assistant logs or sends to the browser, so it is done in one linear pass instead:
+# split the text into identifier chains, and look at the separator and value after each chain once.
+_SECRET_KEYWORD = re.compile(
+    r"(?:api[_ -]?key|secret|token|password|passwd|pwd|passphrase|access[_-]?key|private[_-]?key"
+    r"|pin(?: code| number)?)",
+    re.IGNORECASE,
 )
+
+# A maximal identifier such as x-auth-token or AWS_SECRET_ACCESS_KEY: segments joined by _ or -.
+_IDENTIFIER_CHAIN = re.compile(r"[A-Za-z0-9]++(?:[_-][A-Za-z0-9]++)*+", re.IGNORECASE)
+
+# What follows a credential name: the separator (":", "=", or " is ") and then the value.
+_ASSIGNMENT_TAIL = re.compile(
+    r"(?:[\"']?\s*[:=]\s*|\s+is\s+)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)",
+    re.IGNORECASE,
+)
+
+
+def _names_a_secret(text: str, start: int, end: int, previous: tuple[int, int] | None, floor: int) -> bool:
+    """Whether the identifier chain text[start:end] contains a credential keyword.
+
+    A keyword is a whole segment (password) or two adjacent ones (api_key, access-key), and may also
+    be split by a single space across two chains ("api key", "pin code", "pin number") when
+    `previous` is the chain just before. Keywords inside a word (tokenizer, secretary) do not count."""
+    parts = re.split("([_-])", text[start:end])
+    segments, delimiters = parts[0::2], parts[1::2]
+    if any(_SECRET_KEYWORD.fullmatch(segment) for segment in segments):
+        return True
+    if any(_SECRET_KEYWORD.fullmatch(f"{segments[i]}{delimiters[i]}{segments[i + 1]}")
+           for i in range(len(delimiters))):
+        return True
+    if previous is not None and previous[1] == start - 1 and text[start - 1] == " ":
+        before = re.split("[_-]", text[previous[0]:previous[1]])[-1]
+        if previous[1] - len(before) >= floor and _SECRET_KEYWORD.fullmatch(f"{before} {segments[0]}"):
+            return True
+    return False
+
+
+def _secret_values(text: str) -> list[tuple[int, int]]:
+    """Spans of values assigned to credential-like names (password=x, "token": "x", pin is 1234)."""
+    spans: list[tuple[int, int]] = []
+    floor = 0  # end of the last value found: text inside it is not scanned again
+    previous: tuple[int, int] | None = None
+    for chain in _IDENTIFIER_CHAIN.finditer(text):
+        start, end = chain.span()
+        if start >= floor and _names_a_secret(text, start, end, previous, floor):
+            tail = _ASSIGNMENT_TAIL.match(text, end)
+            if tail:
+                spans.append(tail.span(1))
+                floor = tail.end(1)
+        previous = (start, end)
+    return spans
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
@@ -61,32 +117,67 @@ def safe_display(text: Any) -> str:
 
 
 def _is_harmless(text: str, index: int) -> bool:
-    """Invisible characters that legitimately appear in text: a byte-order mark opening a line, and
-    the zero-width joiner inside an emoji sequence."""
+    """Invisible characters that legitimately appear in text: a byte-order mark opening a line, the
+    zero-width joiner inside an emoji sequence, and the emoji presentation selector (VS16) after an
+    emoji."""
     char = text[index]
     if char == "\ufeff":
         return index == 0 or text[index - 1] in "\n+ -"
     if char == "\u200d":
         neighbours = text[index - 1:index] + text[index + 1:index + 2]
         return len(neighbours) == 2 and all(unicodedata.category(c) == "So" for c in neighbours)
+    if char == "\ufe0f":
+        return index > 0 and unicodedata.category(text[index - 1]) == "So"
     return False
 
 
+# Unicode's Default_Ignorable_Code_Point ranges that are not format characters (Cf), which are
+# revealed anyway: letters and marks that draw nothing (the Hangul fillers U+115F, U+1160, U+3164 and
+# U+FFA0, the combining grapheme joiner, the variation selectors), and reserved code points that
+# fonts must not draw. unicodedata has no property for this, so the list is kept here.
+_IGNORABLE_RANGES = (
+    (0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180F), (0x2060, 0x206F),
+    (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0xE0000, 0xE0FFF),
+)
+
+
+def _renders_blank(char: str, category: str) -> bool:
+    """Characters that show as nothing or as an ordinary space, beyond the Cf/Zl/Zp/Cc categories:
+    default-ignorable code points, every space but U+0020 (no-break, en, em, ideographic...), and
+    the blank braille pattern U+2800, which fonts draw as an empty cell."""
+    if category == "Zs":
+        return char != " "
+    code = ord(char)
+    if code == 0x2800:
+        return True
+    return any(low <= code <= high for low, high in _IGNORABLE_RANGES)
+
+
 def reveal_invisible(text: str) -> tuple[str, int]:
-    """Show invisible, text-direction and control characters (zero-width spaces, bidi overrides,
-    line and paragraph separators, form feeds, escapes) as \\u{...}, so code under review reads
-    exactly as it behaves. Newlines and tabs are kept. Returns the revealed text and how many
-    suspicious characters there were (harmless ones, such as a leading byte-order mark, are shown
-    but not counted)."""
-    out, count = [], 0
+    """Show invisible, blank-rendering, text-direction and control characters (zero-width and
+    non-ASCII spaces, Hangul fillers, variation selectors, bidi overrides, line and paragraph
+    separators, form feeds, escapes) as \\u{...}, so code under review reads exactly as it behaves.
+    Newlines and tabs are kept. Returns the revealed text and how many suspicious characters there
+    were (harmless ones, such as a leading byte-order mark, are shown but not counted)."""
+    return reveal_tracked(text)[:2]
+
+
+def reveal_tracked(text: str) -> tuple[str, int, list[int]]:
+    """reveal_invisible, plus where each \\u{...} it wrote starts in the result (code point offsets),
+    so a reader can tell a revealed character from the same six characters typed in the text."""
+    out, count, starts, length = [], 0, [], 0
     for index, char in enumerate(text):
         category = unicodedata.category(char)
-        if category in ("Cf", "Zl", "Zp") or (category == "Cc" and char not in "\n\t"):
-            out.append(f"\\u{{{ord(char):04x}}}")
+        if (category in ("Cf", "Zl", "Zp") or (category == "Cc" and char not in "\n\t")
+                or (char > "\x7f" and _renders_blank(char, category))):
+            shown = f"\\u{{{ord(char):04x}}}"
+            starts.append(length)
             count += not _is_harmless(text, index)
         else:
-            out.append(char)
-    return "".join(out), count
+            shown = char
+        out.append(shown)
+        length += len(shown)
+    return "".join(out), count, starts
 
 
 _CARD_NUMBER = re.compile(r"\b(?:\d[ -]?){13,19}\b")
@@ -100,22 +191,45 @@ def redact(text: Any) -> str:
     text = str(text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
-    return _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", text)
+    text = _URL_CREDENTIALS.sub(r"\1[REDACTED]@", text)
+    pieces, cursor = [], 0
+    for start, end in _secret_values(text):
+        pieces += [text[cursor:start], "[REDACTED]"]
+        cursor = end
+    return "".join(pieces) + text[cursor:]
 
 
 def contains_secret(text: str) -> bool:
     """Heuristic check for content that must never be written to memory."""
-    if any(p.search(text) for p in _SECRET_PATTERNS) or _SECRET_ASSIGNMENT.search(text):
+    if any(p.search(text) for p in _SECRET_PATTERNS) or _secret_values(text):
         return True
     return bool(_CARD_NUMBER.search(text) or _HIGH_ENTROPY_TOKEN.search(text))
 
 
+def redact_for_log(text: Any) -> str:
+    """Text for the log files: control codes removed, then redacted until nothing changes.
+
+    Removing a control code can join a credential name back together ("pass\\x01word=x"), and a
+    marker glued to the text after it can read as a new value, so one pass is not always enough;
+    the loop is bounded like scrub's. Text that one pass leaves unchanged is already settled."""
+    cleaned = _CONTROL_CHARS.sub("", clean_text(text))
+    text = redact(cleaned)
+    if text == cleaned:
+        return text
+    for _ in range(4):  # redact() adds no control codes, so only redaction is repeated
+        again = redact(text)
+        if again == text:
+            break
+        text = again
+    return text
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact(record.getMessage())
+        record.msg = redact_for_log(record.getMessage())
         record.args = None
         if record.exc_info and not record.exc_text:
-            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_text = redact_for_log(logging.Formatter().formatException(record.exc_info))
             record.exc_info = None
         return True
 
@@ -156,5 +270,5 @@ def setup_logging(config: Config) -> Path | None:
 def audit(event: dict[str, Any]) -> None:
     """Write one JSON line to the audit trail. Values are redacted and kept short."""
     entry = {"timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
-    entry.update({k: redact(v)[:300] if isinstance(v, str) else v for k, v in event.items()})
+    entry.update({k: redact_for_log(v)[:300] if isinstance(v, str) else v for k, v in event.items()})
     audit_log.info(json.dumps(entry, ensure_ascii=False, default=str))

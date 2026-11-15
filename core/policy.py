@@ -9,6 +9,7 @@ from typing import Callable
 from typing import TYPE_CHECKING
 
 from config.settings import PERMISSION_MODES
+from core.events import BUS, emit
 
 if TYPE_CHECKING:
     from tools.registry import Tool
@@ -80,6 +81,8 @@ class PermissionPolicy:
         reason = ""
         if tainted and level is Permission.CONTROLLED_ACTION and self.mode == "standard":
             reason = "Requested after reading web or file content, which could contain injected instructions."
+        if BUS.enabled:  # only the policy knows it is about to ask; the browser shows the tool as waiting
+            emit("tool.execution", tool=tool.name, status="awaiting_confirmation", permission=level.value)
         try:
             approved = bool(self.confirm(ConfirmationRequest(tool.name, level, operation, paths, reason, details)))
         except (EOFError, KeyboardInterrupt):
