@@ -155,6 +155,19 @@ def _check_shapes(type_: str, event: dict[str, Any], problems: list[str]) -> Non
         for field in ("hidden", "omitted"):
             if field in event and not _is_int(event[field]):
                 problems.append(f"{field} must be an integer")
+        # Optional reading aids: where each revealed \u{...} starts, and how many were typed in the text.
+        if "revealed" in event:
+            marks = event["revealed"]
+            ok = isinstance(marks, list) and all(
+                isinstance(mark, list) and len(mark) == 2 and all(_is_int(n) and n >= 0 for n in mark)
+                for mark in marks
+            )
+            if not ok:
+                problems.append("revealed must be a list of [line, offset] pairs of non-negative integers")
+        if "literal_escapes" in event:
+            count = event["literal_escapes"]
+            if not _is_int(count) or count < 0:
+                problems.append("literal_escapes must be a non-negative integer")
 
 
 def validate_event(ev: dict[str, Any]) -> list[str]:

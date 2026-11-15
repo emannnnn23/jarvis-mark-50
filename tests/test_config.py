@@ -498,9 +498,9 @@ class MissionControlSettingsTests(unittest.TestCase):
 
     def test_values_from_env(self):
         config = self.config(JARVIS_UI_ENABLED="true", JARVIS_UI_PORT="9000", JARVIS_UI_OPEN_BROWSER="no",
-                             JARVIS_UI_DEV_ORIGIN="http://localhost:5173", JARVIS_CONFIRM_TIMEOUT="0")
+                             JARVIS_UI_DEV_ORIGIN="http://127.0.0.1:5173", JARVIS_CONFIRM_TIMEOUT="0")
         self.assertEqual((config.ui_enabled, config.ui_port, config.ui_open_browser, config.ui_dev_origin,
-                          config.confirm_timeout), (True, 9000, False, "http://localhost:5173", 0))
+                          config.confirm_timeout), (True, 9000, False, "http://127.0.0.1:5173", 0))
         self.assertEqual(self.config(JARVIS_UI_DEV_ORIGIN=" http://127.0.0.1:4173 ").ui_dev_origin,
                          "http://127.0.0.1:4173")
 
@@ -532,7 +532,11 @@ class MissionControlSettingsTests(unittest.TestCase):
                       "http://localhost:5173/", "http://localhost:5173\nx", "http://localhost:5173:80",
                       "http://LOCALHOST:5173", "http://127.0.0.2:5173", "http://localhost:51a3",
                       "ws://localhost:5173", "http://user@localhost:5173", "*", "null",
-                      "http://localhost:\u0665\u0661\u0667\u0663"):  # Arabic-Indic digits
+                      "http://localhost:\u0665\u0661\u0667\u0663",  # Arabic-Indic digits
+                      # Mission Control answers on 127.0.0.1 only: "localhost" may resolve to ::1, where
+                      # another program could listen, so a localhost dev server is refused too.
+                      "http://localhost:5173", "http://127.0.0.1", "http://127.0.0.1:5173/",
+                      "http://127.0.0.1:\u0665\u0661\u0667\u0663"):
             with self.subTest(value=value):
                 with self.assertRaises(jarvis.ConfigError) as ctx:
                     self.config(JARVIS_UI_DEV_ORIGIN=value)

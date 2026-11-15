@@ -59,6 +59,10 @@ export interface ConfirmPayload {
   browser_approvable: boolean;
   /** Epoch ms; null when approvals never time out (JARVIS_CONFIRM_TIMEOUT=0). */
   expires_at: number | null;
+  /** Where each revealed \u{...} starts: [line index, offset in UTF-16 units]. Absent when none. */
+  revealed?: [number, number][];
+  /** How many "\u{" were typed in the text itself (not revealed characters). Absent when none. */
+  literal_escapes?: number;
 }
 
 export type SessionStartEvent = Envelope<"session.start"> & {

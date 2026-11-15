@@ -124,6 +124,20 @@ class ProtocolTests(unittest.TestCase):
                 problems = validate_event(event)
                 self.assertTrue(any(field in p for p in problems), problems)
 
+    def test_confirm_request_reading_aids_are_optional_and_checked(self) -> None:
+        by_type = {event["type"]: event for event in load_fixtures()}
+        base = copy.deepcopy(by_type["confirm.request"])
+        base.pop("revealed", None)
+        base.pop("literal_escapes", None)
+        self.assertEqual(validate_event(base), [])
+        self.assertEqual(validate_event({**base, "revealed": [[0, 3], [2, 0]], "literal_escapes": 2}), [])
+        for field, bad in (("revealed", [[0]]), ("revealed", [[0, "3"]]), ("revealed", [[0, True]]),
+                           ("revealed", [[-1, 0]]), ("revealed", "0,3"), ("literal_escapes", "1"),
+                           ("literal_escapes", -1), ("literal_escapes", True)):
+            with self.subTest(field=field, bad=bad):
+                problems = validate_event({**base, field: bad})
+                self.assertTrue(any(field in p for p in problems), problems)
+
     def test_task_update_accepts_null_task(self) -> None:
         event = {"v": 1, "seq": 1, "type": "task.update", "timestamp": 1, "task": None}
         self.assertEqual(validate_event(event), [])

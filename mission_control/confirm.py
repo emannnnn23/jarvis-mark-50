@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import hmac
 import logging
+import re
 import secrets
 import select
 import sys
@@ -49,6 +50,9 @@ RESOLVED_KEPT = 32
 
 # Longest id or digest looked at from the browser (real ones are 32 and 64 hex characters).
 MAX_ANSWER_FIELD = 128
+
+# A review line with this many blanks in a row can hide its own tail in the page: terminal-only.
+LONG_BLANK_RUN = re.compile(r"\s{40,}")
 
 
 class StdinAnswerReader:
@@ -250,11 +254,15 @@ class ConfirmationBroker:
         audit({"event": "confirmation", "tool": tool, "approved": approved, "channel": channel})
 
     def _browser_view(self, view) -> tuple[dict[str, Any], bool]:
-        """What the browser is sent, and whether it is exactly the view (so the browser may approve)."""
-        exact = view.as_payload()
+        """What the browser is sent, and whether it is exactly the view (so the browser may approve).
+
+        A line holding a long run of blanks is terminal-only too: the page wraps lines, but the run can
+        still push the rest of the line out of sight or make it look like a line of its own."""
+        exact = {**view.as_payload(), **view.reading_aids()}
         shown = scrub(exact, max_str=PUBLISH_MAX_STR, max_items=PUBLISH_MAX_ITEMS, depth=4)
         redacted = any(redact(text) != text for text in _strings(exact))
-        return shown, shown == exact and not redacted
+        padded = any(LONG_BLANK_RUN.search(text) for _, text in view.lines)
+        return shown, shown == exact and not redacted and not padded
 
     # --- the browser side -------------------------------------------------------------------------
 

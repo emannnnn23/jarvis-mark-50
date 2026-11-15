@@ -3,7 +3,8 @@
  *
  * It travels in the URL fragment, which browsers never send to a server. The page reads it once, keeps it
  * in sessionStorage (so a reload of this tab still works, and it is gone when the tab closes), and removes
- * it from the address bar at once, so it is not left in history, bookmarks or a screen share.
+ * it from the address bar at once, so it is not in later bookmarks or a screen share. The browser may still
+ * keep the first URL, token included, in its history: the token only works until JARVIS restarts.
  */
 
 export const TOKEN_KEY = "jarvis.mission.token";

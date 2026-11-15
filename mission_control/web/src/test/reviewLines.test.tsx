@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { ConfirmationPanelView, SECRET_BANNER } from "../components/panels/ConfirmationPanel";
-import { ReviewLines } from "../components/panels/ReviewLines";
+import { ReviewLines, segmentLine } from "../components/panels/ReviewLines";
 import type { ConfirmPayload } from "../types/events";
 
 const payload = (extra: Partial<ConfirmPayload> = {}): ConfirmPayload => ({
@@ -87,7 +89,88 @@ describe("ReviewLines", () => {
   });
 });
 
+const THEME = readFileSync(fileURLToPath(new URL("../styles/theme.css", import.meta.url)), "utf-8");
+
+/** The declarations of the first rule whose selector is exactly `selector`. */
+function rule(selector: string): string {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = THEME.match(new RegExp(`(^|\\n)${escaped} \\{([^}]*)\\}`));
+  expect(match, selector).not.toBeNull();
+  return match![2]!;
+}
+
+describe("ReviewLines wrapping (a padded line cannot hide its tail)", () => {
+  it("wraps every line instead of scrolling sideways", () => {
+    const line = rule(".review-lines > span");
+    expect(line).toMatch(/white-space:\s*pre-wrap;/);
+    expect(line).toMatch(/overflow-wrap:\s*anywhere;/);
+    expect(line).toMatch(/unicode-bidi:\s*isolate;/);
+    const block = rule(".review-lines");
+    expect(block).toMatch(/overflow-x:\s*hidden;/);
+    expect(block).toMatch(/overflow-y:\s*auto;/);
+    expect(block).not.toMatch(/white-space:\s*pre;/);
+  });
+
+  it("isolates text direction in event rows and replies too", () => {
+    expect(THEME).toMatch(/\.event-status,\s*\.event-detail,\s*\.command-reply-line,\s*\.command-reply-body,\s*\.confirm-facts dd \{\s*unicode-bidi:\s*isolate;/);
+  });
+});
+
+describe("ReviewLines revealed characters", () => {
+  const literal = "+a = 'x\\u{200b}y'";
+  const revealed = "+b = 'x\\u{200b}y'";
+
+  it("marks only the revealed escapes the backend points at, never the typed ones", () => {
+    const html = renderToStaticMarkup(
+      <ReviewLines lines={[{ k: "add", t: literal }, { k: "add", t: revealed }]} revealed={[[1, 7]]} />,
+    );
+    expect(html).toContain(`<span class="add">${literal.replace(/'/g, "&#x27;")}</span>`);
+    expect(html).toContain('<span class="add">+b = &#x27;x<span class="invisible-char">\\u{200b}</span>y&#x27;</span>');
+    expect(html.match(/invisible-char/g)).toHaveLength(1);
+  });
+
+  it("keeps the text exactly: the marked line reads the same, character for character", () => {
+    const parts = segmentLine("a\\u{202e}b\\u{1f600}", [1, 10]);
+    expect(parts.map((part) => part.text).join("")).toBe("a\\u{202e}b\\u{1f600}");
+    expect(parts).toEqual([
+      { text: "a", revealed: false }, { text: "\\u{202e}", revealed: true }, { text: "b", revealed: false },
+      { text: "\\u{1f600}", revealed: true },
+    ]);
+  });
+
+  it("counts offsets in UTF-16 units, so an emoji before the mark is two", () => {
+    expect(segmentLine("+\u{1F600}\\u{200b}", [3])).toEqual([
+      { text: "+\u{1F600}", revealed: false }, { text: "\\u{200b}", revealed: true },
+    ]);
+  });
+
+  it("ignores marks that do not point at a \\u{...} escape, overlap or run backwards", () => {
+    for (const marks of [[0], [2], [40], [-1], [1, 1], [10, 1], [1.5]]) {
+      const parts = segmentLine("a\\u{202e}b\\u{1f600}", marks);
+      expect(parts.map((part) => part.text).join(""), JSON.stringify(marks)).toBe("a\\u{202e}b\\u{1f600}");
+      const markedAt = parts.filter((part) => part.revealed).map((part) => part.text);
+      expect(markedAt.every((text) => /^\\u\{[0-9a-f]{4,6}\}$/.test(text)), JSON.stringify(marks)).toBe(true);
+    }
+    expect(segmentLine("x\\u{zz}", [1])).toEqual([{ text: "x\\u{zz}", revealed: false }]);
+  });
+
+  it("styles a revealed escape so it stands out from typed text", () => {
+    expect(rule(".invisible-char")).toMatch(/background|outline|border/);
+  });
+});
+
 describe("ConfirmationPanel", () => {
+  it("says how many \\u{...} sequences were typed in the text itself, like the terminal", () => {
+    const note = "!! 2 literal \\u{...} sequence(s) in the text itself, not hidden characters";
+    expect(render({ payload: payload({ literal_escapes: 2 }) })).toContain(note);
+    expect(render()).not.toContain("literal");
+  });
+
+  it("passes the revealed marks to the review", () => {
+    const html = render({ payload: payload({ lines: [{ k: "add", t: "+x\\u{200b}" }], revealed: [[0, 2]] }) });
+    expect(html).toContain('<span class="invisible-char">\\u{200b}</span>');
+  });
+
   it("shows what the terminal shows: label, tool, operation, paths and reason, as text", () => {
     const html = render();
     expect(html).toContain("Confirmation required");

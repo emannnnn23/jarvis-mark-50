@@ -216,7 +216,7 @@ Settings come from environment variables. `jarvis.py` automatically loads a `.en
 | `JARVIS_UI_ENABLED` | `false` | `true/false` etc. Starts [Mission Control](#mission-control) with every run, like `--mission-control`. |
 | `JARVIS_UI_PORT` | `8765` | 1024-65535. Mission Control's port, always on `127.0.0.1`. A port in use gives one warning; the terminal works as usual. |
 | `JARVIS_UI_OPEN_BROWSER` | `true` | `true/false` etc. `false`, like `--no-browser`, only prints the Mission Control link. |
-| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for working on the page with `npm run dev`: `http://localhost:5173`. Must be `http://localhost:<port>` or `http://127.0.0.1:<port>`; anything else is a configuration error. |
+| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for working on the page with `npm run dev`: `http://127.0.0.1:5173`. Must be `http://127.0.0.1:<port>`; anything else, `localhost` included, is a configuration error. |
 | `JARVIS_CONFIRM_TIMEOUT` | `600` | 0-3600. Seconds a confirmation waits while Mission Control is on before it is cancelled; `0` waits forever. Without Mission Control the prompt waits as before. |
 
 An invalid value, such as a number out of range, an unknown mode, a malformed `JARVIS_APPS` entry or an invalid permissions file, stops startup with `Configuration error: ...` and exit code 2. `NO_COLOR` disables coloured output, and `XDG_DATA_HOME` moves the default log directory.
@@ -905,12 +905,12 @@ It is **off by default**. With it off, JARVIS behaves exactly as described in th
 Mission Control: http://127.0.0.1:8765/#token=...
 ```
 
-**Always use the printed `http://127.0.0.1:<port>/#token=...` link as it is. Do not change it to a `localhost` address.** The server listens on `127.0.0.1` only, and `localhost` can resolve to the IPv6 address `::1`, where nothing listens. The page also keeps its token and your quality choice per address, so a `localhost` tab starts without them.
+**Always use the printed `http://127.0.0.1:<port>/#token=...` link as it is. Do not change it to a `localhost` address: Mission Control refuses it.** The server listens on `127.0.0.1` only, and `localhost` can resolve to the IPv6 address `::1`, where another program could be listening, so a page that names `localhost` is answered `421 Misdirected Request`.
 
 - If the port is taken (a second JARVIS, another app), JARVIS prints one yellow line, `Mission Control could not start: port 8765 on 127.0.0.1 is already in use (another JARVIS or another app?). Set JARVIS_UI_PORT to a free port. The terminal works as usual.`, and carries on in the terminal.
 - A tab left open from an earlier run cannot connect, because every run has a new token. It says `Open the link printed in the terminal.` and stops trying.
 - Reloading the tab keeps working: the token is kept in that tab's session storage until the tab closes.
-- At most 4 tabs can be connected at once. A fifth says `Too many Mission Control tabs are open.` and has a Retry button.
+- At most 4 tabs can be connected at once. A fifth says `Too many Mission Control tabs are open.` and has a Retry button. Connections that have not sent the token yet are limited separately (8 at a time, 3 seconds each), so they cannot take a tab's place.
 - When JARVIS quits, the page says `JARVIS has shut down.` and the core goes dim.
 
 ### Building the page
@@ -921,6 +921,7 @@ The page is a React and three.js app in `mission_control/web/`. Its build output
 cd mission_control/web && npm ci && npm run build
 ```
 
+- **Use `npm ci`, never `npm install` or `npm update`.** `npm ci` installs exactly the versions in `package-lock.json`; the others may pull newer releases, which have not been reviewed. `package.json` also pins `n8ao` (a dependency of the bloom effect) to 2.0.1 through `overrides`.
 - This needs **Node.js 20.19 or newer** (vite 7 and vitest 4 require it; `package.json` says so under `engines`). Zorin OS 18's own `nodejs` package is version 18, which is too old. Install a newer Node with nvm (`nvm install 20`, then `nvm use 20`). The page was built and tested with Node 20.20.2.
 - The build takes about 10 seconds and needs no network after `npm ci` has downloaded the packages once.
 - Until the page is built, the server still runs, and the link shows a plain page, `Mission Control is not built yet`, with the exact build command. Build, then reload the tab.
@@ -940,19 +941,19 @@ Mission Control can be reached only from this computer. The page itself (its HTM
 
 - **Local only.** The server binds `127.0.0.1` and nothing else, so other machines on the network cannot reach it.
 - **A token per session.** Each run makes a new random token. It is in the link's `#token=` part, which a browser never sends to a server. The page removes it from the address bar at once, keeps it in that tab's session storage, and sends it in the first WebSocket message. Without the right token nothing live is available: the socket is closed after a wrong or missing first message (or 3 s of silence), and `/api/snapshot` answers 401. Only the page files and `/api/health`, which says only that the server is up and which protocol version it speaks, need no token.
-- **Host and Origin checks.** Every request must name `127.0.0.1:<port>` or `localhost:<port>` as the host, which stops DNS-rebinding tricks from other websites. A WebSocket, and any request that carries an Origin, must come from the page's own address (or from the dev server in `JARVIS_UI_DEV_ORIGIN`), so another website open in your browser cannot open the live connection. A program on this computer can claim any Origin it likes; for it, the token is what stands in the way.
-- **A Content Security Policy.** Scripts only from this server (no inline scripts, no eval); inline styles are allowed; images may also be `data:` or `blob:` URLs, and workers `blob:` URLs; connections only to this server (`ws://127.0.0.1:<port>` and `ws://localhost:<port>`); no plugins; and no other site can show the page in a frame.
+- **Host and Origin checks.** Every request the server answers must name `127.0.0.1:<port>` as the host (`localhost` is refused too, see above), which stops DNS-rebinding tricks from other websites; a request too malformed to read at all is turned away by the HTTP parser before these checks. A WebSocket, and any request that carries an Origin, must come from the page's own address (or from the dev server in `JARVIS_UI_DEV_ORIGIN`), so another website open in your browser cannot open the live connection. A program on this computer can claim any Origin it likes; for it, the token is what stands in the way.
+- **A Content Security Policy.** Scripts only from this server (no inline scripts, no eval); inline styles are allowed; images may also be `data:` URLs; workers only from this server; connections only to this server (`ws://127.0.0.1:<port>`); no plugins; no form submissions; and no other site can show the page in a frame. Responses also carry `Cross-Origin-Resource-Policy: same-origin` and `Cross-Origin-Opener-Policy: same-origin`, so other sites can neither embed them nor keep a handle on the Mission Control window. Files under `/assets` whose name starts with a dot are never served.
 - **The token is never logged.** It is printed to the terminal once and appears in no log file and no audit line. The audit trail records only the port.
 - **The token is never on a command line.** To open the tab, JARVIS writes the link into a private temporary file (mode 600, in `$XDG_RUNTIME_DIR` when it is set, otherwise the system temp directory, deleted after 10 seconds) and hands the browser that file, not the link. So the token does not show up in `ps` or other process listings.
-- **Secrets are redacted.** Everything JARVIS sends to the page goes through the same pattern-based secret redaction as the logs, and the Groq key is never sent. Like the logs, redaction cannot catch every secret format.
-- Limits: 4 tabs, 20 messages per second per tab, and 64 KiB per message.
+- **Secrets are redacted.** Everything JARVIS sends to the page goes through the same pattern-based secret redaction as the logs (key formats, `password=...`-style assignments, the `user:password@` part of URLs), and the Groq key is never sent. Before redacting, both remove control codes and redact again when that joins a credential name back together (`pass\x01word=...`). The page goes further: it also removes zero-width and other format characters first (so `pass\u200bword=...` is redacted), and any value stored under a credential-like name (`{"password": [...]}`) is hidden whatever its type. The log files keep zero-width characters as they are, so a name split by one is not redacted there. Redaction is pattern-based: it cannot catch every secret format.
+- Limits: 4 tabs (plus 8 connections still waiting to send the token), 20 messages per second per tab, 64 KiB per message, and one `/api/snapshot` answer per second (`429` otherwise).
 
 ### Approvals in the browser
 
-When a tool needs your confirmation, the terminal shows the usual prompt (it ends `Type 'yes' to proceed (or answer in Mission Control), anything else cancels:`) and the page shows the same review in an amber panel: the same operation, paths and diff lines, with invisible characters shown as `\u{...}` exactly as in the terminal.
+When a tool needs your confirmation, the terminal shows the usual prompt (it ends `Type 'yes' to proceed (or answer in Mission Control), anything else cancels:`) and the page shows the same review in an amber panel: the same operation, paths and diff lines, with invisible and blank-looking characters (zero-width and non-ASCII spaces, Hangul fillers, variation selectors, text-direction controls) shown as `\u{...}` exactly as in the terminal. Long lines wrap in the page, as they do in the terminal, rather than scroll sideways. In the page, each revealed `\u{...}` is highlighted; when the text itself contains typed `\u{` sequences, both the terminal and the page say `!! N literal \u{...} sequence(s) in the text itself, not hidden characters`.
 
 - **The first answer wins.** Type `yes` in the terminal or click Approve or Decline in the page; whichever comes first counts, and the other side shows the result (`Approved in Mission Control.` or `Declined in Mission Control.` in the terminal).
-- **Decline only, when the review looks like it contains a secret or is too long to show in full.** If redaction changed anything in the review, or a line had to be cut short, the page shows only Decline, with `This looks like it contains a secret or is too long to show in full: answer in the terminal`. Approving is then possible only by typing `yes` in the terminal, which shows the full review.
+- **Decline only, when the review looks like it contains a secret or is too long to show in full.** If redaction changed anything in the review, a line had to be cut short, or a line holds a run of 40 or more blanks (which could push the rest of the line out of sight), the page shows only Decline, with `This looks like it contains a secret or is too long to show in full: answer in the terminal`. Approving is then possible only by typing `yes` in the terminal, which shows the full review.
 - **An answer is bound to what was shown.** Each confirmation has a single-use id and a keyed checksum of its exact content. An answer for an old confirmation, or for content that changed, is refused.
 - **A spoken yes never approves**, in the terminal or in the browser.
 - **No answer means no.** While Mission Control is on, a confirmation waits `JARVIS_CONFIRM_TIMEOUT` seconds (default 600, that is 10 minutes) and is then cancelled with `No answer within 600 s: cancelled.` Set it to `0` to wait forever. Without Mission Control, the terminal prompt waits as long as it always has.
@@ -992,11 +993,11 @@ The **Quality** menu at the top right sets how much the scene draws. Your choice
 Only needed to change the page itself. Run JARVIS with the dev server's address allowed, then start the dev server, which reloads the page as you edit:
 
 ```bash
-JARVIS_UI_DEV_ORIGIN=http://localhost:5173 .venv/bin/python jarvis.py --mission-control --no-browser
+JARVIS_UI_DEV_ORIGIN=http://127.0.0.1:5173 .venv/bin/python jarvis.py --mission-control --no-browser
 cd mission_control/web && npm run dev
 ```
 
-Open `http://localhost:5173/#token=<token>`, with the token from the printed link. The dev server passes `/ws` and `/api` on to JARVIS at `127.0.0.1:8765` (or at `JARVIS_UI_PORT`, if you set it in the shell that runs `npm run dev`). `JARVIS_UI_DEV_ORIGIN` accepts only `http://localhost:<port>` or `http://127.0.0.1:<port>`; anything else stops startup with a configuration error.
+Open `http://127.0.0.1:5173/#token=<token>`, with the token from the printed link. The dev server listens on `127.0.0.1` only and passes `/ws` and `/api` on to JARVIS at `127.0.0.1:8765` (or at `JARVIS_UI_PORT`, if you set it in the shell that runs `npm run dev`). `JARVIS_UI_DEV_ORIGIN` accepts only `http://127.0.0.1:<port>`; anything else, `localhost` included, stops startup with a configuration error.
 
 ### Settings
 
@@ -1005,7 +1006,7 @@ Open `http://localhost:5173/#token=<token>`, with the token from the printed lin
 | `JARVIS_UI_ENABLED` | `false` | `true/false` etc. Starts Mission Control with every run, like `--mission-control`. |
 | `JARVIS_UI_PORT` | `8765` | 1024-65535. Always on `127.0.0.1`. |
 | `JARVIS_UI_OPEN_BROWSER` | `true` | `true/false` etc. `false`, like `--no-browser`, only prints the link. |
-| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for `npm run dev`: `http://localhost:5173`. |
+| `JARVIS_UI_DEV_ORIGIN` | (none) | Only for `npm run dev`: `http://127.0.0.1:5173`. |
 | `JARVIS_CONFIRM_TIMEOUT` | `600` | 0-3600 seconds a confirmation waits while Mission Control is on; `0` waits forever. |
 
 ## Logging and audit trail
@@ -1142,6 +1143,9 @@ The tools, voice output and permission policy accept injected fakes (browser ope
 - **Mission Control frame rate on integrated graphics varies.** Balanced is meant to stay smooth on an Intel HD 620, but this has only been checked in a headless browser, not measured on the laptop. Auto-degrade drops a level after a sustained slow period, and Low always works.
 - **Mission Control needs a Node.js build.** The page is not in git; it must be built with Node.js 20.19 or newer (`cd mission_control/web && npm ci && npm run build`), once and after updates that change it.
 - **The first Mission Control link may stay in Chrome's history.** The page removes `#token=...` from the address bar at once, but Chrome can keep the URL it first loaded in its history. The token stops working when that JARVIS session ends.
+- **The Mission Control token is as good as the keyboard.** Whoever holds it can send commands, approve what the browser may approve, and start approved test runs. Keep the link to yourself.
+- **An old Mission Control tab trusts whatever answers on `127.0.0.1:8765`.** After JARVIS quits, a tab left open keeps its token in session storage and reconnects to that address; if another program takes the port, the tab talks to it (it cannot learn anything from the old token, which no longer works). Close Mission Control tabs when you quit JARVIS.
+- **Typing `yes` ahead approves.** A `yes` typed in the terminal before a confirmation appears is read as the answer, as it always has been; the browser cannot type ahead.
 - **The browser's speech pulse is aligned by estimate.** The page assumes the audio player starts about 150 ms after a spoken part is announced; a slower player makes the pulse run slightly ahead of the voice.
 - **Tainting is per request.** If a reply repeats text from a web page or file, the next message you send starts untainted. Redaction is pattern-based and cannot catch every secret format, so keep real credentials out of the workspace.
 

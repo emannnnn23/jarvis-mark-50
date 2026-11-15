@@ -7,7 +7,7 @@
     "node": ">=20.19"
   },
   "scripts": {
-    "dev": "vite --port 5173 --strictPort",
+    "dev": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "typecheck": "tsc -b --noEmit"
@@ -31,5 +31,8 @@
     "typescript": "5.9.3",
     "vite": "7.3.7",
     "vitest": "4.1.12"
+  },
+  "overrides": {
+    "n8ao": "2.0.1"
   }
 }

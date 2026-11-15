@@ -48,7 +48,8 @@ DEFAULT_UI_PORT = 8765  # Mission Control listens on 127.0.0.1 only
 
 
 # The one extra origin Mission Control may accept: a local Vite dev server (exactly scheme, host and port).
-UI_DEV_ORIGIN_PATTERN = re.compile(r"http://(localhost|127\.0\.0\.1):\d+", re.ASCII)  # ASCII: no other digits
+# 127.0.0.1 only, like the server itself: "localhost" may resolve to ::1, where another program could listen.
+UI_DEV_ORIGIN_PATTERN = re.compile(r"http://127\.0\.0\.1:\d+", re.ASCII)  # ASCII: no other digits
 
 
 # Executable candidates per application; the first one found on PATH is used.
@@ -350,7 +351,7 @@ class Config:
     ui_enabled: bool = False
     ui_port: int = DEFAULT_UI_PORT
     ui_open_browser: bool = True
-    ui_dev_origin: str = ""  # a Vite dev server allowed to connect, e.g. http://localhost:5173
+    ui_dev_origin: str = ""  # a Vite dev server allowed to connect, e.g. http://127.0.0.1:5173
     confirm_timeout: int = 600  # seconds an approval waits while Mission Control is on; 0 = forever
 
     @classmethod
@@ -376,8 +377,7 @@ class Config:
         ui_dev_origin = (env.get("JARVIS_UI_DEV_ORIGIN") or "").strip()
         if ui_dev_origin and not UI_DEV_ORIGIN_PATTERN.fullmatch(ui_dev_origin):
             # Only a local dev server may be allowed in: any other origin could drive JARVIS from a web page.
-            raise ConfigError("JARVIS_UI_DEV_ORIGIN must look like http://localhost:5173 or http://127.0.0.1:5173 "
-                              "(or be empty).")
+            raise ConfigError("JARVIS_UI_DEV_ORIGIN must look like http://127.0.0.1:5173 (or be empty).")
         stt_language = (env.get("JARVIS_STT_LANGUAGE") if "JARVIS_STT_LANGUAGE" in env else "en").strip().lower()
         if stt_language and not re.fullmatch(r"[a-z]{2,3}", stt_language):
             raise ConfigError("JARVIS_STT_LANGUAGE must be a language code such as en or tl, or empty to auto-detect.")

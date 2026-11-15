@@ -133,6 +133,62 @@ class RevealInvisibleTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(reveal_invisible(text), (text, 0))
 
+    def test_blank_rendering_characters_are_shown_and_counted(self):
+        # Letters and marks that draw nothing (Hangul fillers, variation selectors, the braille blank)
+        # and every space but the ASCII one: each could hide or fake code in a review.
+        self.assertEqual(reveal_invisible("a\u3164b"), ("a\\u{3164}b", 1))
+        self.assertEqual(reveal_invisible("a\ufe0fb"), ("a\\u{fe0f}b", 1))
+        self.assertEqual(reveal_invisible("a\U000e0100b"), ("a\\u{e0100}b", 1))
+        for char in ("\u115f", "\u1160", "\uffa0", "\u2800", "\u034f", "\u17b4", "\u180b", "\u2065",
+                     "\ufe00", "\ufff0", "\U000e0000", "\U000e0080", "\U000e01ef", "\U000e0fff",
+                     "\u00a0", "\u1680", "\u2000", "\u2005", "\u200a", "\u202f", "\u205f", "\u3000"):
+            with self.subTest(char=f"U+{ord(char):04X}"):
+                self.assertEqual(reveal_invisible(f"x{char}y"), (f"x\\u{{{ord(char):04x}}}y", 1))
+
+    def test_emoji_presentation_selector_after_a_symbol_is_shown_but_not_counted(self):
+        # VS16 after an emoji only asks for the colour glyph, like the ZWJ inside an emoji sequence.
+        self.assertEqual(reveal_invisible("\u2764\ufe0f"), ("\u2764\\u{fe0f}", 0))
+        self.assertEqual(reveal_invisible("1\ufe0f"), ("1\\u{fe0f}", 1))
+        self.assertEqual(reveal_invisible("\ufe0f"), ("\\u{fe0f}", 1))
+
+
+class UrlCredentialRedactionTests(unittest.TestCase):
+    def test_basic_auth_credentials_in_a_url_are_redacted(self):
+        self.assertEqual(jarvis.redact("https://u:p@h/x"), "https://[REDACTED]@h/x")
+        self.assertEqual(jarvis.redact("clone https://emanuel:hunter2pass@git.example.com/repo.git now"),
+                         "clone https://[REDACTED]@git.example.com/repo.git now")
+        self.assertEqual(jarvis.redact("HTTPS://x-access-token:abcdEFGH1234@github.com/o/r"),
+                         "HTTPS://[REDACTED]@github.com/o/r")
+        self.assertEqual(jarvis.redact("postgres+psycopg://app:s3cr3t:x@db:5432/x"),
+                         "postgres+psycopg://[REDACTED]@db:5432/x")
+
+    def test_urls_without_a_password_are_left_alone(self):
+        for text in ("https://example.com:8443/path", "ssh://git@github.com/o/r.git", "mailto:a@b.c",
+                     "https://example.com/a:b@c", "see https://h/x?y=a:b@c", "a://b:c d@e"):
+            with self.subTest(text=text):
+                self.assertEqual(jarvis.redact(text), text)
+
+    def test_redacting_a_url_twice_changes_nothing(self):
+        once = jarvis.redact("https://u:p@h/x and ftp://a:b@c/")
+        self.assertEqual(jarvis.redact(once), once)
+
+    def test_url_pattern_is_linear(self):
+        # A long scheme-like run before "://" must not be retried from every position.
+        def best_time(text):
+            runs = []
+            for _ in range(3):
+                started = time.perf_counter()
+                jarvis.redact(text)
+                runs.append(time.perf_counter() - started)
+            return min(runs)
+
+        for unit, tail in (("a.", "://u:" + "p" * 50), ("a", "://u:p"), ("x://u:", "")):
+            with self.subTest(unit=unit):
+                small = best_time(unit * (_LINEAR_CHARS // len(unit)) + tail)
+                large = best_time(unit * (4 * _LINEAR_CHARS // len(unit)) + tail)
+                self.assertLess(large, 5.0)
+                self.assertLess(large / max(small, 1e-4), 8)
+
 
 class AuditLogTests(TempDirTestCase):
     def tearDown(self):
@@ -160,6 +216,39 @@ class AuditLogTests(TempDirTestCase):
         self.assertEqual(entry["status"], "error")
         self.assertNotIn(secret, audit_text)
         self.assertNotIn(secret, (self.log_dir / "jarvis.log").read_text(encoding="utf-8"))
+
+    def read_logs(self) -> tuple[str, str]:
+        for handler in jarvis.audit_log.handlers + jarvis.log.handlers:
+            handler.flush()
+        return ((self.log_dir / "jarvis.log").read_text(encoding="utf-8"),
+                (self.log_dir / "audit.log").read_text(encoding="utf-8"))
+
+    def test_control_codes_cannot_split_a_secret_name_in_the_log(self):
+        # Removing \x01 joins "pass" and "word": redaction must run again on the joined text.
+        self.assertEqual(jarvis.setup_logging(self.config), self.log_dir)
+        jarvis.log.warning("tool arg: %s", "pass\x01word=hunter2")
+        jarvis.log.warning("nested: pass\x01\x7fword=hunter3 and to\x1bken=hunter4")
+        main, _ = self.read_logs()
+        for value in ("hunter2", "hunter3", "hunter4"):
+            self.assertNotIn(value, main)
+        self.assertIn("password=[REDACTED]", main)
+        self.assertNotIn("\x01", main)
+
+    def test_control_codes_cannot_split_a_secret_name_in_the_audit_trail(self):
+        self.assertEqual(jarvis.setup_logging(self.config), self.log_dir)
+        jarvis.audit({"event": "tool", "args": "pass\x01word=hunter2"})
+        _, trail = self.read_logs()
+        self.assertNotIn("hunter2", trail)
+        self.assertIn("password=[REDACTED]", trail)
+
+    def test_url_credentials_are_redacted_in_the_audit_trail_and_log(self):
+        self.assertEqual(jarvis.setup_logging(self.config), self.log_dir)
+        jarvis.audit({"event": "tool", "args": "https://u:hunter2pass@example.com/"})
+        jarvis.log.info("opening %s", "https://u:hunter2pass@example.com/")
+        main, trail = self.read_logs()
+        self.assertNotIn("hunter2pass", main + trail)
+        self.assertIn("https://[REDACTED]@example.com/", trail)
+        self.assertIn("https://[REDACTED]@example.com/", main)
 
 
 if __name__ == "__main__":

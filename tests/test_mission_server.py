@@ -155,6 +155,13 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.recv(ws), {"type": "auth.ok", "protocol": 1})
         return ws
 
+    async def expect_close_frame(self, ws, code: int) -> None:
+        """The close frame the server sent carries `code`. For a socket closed from another task while it
+        waits to authenticate, aiohttp drops the connection right after the frame, so the test client's
+        own reply fails and its close_code reads 1006; a browser reports the code in the frame."""
+        msg = await ws.receive(timeout=3)
+        self.assertEqual((msg.type, msg.data), (aiohttp.WSMsgType.CLOSE, code))
+
     async def expect_close(self, ws, code: int) -> None:
         while True:
             msg = await ws.receive(timeout=3)
@@ -167,37 +174,38 @@ class HttpSecurityTests(AppTestCase):
     async def test_wrong_host_is_421(self):
         await self.start()
         for host in ("evil.example", f"evil.example:{self.port}", f"127.0.0.1:{self.port + 1}",
-                     "127.0.0.1", f"0.0.0.0:{self.port}", f"[::1]:{self.port}"):
+                     "127.0.0.1", f"0.0.0.0:{self.port}", f"[::1]:{self.port}", f"localhost:{self.port}",
+                     f"LOCALHOST:{self.port}"):
             with self.subTest(host=host):
                 resp = await self.client.get("/api/health", headers={"Host": host})
                 self.assertEqual(resp.status, 421)
                 self.assertEqual(resp.headers["X-Frame-Options"], "DENY")
                 resp.release()
-        for host in (f"127.0.0.1:{self.port}", f"localhost:{self.port}"):
-            with self.subTest(host=host):
-                resp = await self.client.get("/api/health", headers={"Host": host})
-                self.assertEqual(resp.status, 200)
-                resp.release()
+        resp = await self.client.get("/api/health", headers={"Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(resp.status, 200)
+        resp.release()
 
     async def test_foreign_origin_on_http_is_403(self):
         await self.start()
-        resp = await self.client.get("/api/health", headers={"Origin": "http://evil.example"})
-        self.assertEqual(resp.status, 403)
+        for origin in ("http://evil.example", f"http://localhost:{self.port}", f"http://[::1]:{self.port}"):
+            with self.subTest(origin=origin):
+                resp = await self.client.get("/api/health", headers={"Origin": origin})
+                self.assertEqual(resp.status, 403)
+                resp.release()
+        resp = await self.client.get("/api/health", headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(resp.status, 200)
         resp.release()
-        for origin in (f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}"):
-            resp = await self.client.get("/api/health", headers={"Origin": origin})
-            self.assertEqual(resp.status, 200)
-            resp.release()
 
     async def test_ws_without_or_with_foreign_origin_is_403(self):
-        await self.start(dev_origin="http://localhost:5173")
+        await self.start(dev_origin="http://127.0.0.1:5173")
         for origin in (None, "http://evil.example", "null", f"http://127.0.0.1:{self.port + 1}",
-                       f"https://127.0.0.1:{self.port}", "http://localhost:5174"):
+                       f"https://127.0.0.1:{self.port}", "http://127.0.0.1:5174", f"http://localhost:{self.port}",
+                       "http://localhost:5173"):
             with self.subTest(origin=origin):
                 with self.assertRaises(aiohttp.WSServerHandshakeError) as ctx:
                     await self.client.ws_connect("/ws", **({} if origin is None else {"origin": origin}))
                 self.assertEqual(ctx.exception.status, 403)
-        for origin in (f"http://localhost:{self.port}", "http://localhost:5173"):
+        for origin in (f"http://127.0.0.1:{self.port}", "http://127.0.0.1:5173"):
             with self.subTest(origin=origin):
                 ws = await self.connect(origin=origin)
                 await ws.send_json({"type": "auth", "token": TOKEN, "last_seq": None})
@@ -240,9 +248,11 @@ class HttpSecurityTests(AppTestCase):
         self.build_dist()
         await self.start()
         csp = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-               "img-src 'self' data: blob:; "
-               f"connect-src 'self' ws://127.0.0.1:{self.port} ws://localhost:{self.port}; "
-               "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+               "img-src 'self' data:; "
+               f"connect-src 'self' ws://127.0.0.1:{self.port}; "
+               "worker-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+               "form-action 'none'")
+        self.assertNotIn("blob:", csp)  # High (bloom) mode was checked in headless Chrome without it
         page = await self.client.get("/")
         self.assertEqual(page.status, 200)
         self.assertIn("<div id=root>", await page.text())
@@ -253,6 +263,8 @@ class HttpSecurityTests(AppTestCase):
                 self.assertEqual(resp.headers["Referrer-Policy"], "no-referrer")
                 self.assertEqual(resp.headers["X-Frame-Options"], "DENY")
                 self.assertEqual(resp.headers["Cache-Control"], "no-store")
+                self.assertEqual(resp.headers["Cross-Origin-Resource-Policy"], "same-origin")
+                self.assertEqual(resp.headers["Cross-Origin-Opener-Policy"], "same-origin")
                 resp.release()
         asset = await self.client.get("/assets/app.js")
         self.assertEqual(asset.status, 200)
@@ -260,6 +272,11 @@ class HttpSecurityTests(AppTestCase):
         self.assertEqual(asset.headers["Cache-Control"], "public, max-age=31536000, immutable")
         self.assertEqual(asset.headers["Content-Security-Policy"], csp)
         self.assertEqual(asset.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(asset.headers["Cross-Origin-Resource-Policy"], "same-origin")
+        refused = await self.client.get("/api/health", headers={"Host": "evil.example"})
+        self.assertEqual(refused.status, 421)
+        self.assertEqual(refused.headers["Cross-Origin-Resource-Policy"], "same-origin")
+        refused.release()
 
     async def test_asset_traversal_is_404(self):
         self.build_dist()
@@ -274,6 +291,45 @@ class HttpSecurityTests(AppTestCase):
                 resp = await self.client.get(URL(path, encoded=True))
                 self.assertEqual(resp.status, 404)
                 self.assertNotIn("secret", await resp.text())
+
+    async def test_dot_names_under_assets_are_404(self):
+        # A build never makes dotfiles, so anything named .env, .git/... under assets is not ours to serve.
+        self.build_dist()
+        (self.dist / "assets" / ".env").write_text("SECRET-DOTFILE", encoding="utf-8")
+        (self.dist / "assets" / ".git").mkdir()
+        (self.dist / "assets" / ".git" / "config").write_text("SECRET-DOTFILE", encoding="utf-8")
+        (self.dist / "assets" / "sub").mkdir()
+        (self.dist / "assets" / "sub" / ".hidden.js").write_text("SECRET-DOTFILE", encoding="utf-8")
+        await self.start()
+        for path in ("/assets/.env", "/assets/%2eenv", "/assets/.git/config", "/assets/sub/.hidden.js",
+                     "/assets/sub/%2ehidden.js"):
+            with self.subTest(path=path):
+                resp = await self.client.get(URL(path, encoded=True))
+                self.assertEqual(resp.status, 404)
+                self.assertNotIn("SECRET-DOTFILE", await resp.text())
+        ok = await self.client.get("/assets/app.js")
+        self.assertEqual(ok.status, 200)
+        ok.release()
+
+    async def test_snapshot_api_is_rate_limited_after_the_token_check(self):
+        await self.start()
+        bearer = {"Authorization": f"Bearer {TOKEN}"}
+        first = await self.client.get("/api/snapshot", headers=bearer)
+        self.assertEqual(first.status, 200)
+        first.release()
+        # A wrong token is refused as before and does not use up the budget...
+        wrong = await self.client.get("/api/snapshot", headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(wrong.status, 401)
+        wrong.release()
+        # ...but a second good request within a second is.
+        second = await self.client.get("/api/snapshot", headers=bearer)
+        self.assertEqual(second.status, 429)
+        self.assertEqual(second.headers["Cache-Control"], "no-store")
+        second.release()
+        self.hub._last_snapshot -= server.SNAPSHOT_API_INTERVAL
+        third = await self.client.get("/api/snapshot", headers=bearer)
+        self.assertEqual(third.status, 200)
+        third.release()
 
 
 class WebSocketTests(AppTestCase):
@@ -408,12 +464,71 @@ class WebSocketTests(AppTestCase):
         clients = [await self.authed() for _ in range(4)]
         for ws in clients:
             self.assertEqual((await self.recv(ws))["type"], "snapshot")
-        fifth = await self.connect()
+        fifth = await self.connect()  # admitted as pending; refused once it authenticates
+        await fifth.send_json({"type": "auth", "token": TOKEN, "last_seq": None})
         await self.expect_close(fifth, 4409)
         await clients[0].close()
         await asyncio.sleep(0.05)
         again = await self.authed()  # a slot is free again
         self.assertEqual((await self.recv(again))["type"], "snapshot")
+
+    async def test_sockets_without_a_token_cannot_take_the_tab_slots(self):
+        # A local program can forge the page's Origin but has no token: its sockets wait for auth,
+        # and they are capped on their own, so the real tab still gets in.
+        await self.start()
+        squatters = [await self.connect() for _ in range(server.MAX_PENDING)]
+        await asyncio.sleep(0.05)
+        tab = await self.authed()
+        self.assertEqual((await self.recv(tab))["type"], "snapshot")
+        # The pending cap pushed out the oldest squatter to make room for the tab.
+        await self.expect_close_frame(squatters[0], server.CLOSE_TOO_MANY_CLIENTS)
+        pending = [client for client in self.hub.clients if not client.authenticated]
+        self.assertLessEqual(len(pending), server.MAX_PENDING)
+        # Authenticated tabs are still capped at MAX_CLIENTS.
+        others = [await self.authed() for _ in range(server.MAX_CLIENTS - 1)]
+        for ws in others:
+            self.assertEqual((await self.recv(ws))["type"], "snapshot")
+        extra = await self.connect()
+        await extra.send_json({"type": "auth", "token": TOKEN, "last_seq": None})
+        await self.expect_close(extra, server.CLOSE_TOO_MANY_CLIENTS)
+        self.assertEqual(sum(client.authenticated for client in self.hub.clients), server.MAX_CLIENTS)
+
+    async def test_pending_sockets_never_exceed_their_cap(self):
+        await self.start()
+        sockets = [await self.connect() for _ in range(server.MAX_PENDING + 3)]
+        await asyncio.sleep(0.1)
+        self.assertLessEqual(len([c for c in self.hub.clients if not c.authenticated]), server.MAX_PENDING)
+        for ws in sockets[:3]:
+            await self.expect_close_frame(ws, server.CLOSE_TOO_MANY_CLIENTS)
+
+    async def test_non_string_type_is_an_invalid_frame_and_the_socket_stays_open(self):
+        await self.start()
+        ws = await self.authed()
+        await self.recv(ws)  # snapshot
+        for frame in ({"type": ["x"]}, {"type": {"a": 1}}, {"type": 7}, {"type": None}):
+            with self.subTest(frame=frame):
+                await ws.send_json(frame)
+                self.assertEqual(await self.recv(ws), {"type": "error", "code": "invalid"})
+        await ws.send_json({"type": "ping"})
+        self.assertEqual(await self.recv(ws), {"type": "pong"})
+
+    async def test_snapshot_does_not_scrub_ring_events_again(self):
+        # Ring events were scrubbed when published; scrubbing 200 of them per snapshot again was the
+        # snapshot's main cost. They are sent as they are; the parts the hub builds are still scrubbed.
+        await self.start()
+        for _ in range(250):
+            self.bus.publish("assistant.message", text=("word " * 1600)[:8000])
+        self.tracker.set_subsystem("llm", last_error_kind=f"auth failed with key {SECRET}")
+        ring = self.bus.recent()
+        with mock.patch("mission_control.server.scrub", wraps=server.scrub) as scrubbed:
+            snap = self.hub.snapshot()
+        self.assertEqual(len(snap["recent_events"]), server.RECENT_EVENTS)
+        for sent, kept in zip(snap["recent_events"], ring[-server.RECENT_EVENTS:]):
+            self.assertIs(sent, kept)
+        self.assertTrue(scrubbed.called)
+        for call in scrubbed.call_args_list:
+            self.assertNotIn("recent_events", call.args[0] if isinstance(call.args[0], dict) else {})
+        self.assertNotIn(SECRET[4:14], json.dumps(snap))
 
     async def test_rate_limit_closes_4429(self):
         await self.start()

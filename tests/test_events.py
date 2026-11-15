@@ -361,6 +361,31 @@ class TestScrub(unittest.TestCase):
                 self.assertEqual(scrub(first), first)
                 self.assertNotIn("hunter2", first)
 
+    def test_format_characters_cannot_split_a_secret_name(self) -> None:
+        # Zero-width and other format characters draw nothing, so "pass\u200bword" reads as
+        # "password" in the page: they are removed before redaction, which then sees the name.
+        for text in ("pass\u200bword=x", "pass\u200bword=hunter2", "api\u200d_key=hunter2",
+                     "pass\u00adword=hunter2", "pass\u2060word=hunter2", "to\ufeffken: hunter2",
+                     "pass\u202eword=hunter2", "pass\U000e0041word=hunter2"):
+            with self.subTest(text=text):
+                out = scrub(text)
+                self.assertNotIn("hunter2", out)
+                self.assertTrue(out.endswith("=[REDACTED]") or out.endswith(": [REDACTED]"), out)
+                self.assertEqual(scrub(out), out)
+        self.assertEqual(scrub("pass\u200bword=x"), "password=[REDACTED]")
+
+    def test_emoji_joiners_are_kept(self) -> None:
+        family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+        self.assertEqual(scrub(f"hi {family}!"), f"hi {family}!")
+        self.assertEqual(scrub("a\u200db"), "ab")
+
+    def test_any_value_under_a_secret_name_is_redacted(self) -> None:
+        for value in (["hunter2"], 12345678, {"v": "hunter2"}, ("a", "b"), 3.5, True, None, "hunter2"):
+            with self.subTest(value=value):
+                self.assertEqual(scrub({"password": value}), {"password": "[REDACTED]"})
+        self.assertEqual(scrub({"api_key": {"v": "hunter2"}, "count": 3}), {"api_key": "[REDACTED]", "count": 3})
+        self.assertEqual(scrub({"tokens": [1, 2], "keys": ["a"]}), {"tokens": [1, 2], "keys": ["a"]})
+
     def test_scrub_survives_cycles(self) -> None:
         loop: list = []
         loop.append(loop)

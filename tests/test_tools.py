@@ -435,6 +435,14 @@ class ToolEventTests(BusCaptureMixin, AgentTestCase):
             self.assertLessEqual(len(target), 120)
         self.assertIn("example.com", targets[0])
 
+    def test_tool_target_url_credentials_are_redacted(self):
+        events = self.capture_events()
+        self.run_tool("open_url", {"url": "https://u:hunter2pass@example.com/"})
+        targets = [e["target"] for e in events if e["type"] == "tool.execution"]
+        self.assertEqual(len(targets), 3)  # requested, running, success
+        for target in targets:
+            self.assertEqual(target, "https://[REDACTED]@example.com/")
+
     def test_tool_target_is_cut_to_120_characters(self):
         events = self.capture_events()
         self.run_tool("open_url", {"url": "https://example.com/" + "a" * 400})

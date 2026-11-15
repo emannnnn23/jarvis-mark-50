@@ -1370,17 +1370,18 @@ body {
   font-size: var(--step--1);
 }
 
-/* The review, exactly: one block per line, nothing wrapped or collapsed; scroll for the rest. */
+/* The review, exactly: one block per line, nothing collapsed. Long lines wrap like the terminal's,
+   never scroll sideways, so no part of a line can sit out of sight; scroll down for the rest. */
 .review-lines {
   flex: 1 1 auto;
   min-height: 3em;
   margin: 0;
   padding: 8px 12px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   font-family: ui-monospace, "DejaVu Sans Mono", "Liberation Mono", monospace;
   font-size: 12px;
   line-height: 1.5;
-  white-space: pre;
   tab-size: 4;
   color: var(--mist);
   background: rgba(4, 7, 11, 0.72);
@@ -1392,8 +1393,27 @@ body {
 .review-lines > span {
   display: block;
   min-height: 1.5em;
-  white-space: pre;
+  /* Every space kept, and the line wrapped anywhere it must, even inside a long word. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   /* A text-direction character cannot reach past its own line. */
+  unicode-bidi: isolate;
+}
+
+/* A character the backend revealed as \u{...}, set apart from the same text typed in the file. */
+.invisible-char {
+  color: var(--amber);
+  background: rgba(255, 181, 71, 0.16);
+  outline: 1px solid rgba(255, 181, 71, 0.45);
+  border-radius: 2px;
+}
+
+/* Text from JARVIS cannot carry a text-direction override past its own element. */
+.event-status,
+.event-detail,
+.command-reply-line,
+.command-reply-body,
+.confirm-facts dd {
   unicode-bidi: isolate;
 }
 

@@ -120,6 +120,21 @@ describe("isServerEvent against the shared fixtures", () => {
     }
   });
 
+  it("checks confirm.request's optional reading aids (revealed marks, literal escapes) when present", () => {
+    const request = clone(fixtures.find((event) => event.type === "confirm.request")!);
+    delete request.revealed;
+    delete request.literal_escapes;
+    expect(isServerEvent(request)).toBe(true);
+    expect(isServerEvent({ ...request, revealed: [[0, 3], [2, 0]], literal_escapes: 2 })).toBe(true);
+    const bad: [string, unknown][] = [
+      ["revealed", [[0]]], ["revealed", [[0, "3"]]], ["revealed", [[0, 1.5]]], ["revealed", [[-1, 0]]],
+      ["revealed", "0,3"], ["literal_escapes", "1"], ["literal_escapes", -1], ["literal_escapes", 1.5],
+    ];
+    for (const [field, value] of bad) {
+      expect(isServerEvent({ ...request, [field]: value }), `${field}=${JSON.stringify(value)}`).toBe(false);
+    }
+  });
+
   it("accepts the nulls the backend really sends", () => {
     const state = fixtures.find((event) => event.type === "jarvis.state")!;
     expect(isServerEvent({ ...clone(state), detail: null })).toBe(true);

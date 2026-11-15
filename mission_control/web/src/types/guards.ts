@@ -103,6 +103,12 @@ const confirmFields: Fields = {
   id: str, digest: str, tool: str, label: str, operation: str, affected_paths: arrayOf(str), reason: str,
   hidden: int, lines: arrayOf(reviewLine), omitted: int, browser_approvable: bool, expires_at: nullable(num),
 };
+const count: Check = (value) => int(value) && (value as number) >= 0;
+/** Optional reading aids (protocol.py _check_shapes): revealed marks and the typed "\u{" count. */
+const confirmOptional: Fields = {
+  revealed: arrayOf((value) => Array.isArray(value) && value.length === 2 && value.every(count)),
+  literal_escapes: count,
+};
 
 interface Spec {
   required: Fields;
@@ -154,7 +160,7 @@ const SPECS: Record<ServerEventType, Spec> = {
   "voice.level": {
     required: { rms: (v) => num(v) && (v as number) >= 0 && (v as number) <= 1, phase: e("voice.level:phase") },
   },
-  "confirm.request": { required: confirmFields },
+  "confirm.request": { required: confirmFields, optional: confirmOptional },
   "confirm.resolved": { required: { id: str, approved: bool, channel: e("confirm.resolved:channel") } },
   "command.ack": { required: { command_id: str, status: e("command.ack:status") } },
   "command.rejected": { required: { command_id: str, reason: e("command.rejected:reason") } },
@@ -200,7 +206,7 @@ export function isServerEvent(value: unknown): value is ServerEvent {
 export const isTaskView = (value: unknown): value is TaskView => taskView(value);
 
 export function isConfirmPayload(value: unknown): value is ConfirmPayload {
-  return isObject(value) && checkFields(value, confirmFields, {});
+  return isObject(value) && checkFields(value, confirmFields, confirmOptional);
 }
 
 export function isAuthOk(value: unknown): value is AuthOk {

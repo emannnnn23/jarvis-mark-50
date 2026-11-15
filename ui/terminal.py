@@ -20,7 +20,7 @@ from typing import Callable
 from typing import TYPE_CHECKING
 
 from config.settings import VERSION
-from core.audit import clean_text, log, reveal_invisible, safe_display
+from core.audit import clean_text, log, reveal_invisible, reveal_tracked, safe_display
 from core.events import BUS, SCRUB_INPUT_LIMIT, emit, scrub
 from core.orchestrator import run_agent
 from core.policy import ConfirmationRequest, Permission
@@ -55,7 +55,11 @@ class ConfirmationView:
     thing, and so an approval from the browser can be bound to it by `digest`.
 
     `operation`, `affected_paths` and `lines` are already revealed (invisible characters as \\u{...});
-    `tool` and `reason` come from JARVIS itself, not the model, and are printed as they are, as before."""
+    `tool` and `reason` come from JARVIS itself, not the model, and are printed as they are, as before.
+
+    A revealed character and the same six characters typed in the text read alike, so `revealed`
+    records where each revealed one starts in `lines` (line index, offset in UTF-16 code units, as the
+    browser indexes strings), and `literal_escapes` counts the "\\u{" typed in the details themselves."""
 
     label: str
     tool: str
@@ -65,6 +69,8 @@ class ConfirmationView:
     hidden: int
     lines: tuple[tuple[str, str], ...]  # (kind, text): kind is add | del | hunk | ctx
     omitted: int
+    revealed: tuple[tuple[int, int], ...] = ()
+    literal_escapes: int = 0
 
     def canonical(self) -> bytes:
         """Canonical JSON of every field: any change to what is shown changes these bytes."""
@@ -83,6 +89,17 @@ class ConfirmationView:
                 "affected_paths": list(self.affected_paths), "reason": self.reason, "hidden": self.hidden,
                 "lines": [{"k": kind, "t": text} for kind, text in self.lines], "omitted": self.omitted}
 
+    def reading_aids(self) -> dict:
+        """The optional confirm.request fields that tell a revealed \\u{...} from typed text: where each
+        revealed character starts (`revealed`, [line, UTF-16 offset] pairs) and how many "\\u{" the
+        details contain (`literal_escapes`). Present only when there is something to mark or say."""
+        aids: dict = {}
+        if self.revealed:
+            aids["revealed"] = [[line, offset] for line, offset in self.revealed]
+        if self.literal_escapes:
+            aids["literal_escapes"] = self.literal_escapes
+        return aids
+
 
 def _line_kind(line: str) -> str:
     if line.startswith("+") and not line.startswith("+++"):
@@ -94,18 +111,59 @@ def _line_kind(line: str) -> str:
     return "ctx"
 
 
-def _review_lines(details: str) -> tuple[int, tuple[tuple[str, str], ...], int]:
-    """(hidden characters, the first MAX_DETAIL_LINES lines with their kinds, lines left out)."""
+@dataclasses.dataclass(frozen=True)
+class _Review:
+    hidden: int
+    lines: tuple[tuple[str, str], ...]
+    omitted: int
+    revealed: tuple[tuple[int, int], ...]
+    literal_escapes: int
+
+
+def _marks(shown: tuple[tuple[str, str], ...], starts: list[int]) -> tuple[tuple[int, int], ...]:
+    """(line index, UTF-16 offset) of each revealed character in the lines shown. `starts` are code
+    point offsets into the whole revealed text, in order. Each line is walked once (characters past
+    U+FFFF count twice in UTF-16), so a line full of revealed characters stays linear."""
+    marks: list[tuple[int, int]] = []
+    pending = iter(starts)
+    start = next(pending, None)
+    line_start = 0
+    for index, (_, line) in enumerate(shown):
+        if start is None:
+            break
+        line_end = line_start + len(line)
+        counted, units = 0, 0  # code points of this line walked so far, and their length in UTF-16
+        while start is not None and start < line_end:
+            offset = start - line_start
+            units += offset - counted + sum(1 for char in line[counted:offset] if char > "\uffff")
+            counted = offset
+            marks.append((index, units))
+            start = next(pending, None)
+        line_start = line_end + 1  # past the "\n"
+    return tuple(marks)
+
+
+def _review_lines(details: str) -> _Review:
+    """The revealed review: hidden characters, the first MAX_DETAIL_LINES lines with their kinds, lines
+    left out, where each revealed character starts in the lines shown, and how many "\\u{" were typed."""
     # Reveal before anything is stripped, so control characters are shown rather than silently removed.
-    revealed, hidden = reveal_invisible(clean_text(details))
+    cleaned = clean_text(details)
+    revealed, hidden, starts = reveal_tracked(cleaned)
+    # Every line break but "\n" is revealed, so splitlines() here splits on "\n" alone.
     lines = revealed.splitlines()
     shown = tuple((_line_kind(line), line) for line in lines[:MAX_DETAIL_LINES])
-    return hidden, shown, max(0, len(lines) - MAX_DETAIL_LINES)
+    return _Review(hidden, shown, max(0, len(lines) - MAX_DETAIL_LINES), _marks(shown, starts),
+                   cleaned.count("\\u{"))
 
 
-def _print_review(hidden: int, lines: tuple[tuple[str, str], ...], omitted: int) -> None:
+LITERAL_NOTE = "!! {count} literal \\u{{...}} sequence(s) in the text itself, not hidden characters"
+
+
+def _print_review(hidden: int, lines: tuple[tuple[str, str], ...], omitted: int, literal_escapes: int = 0) -> None:
     if hidden:
         print("   " + style(f"!! {hidden} invisible or text-direction character(s), shown as \\u{{...}}", "yellow"))
+    if literal_escapes:
+        print("   " + style(LITERAL_NOTE.format(count=literal_escapes), "yellow"))
     for kind, line in lines:
         colour = _KIND_COLOURS.get(kind)
         print("   " + (style(line, colour) if colour else line))
@@ -116,16 +174,18 @@ def _print_review(hidden: int, lines: tuple[tuple[str, str], ...], omitted: int)
 def build_confirmation_view(request: ConfirmationRequest) -> ConfirmationView:
     """What `print_confirmation` shows for this request."""
     label = "SENSITIVE ACTION" if request.permission is Permission.SENSITIVE_ACTION else "ACTION"
-    hidden, lines, omitted = _review_lines(request.details) if request.details else (0, (), 0)
+    review = _review_lines(request.details) if request.details else _Review(0, (), 0, (), 0)
     return ConfirmationView(
         label=label,
         tool=request.tool_name,
         operation=reveal_invisible(clean_text(request.operation))[0],
         affected_paths=tuple(reveal_invisible(clean_text(path))[0] for path in request.affected_paths),
         reason=request.reason,
-        hidden=hidden,
-        lines=lines,
-        omitted=omitted,
+        hidden=review.hidden,
+        lines=review.lines,
+        omitted=review.omitted,
+        revealed=review.revealed,
+        literal_escapes=review.literal_escapes,
     )
 
 
@@ -137,7 +197,7 @@ def print_confirmation(view: ConfirmationView, prompt_hint: str = "") -> None:
         print(f"   Affects:   {path}")
     if view.reason:
         print(f"   Why asked: {view.reason}")
-    _print_review(view.hidden, view.lines, view.omitted)
+    _print_review(view.hidden, view.lines, view.omitted, view.literal_escapes)
     if prompt_hint:
         print(prompt_hint, end="", flush=True)
 
@@ -145,7 +205,8 @@ def print_confirmation(view: ConfirmationView, prompt_hint: str = "") -> None:
 def print_details(details: str) -> None:
     """Show a confirmation's details (usually a unified diff), coloured and capped in length.
     Invisible and text-direction characters are shown as \\u{...} so nothing is hidden."""
-    _print_review(*_review_lines(details))
+    review = _review_lines(details)
+    _print_review(review.hidden, review.lines, review.omitted, review.literal_escapes)
 
 
 CONFIRM_PROMPT = "   Type 'yes' to proceed, anything else cancels: "

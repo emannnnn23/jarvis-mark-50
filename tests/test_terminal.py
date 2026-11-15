@@ -295,6 +295,58 @@ class ConfirmationViewTests(unittest.TestCase):
         self.assertEqual(out.getvalue(), plain.getvalue() + "   Answer: ")
 
 
+class LiteralEscapeTests(unittest.TestCase):
+    """A revealed character (\\u{200b}) and the same characters typed in the file read alike, so the
+    view says how many were typed and records where each revealed one is."""
+
+    LITERAL_AND_REAL = "+a = 'x\\u{200b}y'\n+b = 'x\u200by'\n"
+    LITERAL_NOTE = "!! 1 literal \\u{...} sequence(s) in the text itself, not hidden characters"
+
+    def request(self, details: str) -> jarvis.ConfirmationRequest:
+        return jarvis.ConfirmationRequest("edit_workspace_file", jarvis.Permission.SENSITIVE_ACTION, "Edit a.py",
+                                          ["/w/a.py"], "", details)
+
+    def test_view_counts_literal_sequences_and_marks_revealed_ones(self):
+        view = terminal.build_confirmation_view(self.request(self.LITERAL_AND_REAL))
+        self.assertEqual(view.lines, (("add", "+a = 'x\\u{200b}y'"), ("add", "+b = 'x\\u{200b}y'")))
+        self.assertEqual((view.hidden, view.literal_escapes), (1, 1))
+        self.assertEqual(view.revealed, ((1, 7),))  # line 1, starting after "+b = 'x"
+
+    def test_terminal_prints_the_literal_note_with_the_hidden_one(self):
+        with mock.patch("ui.terminal.style", side_effect=tagged_style), mock.patch("builtins.print") as printed:
+            terminal.print_details(self.LITERAL_AND_REAL)
+        lines = [" ".join(map(str, call.args)) for call in printed.call_args_list]
+        self.assertEqual(lines[:2], [
+            "   <yellow>!! 1 invisible or text-direction character(s), shown as \\u{...}",
+            f"   <yellow>{self.LITERAL_NOTE}",
+        ])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            terminal.print_confirmation(terminal.build_confirmation_view(self.request("+only \\u{41} typed\n")))
+        self.assertIn("!! 1 literal \\u{...} sequence(s)", out.getvalue())
+        self.assertNotIn("invisible", out.getvalue())
+
+    def test_reading_aids_only_when_there_is_something_to_say(self):
+        view = terminal.build_confirmation_view(self.request(self.LITERAL_AND_REAL))
+        self.assertEqual(view.reading_aids(), {"revealed": [[1, 7]], "literal_escapes": 1})
+        self.assertNotIn("revealed", view.as_payload())  # the base payload keeps its shape
+        self.assertEqual(terminal.build_confirmation_view(self.request("+x = 1\n")).reading_aids(), {})
+
+    def test_offsets_are_utf16_like_the_browser_and_skip_omitted_lines(self):
+        # The page indexes strings in UTF-16 code units: an emoji before the mark counts twice.
+        view = terminal.build_confirmation_view(self.request("+\U0001F600\u200b and \u200b\n" + "+x\n" * 450 + "+\u200b"))
+        self.assertEqual(view.revealed, ((0, 3), (0, 16)))
+        self.assertEqual(view.omitted, 52)
+        self.assertEqual(view.hidden, 3)  # counted over everything, like before; only shown lines are marked
+
+    def test_marks_and_note_are_bound_by_the_digest(self):
+        view = terminal.build_confirmation_view(self.request(self.LITERAL_AND_REAL))
+        key = b"k" * 32
+        for change in ({"literal_escapes": 0}, {"revealed": ()}, {"revealed": ((0, 7),)}):
+            with self.subTest(change=change):
+                self.assertNotEqual(dataclasses.replace(view, **change).digest(key), view.digest(key))
+
+
 class LooksLikeDeveloperRequestTests(unittest.TestCase):
     def test_code_words(self):
         for text in ("fix the failing tests", "What changed in my repo today?", "run the linter", "show me the git diff",

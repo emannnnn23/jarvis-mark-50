@@ -96,7 +96,11 @@ export function ConfirmationPanelView({ payload, answer, now, armed, connected, 
       {payload.hidden > 0 && (
         <p className="confirm-hidden">{`!! ${payload.hidden} invisible or text-direction character(s), shown as \\u{...}`}</p>
       )}
-      {payload.lines.length > 0 && <ReviewLines lines={payload.lines} />}
+      {(payload.literal_escapes ?? 0) > 0 && (
+        // Same words as the terminal (ui/terminal.py LITERAL_NOTE): typed \u{...} text is not a hidden character.
+        <p className="confirm-hidden">{`!! ${payload.literal_escapes} literal \\u{...} sequence(s) in the text itself, not hidden characters`}</p>
+      )}
+      {payload.lines.length > 0 && <ReviewLines lines={payload.lines} revealed={payload.revealed} />}
       {payload.omitted > 0 && <p className="confirm-omitted">{`... ${payload.omitted} more lines not shown`}</p>}
       <footer className="confirm-actions">
         <p className={`confirm-status confirm-status-${status?.tone ?? "quiet"}`} role="status" aria-live="polite">

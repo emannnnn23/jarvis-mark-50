@@ -14,6 +14,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from typing import Any
@@ -97,6 +98,36 @@ def _cut(text: str, max_str: int) -> str:
     return cut
 
 
+_NON_ASCII_RUN = re.compile(r"[^\x00-\x7f]+")
+
+# What may stand before a zero-width joiner that is kept: an emoji, a skin-tone modifier, or the
+# emoji presentation selector (U+FE0F) after an emoji, as in the sequences for a family or a job.
+_EMOJI_BEFORE_JOINER = ("So", "Sk")
+
+
+def _strip_format_run(match: re.Match[str]) -> str:
+    run = match.group()
+    out = []
+    for index, char in enumerate(run):
+        category = unicodedata.category(char)
+        if category != "Cf":
+            out.append(char)
+        elif char == "\u200d" and 0 < index < len(run) - 1 and unicodedata.category(run[index + 1]) == "So" \
+                and (unicodedata.category(run[index - 1]) in _EMOJI_BEFORE_JOINER or run[index - 1] == "\ufe0f"):
+            out.append(char)
+    return "".join(out)
+
+
+def strip_format(text: str) -> str:
+    """Remove format characters (zero-width spaces and joiners, soft hyphens, bidi controls, tags):
+    they draw nothing, so "pass\\u200bword=x" would read as "password=x" in the page while redaction
+    saw two words. A joiner inside an emoji sequence stays. Only non-ASCII runs are looked at, so
+    ordinary text costs one scan."""
+    if text.isascii():
+        return text
+    return _NON_ASCII_RUN.sub(_strip_format_run, text)
+
+
 _current_request: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_request_id", default=None)
 
 
@@ -111,7 +142,8 @@ def scrub(value: Any, *, max_str: int = 2000, max_items: int = 200, depth: int =
     is repeated until it settles (see _settle) and the cut is one redact() leaves alone (see _cut)."""
     if isinstance(value, str):
         cleaned = clean_text(value[:SCRUB_INPUT_LIMIT])
-        text = safe_display(redact(cleaned))
+        # Format characters go before redaction, so one cannot split a credential name in two.
+        text = safe_display(redact(strip_format(cleaned)))
         if text != cleaned:  # unchanged text is already a fixed point: skip the extra pass
             text = _settle(text)
         return text if len(text) <= max_str else _cut(text, max_str)
@@ -125,9 +157,10 @@ def scrub(value: Any, *, max_str: int = 2000, max_items: int = 200, depth: int =
         out: dict[str, Any] = {}
         for key, item in list(value.items())[:max_items]:
             name = scrub(str(key), max_str=100)
-            if isinstance(item, str) and "[REDACTED]" in redact(f"{name}=x"):
+            if "[REDACTED]" in redact(f"{name}=x"):
                 # A value stored under a secret-looking name ({"password": "hunter2"}) has no
-                # pattern of its own to match, so the name decides.
+                # pattern of its own to match, so the name decides, whatever the value's type
+                # ({"password": ["hunter2"]}, {"pin": 1234}, {"api_key": {"v": ...}}).
                 out[name] = "[REDACTED]"
             else:
                 out[name] = scrub(item, max_str=max_str, max_items=max_items, depth=depth - 1)

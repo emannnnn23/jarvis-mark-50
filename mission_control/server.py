@@ -4,12 +4,15 @@ JARVIS can edit files and run commands, so this door is narrow on purpose:
 
 - it listens on 127.0.0.1 only, on its own thread and event loop (`jarvis-mission-control`), so the
   terminal and the voice loop never wait on a browser;
-- every request must name this server in its Host header (anti DNS-rebinding: a hostile site that
-  points its own name at 127.0.0.1 is refused with 421) and, when it carries an Origin (and always
-  for the WebSocket), come from this server's own page or the configured dev server;
+- every request must name this server, 127.0.0.1:<port>, in its Host header (anti DNS-rebinding: a
+  hostile site that points its own name at 127.0.0.1 is refused with 421; "localhost" is refused too,
+  as it may resolve to ::1, where another program could listen) and, when it carries an Origin (and
+  always for the WebSocket), come from this server's own page or the configured dev server;
 - the WebSocket must present the per-run token in its first frame within AUTH_TIMEOUT; the token is
   compared in constant time and never logged, and a wrong one closes the socket after a short delay;
-- clients, message rate, message size and each client's send queue are all bounded;
+- authenticated tabs, sockets still waiting to authenticate (capped apart, so sockets without the
+  token cannot take the tabs' places), message rate, message size and each client's send queue are
+  all bounded;
 - every frame the server builds itself (snapshots, control frames) is scrubbed like bus events are.
 
 Bus events reach the browser through `Hub`: it subscribes to the bus once, folds each event into the
@@ -61,7 +64,10 @@ THREAD_NAME = "jarvis-mission-control"
 
 AUTH_TIMEOUT = 3.0  # seconds a new socket has to send its auth frame
 BAD_TOKEN_DELAY = 0.25  # slows down token guessing; a stale tab only waits once
-MAX_CLIENTS = 4
+MAX_CLIENTS = 4  # authenticated tabs
+# Sockets that have not authenticated yet. Capped apart from MAX_CLIENTS, so a local program without
+# the token cannot hold every place; when full, the oldest waiting socket makes room for the new one.
+MAX_PENDING = 8
 MAX_MESSAGES_PER_SECOND = 20
 SEND_QUEUE_SIZE = 512
 MAX_MESSAGE_SIZE = 65536
@@ -73,6 +79,7 @@ CLOSE_REPLY_TIMEOUT = 1.0  # how long a close waits for the browser's reply; als
 RECENT_EVENTS = 200  # events carried in a snapshot
 MAX_ECHOED_ID = 128  # longest confirmation id echoed back in confirm.answer.result
 SNAPSHOT_DEPTH = 6  # a bus event (scrubbed at depth 4) sits two levels down in a snapshot
+SNAPSHOT_API_INTERVAL = 1.0  # seconds between two /api/snapshot answers (a snapshot is not cheap)
 
 TICK_INTERVAL = 1.0
 METRICS_INTERVAL = 2.0
@@ -88,9 +95,9 @@ CLOSE_TOO_MANY_CLIENTS = 4409
 CLOSE_RATE_LIMITED = 4429
 CLOSE_OVERLOADED = int(WSCloseCode.TRY_AGAIN_LATER)  # 1013: this client cannot keep up
 
-CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
-       "connect-src 'self' ws://127.0.0.1:{port} ws://localhost:{port}; worker-src 'self' blob:; "
-       "object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self' ws://127.0.0.1:{port}; worker-src 'self'; "
+       "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 ASSET_CACHE = "public, max-age=31536000, immutable"  # Vite names assets by content hash
 
 NOT_BUILT_PAGE = """<!doctype html>
@@ -151,6 +158,7 @@ class _Client:
         self.sender: asyncio.Task | None = None
         self.closer: asyncio.Task | None = None
         self.closing = False
+        self.opened = time.monotonic()  # which waiting socket is the oldest
         self._received: deque[float] = deque()
 
     def enqueue(self, text: str) -> None:
@@ -254,16 +262,17 @@ class Hub:
         self._probe_task: asyncio.Task | None = None
         self._probe_running = threading.Event()
         self._last_probe: float | None = None
+        self._last_snapshot: float | None = None  # loop time of the last /api/snapshot answer
 
     # --- request checks ---------------------------------------------------------------------------
 
     @property
     def allowed_hosts(self) -> frozenset[str]:
-        return frozenset({f"127.0.0.1:{self.port}", f"localhost:{self.port}"})
+        return frozenset({f"127.0.0.1:{self.port}"})
 
     @property
     def allowed_origins(self) -> frozenset[str]:
-        origins = {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}"}
+        origins = {f"http://127.0.0.1:{self.port}"}
         if self.dev_origin:
             origins.add(self.dev_origin)
         return frozenset(origins)
@@ -408,7 +417,12 @@ class Hub:
     # --- snapshot ---------------------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
-        """Everything a client needs to draw the current picture from nothing (scrubbed)."""
+        """Everything a client needs to draw the current picture from nothing (scrubbed).
+
+        The recent events are the ring's own, already scrubbed by EventBus.publish, so they are sent as
+        they are: scrubbing 200 events of up to 8000 characters again was most of a snapshot's cost.
+        Everything the hub builds or keeps itself (state, subsystems, session, pending confirmation) is
+        scrubbed here. The ring's events are shared: they are only read, never changed."""
         tracked = self.tracker.snapshot()
         recent = (self.bus.recent() or [])[-RECENT_EVENTS:]
         seq = max([self._last_seq, *(event["seq"] for event in recent)])
@@ -423,9 +437,17 @@ class Hub:
             "pending_confirmation": pending,
             "metrics": self._metrics,
             "network": self._network,
-            "recent_events": recent,
         }
-        return scrub(frame, max_str=PUBLISH_MAX_STR, max_items=PUBLISH_MAX_ITEMS, depth=SNAPSHOT_DEPTH)
+        scrubbed = scrub(frame, max_str=PUBLISH_MAX_STR, max_items=PUBLISH_MAX_ITEMS, depth=SNAPSHOT_DEPTH)
+        scrubbed["recent_events"] = recent
+        return scrubbed
+
+    def snapshot_allowed(self, now: float) -> bool:
+        """At most one /api/snapshot answer per SNAPSHOT_API_INTERVAL for the whole server."""
+        if self._last_snapshot is not None and 0 <= now - self._last_snapshot < SNAPSHOT_API_INTERVAL:
+            return False
+        self._last_snapshot = now
+        return True
 
     def _pending_confirmation(self) -> dict[str, Any] | None:
         if self.broker is None:
@@ -469,10 +491,14 @@ class Hub:
             await asyncio.sleep(BAD_TOKEN_DELAY)
             await _close_or_abort(ws, client.transport, CLOSE_UNAUTHORIZED, b"unauthorized")
             return
+        if sum(other.authenticated for other in self.clients) >= MAX_CLIENTS:
+            # Counted here, after the token, so sockets without it cannot take a tab's place.
+            await _close_or_abort(ws, client.transport, CLOSE_TOO_MANY_CLIENTS, b"too many clients")
+            return
         last_seq = auth.get("last_seq")
         if not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0:
             last_seq = None
-        self._admit(client, last_seq)
+        self._admit(client, last_seq)  # synchronous: no other socket can authenticate in between
         client.sender = loop.create_task(client.run_sender())
         self._maybe_probe(PROBE_MAX_AGE)
         async for msg in ws:
@@ -518,7 +544,9 @@ class Hub:
 
     def _handle(self, client: _Client, msg) -> None:
         data = self._parse(msg)
-        handler = self.handlers.get(data.get("type")) if data is not None else None  # type: ignore[arg-type]
+        kind = data.get("type") if data is not None else None
+        # Only a string can name a handler: a list or an object as "type" is not hashable.
+        handler = self.handlers.get(kind) if isinstance(kind, str) else None
         if handler is None:
             client.enqueue(INVALID_FRAME)
             return
@@ -644,7 +672,8 @@ DIST_KEY = web.AppKey("mission_control_dist", Path)
 
 @web.middleware
 async def _guard(request: web.Request, handler):
-    """Host and Origin checks for every request, before any handler runs."""
+    """Host and Origin checks for every request, before any handler runs; and no dot names under
+    /assets (a build never makes them, so .env or .git there is not ours to serve)."""
     hub = request.app[HUB_KEY]
     hosts = request.headers.getall("Host", [])
     if len(hosts) != 1 or hosts[0].lower() not in hub.allowed_hosts:
@@ -655,6 +684,8 @@ async def _guard(request: web.Request, handler):
         # A browser always sends Origin on a WebSocket; one without it is not our page.
         if len(origins) != 1 or origins[0] not in hub.allowed_origins:
             raise web.HTTPForbidden(text="Forbidden.")
+    if request.path.startswith("/assets/") and any(part.startswith(".") for part in request.path.split("/")[2:]):
+        raise web.HTTPNotFound()
     return await handler(request)
 
 
@@ -665,6 +696,9 @@ async def _security_headers(request: web.Request, response: web.StreamResponse) 
     headers["X-Content-Type-Options"] = "nosniff"
     headers["Referrer-Policy"] = "no-referrer"
     headers["X-Frame-Options"] = "DENY"
+    # No other site may embed these responses or keep a handle on this window.
+    headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    headers["Cross-Origin-Opener-Policy"] = "same-origin"
     if request.path.startswith("/assets/") and response.status < 400:
         headers["Cache-Control"] = ASSET_CACHE
     else:
@@ -687,18 +721,22 @@ async def _snapshot(request: web.Request) -> web.Response:
     scheme, _, value = request.headers.get("Authorization", "").partition(" ")
     if scheme.lower() != "bearer" or not hub.check_token(value):
         raise web.HTTPUnauthorized(text="Unauthorized.", headers={"WWW-Authenticate": "Bearer"})
+    # Checked after the token, so a request without it cannot use up the budget.
+    if not hub.snapshot_allowed(asyncio.get_running_loop().time()):
+        raise web.HTTPTooManyRequests(text="Too many requests.", headers={"Retry-After": "1"})
     return web.json_response(hub.snapshot())
 
 
 async def _websocket(request: web.Request) -> web.WebSocketResponse:
     hub = request.app[HUB_KEY]
     ws = web.WebSocketResponse(heartbeat=HEARTBEAT, max_msg_size=MAX_MESSAGE_SIZE, timeout=CLOSE_REPLY_TIMEOUT)
-    if len(hub.clients) >= MAX_CLIENTS:
-        await ws.prepare(request)
-        await _close_or_abort(ws, request.transport, CLOSE_TOO_MANY_CLIENTS, b"too many clients")
-        return ws
+    pending = [client for client in hub.clients if not client.authenticated and not client.closing]
+    if len(pending) >= MAX_PENDING:
+        # Full of sockets that have not authenticated: the oldest makes room. Refusing the new one
+        # instead would let a program without the token keep the real tab out by reconnecting.
+        min(pending, key=lambda client: client.opened).close_soon(CLOSE_TOO_MANY_CLIENTS, b"too many clients")
     client = _Client(ws, request.transport)
-    hub.clients.add(client)  # before the first await, so two racing sockets cannot both take the last slot
+    hub.clients.add(client)  # before the first await, so the pending count above is always current
     try:
         await ws.prepare(request)
         await hub.serve(client)
